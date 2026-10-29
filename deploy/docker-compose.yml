@@ -1,0 +1,26 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: ananta-clickhouse
+    ports: ["8123:8123", "9000:9000"]
+    environment:
+      CLICKHOUSE_DB: ananta
+      CLICKHOUSE_USER: ananta
+      CLICKHOUSE_PASSWORD: ananta_dev
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - ch_data:/var/lib/clickhouse
+      - ../database/clickhouse:/docker-entrypoint-initdb.d:ro
+    ulimits: { nofile: { soft: 262144, hard: 262144 } }
+  postgres:
+    image: postgres:16
+    container_name: ananta-postgres
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_DB: ananta_meta
+      POSTGRES_USER: ananta
+      POSTGRES_PASSWORD: ananta_dev
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ../database/postgres:/docker-entrypoint-initdb.d:ro
+volumes: { ch_data: {}, pg_data: {} }
