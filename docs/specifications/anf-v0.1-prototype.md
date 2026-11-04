@@ -82,6 +82,6 @@ The catalog is rewritten through a temporary file and rename. It currently store
 - No WAL, multi-writer transactions, MVCC or crash-recovery guarantee.
 - The single-writer assumption is required.
 - Durability and atomic-rename semantics depend on the host filesystem and platform.
-- The reader presently materialises the decoded result rows; bounded streaming batch iteration remains a follow-up task.
+- The reader supports projected-column decoding, but the current database API materialises the returned result rows in memory. Bounded streaming batch iteration remains a follow-up task.
 
 Any incompatible format change must update the version, this document and golden fixtures before compatibility is claimed.
