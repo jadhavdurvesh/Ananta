@@ -138,7 +138,11 @@ pub fn decode_projected_segment(
             return Err(FormatError::InvalidDirectory);
         }
         let end = offset.checked_add(length).ok_or(FormatError::LengthOverflow)?;
-        if end > trailer_start { return Err(FormatError::InvalidDirectory); }
+        // Every encoded value needs at least one null marker byte. This also
+        // bounds row_count allocations by the actual on-disk segment size.
+        if length < row_count || end > trailer_start {
+            return Err(FormatError::InvalidDirectory);
+        }
         entries.push(Entry { type_code, offset, length });
         expected_offset = end;
     }
