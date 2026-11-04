@@ -121,6 +121,18 @@ The current native prototype is not production-ready. It currently materialises 
 - [ ] Add tests for every discovered defect before fixing it.
 - [ ] Update ANF prototype documentation when bytes or semantics change.
 
+## M0.35 Correctness review actions
+
+The current M0 review branch addresses these findings. Treat each as implemented-but-unverified until its PR checks pass:
+- [~] Propagate directory-entry errors during scans instead of silently dropping entries.
+- [~] Distinguish a missing catalog from other filesystem metadata errors.
+- [~] Reject truncated catalogs using the actual minimum file size.
+- [~] Bound untrusted table/column counts by the bytes remaining before allocating vectors.
+- [~] Add regression tests for truncated catalogs, impossible counts, missing table storage directories, empty catalogs and empty batches.
+- [~] Clarify that projected decoding still reads the whole segment in ANF v0.1 because checksum verification covers the entire segment.
+
+The current GitHub Actions run for the merged baseline passed formatting, tests, Clippy and the example at commit `fcbea310`. New main-branch runs for later commits are queued; the M0 review changes still require their own successful CI run.
+
 ## M0.4 Write-access boundary
 - [ ] Document that only one exclusive writer may use a database directory.
 - [ ] Add a clear error for unsupported concurrent open/write where feasible.
