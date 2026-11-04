@@ -17,12 +17,12 @@ ANANTA is not a SQL wrapper, PostgreSQL extension or ClickHouse backend. Its nat
 
 The initial Rust implementation currently includes:
 - Typed values and schema validation.
-- Experimental ANF columnar segment encoder/decoder, including projected-column decoding.
+- Experimental ANF columnar segment encoder/decoder, including projected-column decoding (the full segment is currently read to verify its checksum).
 - Native local catalog file with persisted schemas.
 - Embedded database API for open, create-table, insert-batch, full scan and projected scan.
 - A basic telemetry example and unit/integration tests.
 
-This is an experimental first vertical slice, not a complete or production-ready DBMS. It currently materialises scan results in memory and assumes one writer. Cross-process/multiple-handle locking is not implemented. AQL, query planning, analytics operators, bounded streaming scans, compression, indexes, compaction, WAL, transactions, MVCC and crash recovery are not yet implemented.
+This is an experimental first vertical slice, not a complete or production-ready DBMS. It currently reads complete segment files and materialises scan results in memory; projected scans skip decoding unselected column values but do not yet provide physical column-range I/O. It assumes one exclusive writer. Cross-process/multiple-handle locking is not implemented. AQL, query planning, analytics operators, bounded streaming scans, compression, indexes, compaction, WAL, transactions, MVCC and crash recovery are not yet implemented.
 
 ## Master execution roadmap
 
