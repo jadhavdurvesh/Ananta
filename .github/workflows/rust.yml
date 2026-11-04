@@ -2,7 +2,7 @@ name: Native Rust
 
 on:
   push:
-    branches: ["**"]
+    branches: ["main"]
   pull_request:
 
 permissions:
