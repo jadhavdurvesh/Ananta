@@ -255,7 +255,8 @@ mod tests {
         let schema = schema();
         let rows = vec![vec![Value::TimestampMicros(1), Value::Utf8("x".into()), Value::Null, Value::Boolean(true)]];
         let mut encoded = encode_segment(&schema, &rows).unwrap();
-        encoded[encoded.len() - TRAILER_LEN - 1] ^= 0x01;
+        let mutation_index = encoded.len() - TRAILER_LEN - 1;
+        encoded[mutation_index] ^= 0x01;
         assert_eq!(decode_segment(&encoded, &schema), Err(FormatError::ChecksumMismatch));
     }
 
