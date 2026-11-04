@@ -344,7 +344,7 @@ mod tests {
         let path = temp_path();
         fs::create_dir_all(path.join("catalog")).unwrap();
         fs::create_dir_all(path.join("data")).unwrap();
-        fs::write(path.join("catalog").join("catalog.anc"), b"ANC1\\x01\\x00").unwrap();
+        fs::write(path.join("catalog").join("catalog.anc"), &[b'A', b'N', b'C', b'1', 1, 0]).unwrap();
 
         let result = Database::open(&path);
         assert!(matches!(result, Err(DbError::CorruptCatalog("file is truncated"))));
