@@ -393,6 +393,30 @@ mod tests {
     }
 
     #[test]
+    fn scan_reports_missing_table_storage_directory() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        fs::remove_dir_all(path.join("data").join("telemetry")).unwrap();
+
+        assert!(matches!(db.scan("telemetry"), Err(DbError::Io(_))));
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn empty_batch_does_not_create_a_segment() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+
+        assert!(db.insert_batch("telemetry", &[]).unwrap().is_none());
+        assert!(db.scan("telemetry").unwrap().is_empty());
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn multiple_batches_are_read_in_segment_order() {
         let path = temp_path();
         let mut db = Database::open(&path).unwrap();
