@@ -1,0 +1,12 @@
+[package]
+name = "ananta-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ananta-types = { path = "../ananta-types" }
+
+[lints]
+workspace = true
