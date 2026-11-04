@@ -43,6 +43,9 @@ ANANTA — independent database research platform
     +-- ananta-core
     +-- ananta-cli
     +-- ananta-bench
+
++-- studio/ (planned first-party dashboard)
+    +-- ANANTA Studio frontend, built against versioned engine APIs
 ```
 
 Crates are added when the relevant interfaces are ready; this is a target decomposition, not a requirement to create empty crates immediately.
@@ -107,6 +110,12 @@ Correctness comparison precedes performance comparison. Report engine version, c
 | Analytics | Aggregations, time windows and later analytical operators |
 | WAL | Future commit log, checkpoint and recovery |
 | Core | Embedded database API and lifecycle |
+
+## First-party dashboard boundary
+
+ANANTA Studio is the first-party visual management and analytics application. It connects through a versioned management/query API exposed by a future server/session layer. It must not read, mutate or depend directly on raw storage files. Engine correctness, local embedded use, CLI operation and recovery must all work when Studio is unavailable.
+
+Studio sections are planned in `docs/roadmap/studio-and-platform.md`. Only capabilities backed by actual engine telemetry and APIs may be presented as implemented.
 
 ## Deferred research decisions
 
