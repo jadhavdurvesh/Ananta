@@ -75,6 +75,10 @@ The native catalog is stored at `catalog/catalog.anc`. The initial format contai
 
 The catalog is rewritten through a temporary file and rename. It currently stores schema metadata only; segment discovery scans each table's data directory for ordered `.anf` files.
 
+## Projected-read behaviour in v0.1
+
+The decoder can decode only selected column values, but the current database API still reads the complete segment file into memory before decoding. This is required by the current whole-segment checksum design. Therefore v0.1 projection reduces value decoding and result width; it does **not** yet guarantee reduced disk I/O or memory proportional only to selected columns. Range-based column I/O and bounded streaming require a later format/storage revision.
+
 ## Prototype limitations
 
 - FNV-1a is not cryptographic and must not be used for tamper resistance.
