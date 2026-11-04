@@ -87,7 +87,7 @@ impl Database {
         self.catalog.keys().map(String::as_str)
     }
 
-    pub fn insert_batch(&self, table: &str, rows: &[Vec<Value>]) -> Result<Option<PathBuf>, DbError> {
+    pub fn insert_batch(&mut self, table: &str, rows: &[Vec<Value>]) -> Result<Option<PathBuf>, DbError> {
         let schema = self.schema(table)?;
         for row in rows { schema.validate_row(row)?; }
         if rows.is_empty() { return Ok(None); }
