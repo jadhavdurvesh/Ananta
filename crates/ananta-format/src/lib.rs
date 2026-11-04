@@ -20,6 +20,7 @@ pub enum FormatError {
     InvalidEndMarker,
     ChecksumMismatch,
     InvalidDirectory,
+    InvalidProjection(usize),
     InvalidValue(&'static str),
     SchemaMismatch,
     Type(String),
@@ -35,6 +36,7 @@ impl fmt::Display for FormatError {
             Self::InvalidEndMarker => f.write_str("invalid ANF end marker"),
             Self::ChecksumMismatch => f.write_str("ANF checksum mismatch"),
             Self::InvalidDirectory => f.write_str("invalid ANF column directory"),
+            Self::InvalidProjection(i) => write!(f, "column projection index {i} is out of range"),
             Self::InvalidValue(message) => write!(f, "invalid ANF value: {message}"),
             Self::SchemaMismatch => f.write_str("ANF schema does not match requested schema"),
             Self::Type(message) => f.write_str(message),
@@ -89,6 +91,17 @@ pub fn encode_segment(schema: &Schema, rows: &[Vec<Value>]) -> Result<Vec<u8>, F
 }
 
 pub fn decode_segment(bytes: &[u8], schema: &Schema) -> Result<Vec<Vec<Value>>, FormatError> {
+    let projection = (0..schema.len()).collect::<Vec<_>>();
+    decode_projected_segment(bytes, schema, &projection)
+}
+
+/// Decode only selected columns, preserving the requested projection order.
+/// The segment checksum and all directory bounds are still validated.
+pub fn decode_projected_segment(
+    bytes: &[u8],
+    schema: &Schema,
+    projection: &[usize],
+) -> Result<Vec<Vec<Value>>, FormatError> {
     if bytes.len() < HEADER_LEN + TRAILER_LEN { return Err(FormatError::Truncated); }
     if &bytes[0..4] != MAGIC { return Err(FormatError::InvalidMagic); }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
@@ -100,9 +113,12 @@ pub fn decode_segment(bytes: &[u8], schema: &Schema) -> Result<Vec<Vec<Value>>, 
     let row_count = usize::try_from(row_count_u64).map_err(|_| FormatError::LengthOverflow)?;
     let column_count = usize::try_from(read_u32(bytes, 16)?).map_err(|_| FormatError::LengthOverflow)?;
     if column_count != schema.len() { return Err(FormatError::SchemaMismatch); }
+    if let Some(index) = projection.iter().find(|index| **index >= column_count) {
+        return Err(FormatError::InvalidProjection(*index));
+    }
 
-    let directory_end = HEADER_LEN.checked_add(column_count.checked_mul(DIRECTORY_ENTRY_LEN).ok_or(FormatError::LengthOverflow)?)
-        .ok_or(FormatError::LengthOverflow)?;
+    let directory_len = column_count.checked_mul(DIRECTORY_ENTRY_LEN).ok_or(FormatError::LengthOverflow)?;
+    let directory_end = HEADER_LEN.checked_add(directory_len).ok_or(FormatError::LengthOverflow)?;
     let trailer_start = bytes.len().checked_sub(TRAILER_LEN).ok_or(FormatError::Truncated)?;
     if directory_end > trailer_start { return Err(FormatError::Truncated); }
 
@@ -128,23 +144,30 @@ pub fn decode_segment(bytes: &[u8], schema: &Schema) -> Result<Vec<Vec<Value>>, 
     }
     if expected_offset != trailer_start { return Err(FormatError::InvalidDirectory); }
 
-    let mut columns = Vec::with_capacity(column_count);
-    for (column, entry) in schema.columns().iter().zip(entries) {
+    let mut decoded = vec![None; column_count];
+    for index in projection.iter().copied().collect::<std::collections::BTreeSet<_>>() {
+        let entry = entries[index];
+        let column = &schema.columns()[index];
         if entry.type_code != column.data_type as u8 { return Err(FormatError::SchemaMismatch); }
-        let end = entry.offset + entry.length;
+        let end = entry.offset.checked_add(entry.length).ok_or(FormatError::LengthOverflow)?;
         let mut cursor = entry.offset;
         let mut values = Vec::with_capacity(row_count);
         for _ in 0..row_count {
-            values.push(decode_value(bytes, &mut cursor, end, column.data_type)?);
+            let value = decode_value(bytes, &mut cursor, end, column.data_type)?;
+            if matches!(value, Value::Null) && !column.nullable {
+                return Err(FormatError::Type(format!("column '{}' does not allow NULL", column.name)));
+            }
+            values.push(value);
         }
         if cursor != end { return Err(FormatError::InvalidDirectory); }
-        columns.push(values);
+        decoded[index] = Some(values);
     }
 
     let mut rows = Vec::with_capacity(row_count);
     for row_index in 0..row_count {
-        let row = columns.iter().map(|column| column[row_index].clone()).collect::<Vec<_>>();
-        schema.validate_row(&row).map_err(|e| FormatError::Type(e.to_string()))?;
+        let row = projection.iter().map(|index| {
+            decoded[*index].as_ref().expect("projected column decoded")[row_index].clone()
+        }).collect::<Vec<_>>();
         rows.push(row);
     }
     Ok(rows)
