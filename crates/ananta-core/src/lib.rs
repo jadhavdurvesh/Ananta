@@ -61,7 +61,11 @@ impl Database {
         fs::create_dir_all(root.join("catalog"))?;
         fs::create_dir_all(root.join("data"))?;
         let catalog_path = root.join("catalog").join("catalog.anc");
-        let catalog = if catalog_path.exists() { load_catalog(&catalog_path)? } else { BTreeMap::new() };
+        let catalog = match fs::metadata(&catalog_path) {
+            Ok(_) => load_catalog(&catalog_path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => return Err(DbError::Io(error)),
+        };
         Ok(Self { root, catalog })
     }
 
@@ -118,7 +122,11 @@ impl Database {
         self.scan_projected_indices(table, schema, &projection)
     }
 
-    /// Read only the requested columns, preserving the caller's column order.
+    /// Decode only the requested columns, preserving the caller's column order.
+    ///
+    /// The current implementation still reads the complete segment into memory
+    /// because ANF v0.1 uses a whole-segment checksum. Bounded column-range I/O
+    /// requires a later format revision and streaming storage API.
     pub fn scan_columns(&self, table: &str, columns: &[&str]) -> Result<Vec<Vec<Value>>, DbError> {
         let schema = self.schema(table)?;
         let mut projection = Vec::with_capacity(columns.len());
@@ -137,12 +145,14 @@ impl Database {
         projection: &[usize],
     ) -> Result<Vec<Vec<Value>>, DbError> {
         let table_dir = self.root.join("data").join(table);
-        if !table_dir.exists() { return Ok(Vec::new()); }
-        let mut segments = fs::read_dir(&table_dir)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("anf"))
-            .collect::<Vec<_>>();
+        let mut segments = Vec::new();
+        for entry in fs::read_dir(&table_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("anf") {
+                segments.push(path);
+            }
+        }
         segments.sort();
         let mut rows = Vec::new();
         for segment in segments {
@@ -206,7 +216,8 @@ fn save_catalog(path: &Path, catalog: &BTreeMap<String, Schema>) -> Result<(), D
 fn load_catalog(path: &Path) -> Result<BTreeMap<String, Schema>, DbError> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
-    if bytes.len() < 18 { return Err(DbError::CorruptCatalog("file is truncated")); }
+    // ANC1 + version + table count + checksum + CEND = 22 bytes minimum.
+    if bytes.len() < 22 { return Err(DbError::CorruptCatalog("file is truncated")); }
     if &bytes[..4] != CATALOG_MAGIC { return Err(DbError::CorruptCatalog("invalid magic")); }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
     if version != CATALOG_VERSION { return Err(DbError::UnsupportedCatalogVersion(version)); }
@@ -216,14 +227,19 @@ fn load_catalog(path: &Path) -> Result<BTreeMap<String, Schema>, DbError> {
 
     let mut cursor = 6_usize;
     let table_count = read_u32(&bytes, &mut cursor, trailer)? as usize;
-    if table_count > MAX_CATALOG_ITEMS { return Err(DbError::CorruptCatalog("table count exceeds limit")); }
+    if table_count > MAX_CATALOG_ITEMS || table_count > (trailer - cursor) / 9 {
+        return Err(DbError::CorruptCatalog("table count exceeds catalog bounds"));
+    }
     let mut catalog = BTreeMap::new();
     for _ in 0..table_count {
         let name = read_string(&bytes, &mut cursor, trailer)?;
         validate_name(&name)?;
         let column_count = read_u32(&bytes, &mut cursor, trailer)? as usize;
-        if column_count == 0 || column_count > MAX_CATALOG_ITEMS {
-            return Err(DbError::CorruptCatalog("invalid column count"));
+        if column_count == 0
+            || column_count > MAX_CATALOG_ITEMS
+            || column_count > (trailer - cursor) / 7
+        {
+            return Err(DbError::CorruptCatalog("column count exceeds catalog bounds"));
         }
         let mut columns = Vec::with_capacity(column_count);
         for _ in 0..column_count {
@@ -320,6 +336,59 @@ mod tests {
         assert!(db.create_table("../outside", sample_schema()).is_err());
         db.create_table("telemetry", sample_schema()).unwrap();
         assert!(db.insert_batch("telemetry", &[vec![Value::Int64(1)]]).is_err());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_truncated_catalog_before_parsing() {
+        let path = temp_path();
+        fs::create_dir_all(path.join("catalog")).unwrap();
+        fs::create_dir_all(path.join("data")).unwrap();
+        fs::write(path.join("catalog").join("catalog.anc"), b"ANC1\\x01\\x00").unwrap();
+
+        let result = Database::open(&path);
+        assert!(matches!(result, Err(DbError::CorruptCatalog("file is truncated"))));
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_catalog_counts_that_cannot_fit_file() {
+        let path = temp_path();
+        fs::create_dir_all(path.join("catalog")).unwrap();
+        fs::create_dir_all(path.join("data")).unwrap();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(CATALOG_MAGIC);
+        bytes.extend_from_slice(&CATALOG_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(b"t");
+        bytes.extend_from_slice(&(MAX_CATALOG_ITEMS as u32).to_le_bytes());
+        let checksum = checksum64(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        bytes.extend_from_slice(CATALOG_END);
+        fs::write(path.join("catalog").join("catalog.anc"), bytes).unwrap();
+
+        let result = Database::open(&path);
+        assert!(matches!(
+            result,
+            Err(DbError::CorruptCatalog("column count exceeds catalog bounds"))
+        ));
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn empty_catalog_is_readable_after_reopen() {
+        let path = temp_path();
+        {
+            let _db = Database::open(&path).unwrap();
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            assert_eq!(db.table_names().count(), 0);
+        }
         fs::remove_dir_all(path).unwrap();
     }
 
