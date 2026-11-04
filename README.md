@@ -24,6 +24,10 @@ The initial Rust implementation currently includes:
 
 This is an experimental first vertical slice, not a complete or production-ready DBMS. It currently materialises scan results in memory and assumes one writer. Cross-process/multiple-handle locking is not implemented. AQL, query planning, analytics operators, bounded streaming scans, compression, indexes, compaction, WAL, transactions, MVCC and crash recovery are not yet implemented.
 
+## Master execution roadmap
+
+The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M0 — verify the existing Rust foundation.** Do not begin later milestones until M0 passes.
+
 ## Native design documents
 
 - [Product vision: complete native database platform](docs/product/vision.md)
