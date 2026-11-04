@@ -1,25 +1,38 @@
 # ANANTA
 
-**ANANTA is an independent database system research project.** The goal is to build a database management system (DBMS) in Rust with its own database engine, native storage subsystem and file format, catalog, query language, planner, execution engine and analytical/time-series operators.
+**ANANTA is an independent database management system (DBMS) and data platform research project by DMJ.** The goal is to build a database system in Rust with its own engine, native storage subsystem and file format, catalog, query language, planner, execution engine, analytics, administration APIs and first-party dashboard.
 
 ANANTA is not a SQL wrapper, PostgreSQL extension or ClickHouse backend. Its native engine must create, store, retrieve and analyse data without requiring another database. The host operating system provides filesystem and disk I/O primitives; ANANTA owns the database-level storage design and persistence format.
 
-## Native engine
+## Product pillars
 
-- **Storage:** ANANTA Native Format (ANF), custom catalog and columnar segments.
-- **Query language:** AQL (working name), a planned native language with its own grammar and execution semantics. SQL is not the required interface.
-- **Analytics:** Native vectorised operators, aggregations and time-series processing.
-- **Implementation:** Rust workspace under `crates/`.
-- **Initial topology:** Single-node, embedded, single-writer prototype.
+- **ANANTA Engine:** native database runtime, lifecycle, catalog and resource management.
+- **ANANTA Storage:** ANF native files and the proposed ChronoWeave research architecture.
+- **AQL:** working name for a native query language with its own grammar and execution semantics. SQL is not the required interface.
+- **ANANTA Analytics:** native vectorised operators, aggregations and time-series processing.
+- **ANANTA Studio:** planned first-party dashboard for database exploration, AQL workbench, storage inspection, visual explain, analytics, ingestion monitoring and administration.
+- **Developer platform:** Rust API, CLI, future server protocol, SDKs and workload integrations.
 
-The first implementation slice currently includes typed values/schemas, an ANF segment encoder/decoder, a local catalog, database open/create-table/insert/scan APIs, and a basic example. It is experimental: no WAL, transactional crash recovery, compression, indexes, query language, planner or production guarantees yet.
+## Native engine status
 
-## Native engine documents
+The initial Rust implementation currently includes:
+- Typed values and schema validation.
+- Experimental ANF columnar segment encoder/decoder, including projected-column decoding.
+- Native local catalog file with persisted schemas.
+- Embedded database API for open, create-table, insert-batch, full scan and projected scan.
+- A basic telemetry example and unit/integration tests.
 
+This is an experimental first vertical slice, not a complete or production-ready DBMS. It currently materialises scan results in memory and assumes one writer. Cross-process/multiple-handle locking is not implemented. AQL, query planning, analytics operators, bounded streaming scans, compression, indexes, compaction, WAL, transactions, MVCC and crash recovery are not yet implemented.
+
+## Native design documents
+
+- [Product vision: complete native database platform](docs/product/vision.md)
 - [Native engine technical specification](docs/specifications/native-engine-v0.2.md)
 - [Native architecture and independence boundaries](docs/architecture/native-engine.md)
 - [Phase 1 implementation plan](docs/roadmap/phase-1-native-engine.md)
 - [ANF v0.1 prototype byte layout](docs/specifications/anf-v0.1-prototype.md)
+- [ChronoWeave storage research proposal](docs/specifications/chronoweave-storage-research.md)
+- [ANANTA Studio and developer platform roadmap](docs/roadmap/studio-and-platform.md)
 
 ## Build and test the native engine
 
@@ -38,24 +51,6 @@ The example creates/opens `./ananta-data`, creates a telemetry table if needed, 
 
 The existing ClickHouse/PostgreSQL setup is retained for external comparisons and historical experiments. It is not required to build or run the native engine.
 
-### Reference benchmark baseline
+The benchmark runner and layout lab remain research tools for reference database experiments. Native ANANTA will need its own benchmark implementation and correctness-verified comparisons before direct performance claims.
 
-```bash
-cd deploy && docker compose up -d
-cd ../services/benchmark-runner && pip install -r requirements.txt
-python generate.py --rows 1000000 --dist uniform --seed 7
-python run.py --label baseline-1M-uniform
-```
-
-### Reference layout lab
-
-```bash
-cd services/layout-lab && pip install -r requirements.txt
-python lab.py --label lab-1M-uniform
-```
-
-The layout lab's promotion policy applies to the ClickHouse layouts it tests. Native ANANTA requires its own benchmark adapter and comparable correctness-verified results before direct performance claims.
-
-## Workloads
-
-Workloads are optional inputs to the database, not imports or runtime dependencies of engine core. Fire Bot is one optional telemetry workload. See `workloads/README.md` and `docs/decisions/`.
+See `docs/decisions/` and `workloads/README.md`. Workloads are optional; Fire Bot is not a database dependency.
