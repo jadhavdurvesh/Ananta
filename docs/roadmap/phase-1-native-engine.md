@@ -17,7 +17,7 @@ In scope:
 - Native catalog and database directory lifecycle.
 - Versioned ANF header, column directory, payload and footer.
 - Native segment writer, reader and lifecycle.
-- Batch validation and bounded column scans.
+- Batch validation and projected-column scans (eager result materialisation in v0.1; bounded streaming is deferred).
 - Temporal segment statistics.
 - Corruption and round-trip tests.
 
@@ -68,7 +68,7 @@ Acceptance: golden fixtures, round-trip and corruption tests pass.
 ### P5. Native storage and ingestion
 - Validate complete batches before writing.
 - Write segments to temporary paths and publish using a documented safe sequence.
-- Provide full-column and selected-column scans in bounded batches.
+- Provide full-column and selected-column scan APIs. The first implementation may materialise results; implement a bounded batch iterator before claiming large-table bounded-memory scans.
 - Record per-segment min/max timestamp metadata.
 - Keep catalog and segment publication ordering explicit.
 
