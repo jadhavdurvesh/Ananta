@@ -1,4 +1,4 @@
-use ananta_format::{decode_segment, encode_segment, FormatError};
+use ananta_format::{decode_projected_segment, encode_segment, FormatError};
 use ananta_types::{Column, DataType, Schema, TypeError, Value};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -20,6 +20,7 @@ pub enum DbError {
     InvalidName(String),
     TableExists(String),
     TableNotFound(String),
+    ColumnNotFound(String),
     CorruptCatalog(&'static str),
     UnsupportedCatalogVersion(u16),
     ChecksumMismatch,
@@ -35,6 +36,7 @@ impl fmt::Display for DbError {
             Self::InvalidName(s) => write!(f, "invalid database object name: {s}"),
             Self::TableExists(s) => write!(f, "table already exists: {s}"),
             Self::TableNotFound(s) => write!(f, "table not found: {s}"),
+            Self::ColumnNotFound(s) => write!(f, "column not found: {s}"),
             Self::CorruptCatalog(s) => write!(f, "corrupt ANANTA catalog: {s}"),
             Self::UnsupportedCatalogVersion(v) => write!(f, "unsupported catalog version: {v}"),
             Self::ChecksumMismatch => f.write_str("catalog checksum mismatch"),
@@ -112,6 +114,28 @@ impl Database {
 
     pub fn scan(&self, table: &str) -> Result<Vec<Vec<Value>>, DbError> {
         let schema = self.schema(table)?;
+        let projection = (0..schema.len()).collect::<Vec<_>>();
+        self.scan_projected_indices(table, schema, &projection)
+    }
+
+    /// Read only the requested columns, preserving the caller's column order.
+    pub fn scan_columns(&self, table: &str, columns: &[&str]) -> Result<Vec<Vec<Value>>, DbError> {
+        let schema = self.schema(table)?;
+        let mut projection = Vec::with_capacity(columns.len());
+        for name in columns {
+            let index = schema.columns().iter().position(|column| column.name == *name)
+                .ok_or_else(|| DbError::ColumnNotFound((*name).to_owned()))?;
+            projection.push(index);
+        }
+        self.scan_projected_indices(table, schema, &projection)
+    }
+
+    fn scan_projected_indices(
+        &self,
+        table: &str,
+        schema: &Schema,
+        projection: &[usize],
+    ) -> Result<Vec<Vec<Value>>, DbError> {
         let table_dir = self.root.join("data").join(table);
         if !table_dir.exists() { return Ok(Vec::new()); }
         let mut segments = fs::read_dir(&table_dir)?
@@ -125,7 +149,7 @@ impl Database {
             let mut file = File::open(segment)?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)?;
-            rows.extend(decode_segment(&bytes, schema)?);
+            rows.extend(decode_projected_segment(&bytes, schema, projection)?);
         }
         Ok(rows)
     }
@@ -308,7 +332,15 @@ mod tests {
         let b = vec![Value::TimestampMicros(2), Value::Utf8("b".into()), Value::Float64(2.0)];
         db.insert_batch("telemetry", &[a.clone()]).unwrap();
         db.insert_batch("telemetry", &[b.clone()]).unwrap();
-        assert_eq!(db.scan("telemetry").unwrap(), vec![a,b]);
+        assert_eq!(db.scan("telemetry").unwrap(), vec![a.clone(),b.clone()]);
+        assert_eq!(
+            db.scan_columns("telemetry", &["device", "timestamp"]).unwrap(),
+            vec![
+                vec![Value::Utf8("a".into()), Value::TimestampMicros(1)],
+                vec![Value::Utf8("b".into()), Value::TimestampMicros(2)],
+            ]
+        );
+        assert!(db.scan_columns("telemetry", &["missing"]).is_err());
         fs::remove_dir_all(path).unwrap();
     }
 }
