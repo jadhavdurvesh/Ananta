@@ -45,6 +45,10 @@ The current ClickHouse and PostgreSQL services remain external reference systems
 - Detect unsupported format versions, truncated files and checksum failures.
 - Establish correctness and baseline performance tests.
 
+### Complete platform vision
+
+ANANTA is intended to ship as a complete database product, not merely a Rust library. The long-term product includes a first-party dashboard called ANANTA Studio, a management/query API, server/session layer, CLI and client SDKs. Studio is a management surface over the native engine, not a separate data backend and not required for embedded operation. Its product roadmap is in `docs/roadmap/studio-and-platform.md`.
+
 ### Explicit non-goals for the first milestone
 - Distributed execution, replication or consensus.
 - Multi-writer transactions or MVCC.
@@ -162,6 +166,6 @@ Do not advertise transaction guarantees in v0.1. Until WAL and recovery are impl
 
 ClickHouse and PostgreSQL may serve as external baselines. Compare equivalent logical workloads and verify identical results before performance comparisons. Publish raw benchmark data. The native engine must also be usable and testable with those services stopped.
 
-## 11. Versioning
+## 11. Product experience and storage research\n\nThe proposed first-party dashboard is ANANTA Studio. The proposed storage research direction is ChronoWeave (Chronicles, Capsules, Weaves and Navigation Map). Both are documented as future work in the product vision and research proposal. Neither should be represented as implemented or uniquely novel until implemented, surveyed and benchmarked.\n\n## 12. Versioning
 
 ANF v0.1 is experimental and may change before a stable release. Any incompatible format change requires a version increment, compatibility/migration note and updated golden fixtures. AQL syntax and semantics will also require explicit language-versioning rules before public stability is promised.
