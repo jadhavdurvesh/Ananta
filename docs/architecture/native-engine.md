@@ -19,10 +19,11 @@ The host operating system still provides filesystem and device I/O primitives. A
 ```text
 ANANTA — independent database research platform
 |
-+-- reference/ (existing services; current paths remain unchanged)
-|   +-- ClickHouse schemas and benchmark target
-|   +-- PostgreSQL schema/reference control-plane experiments
-|   +-- benchmark-runner and layout-lab
++-- database/ (existing reference schemas)
+|   +-- clickhouse/
+|   +-- postgres/
++-- deploy/ (existing local reference stack)
++-- services/ (existing benchmark-runner and layout-lab)
 |
 +-- workloads/
 |   +-- synthetic event workloads
@@ -49,6 +50,10 @@ ANANTA — independent database research platform
 ```
 
 Crates are added when the relevant interfaces are ready; this is a target decomposition, not a requirement to create empty crates immediately.
+
+## First-party platform
+
+The planned `studio/` application is documented in `docs/roadmap/studio-and-platform.md`; it is not implemented yet. A future versioned server/management API will expose real catalog, query, storage and telemetry capabilities. Studio must not read raw database files or become a runtime dependency of the engine.
 
 ## Native execution flow
 
