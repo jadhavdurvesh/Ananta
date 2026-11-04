@@ -68,9 +68,9 @@ impl Database {
         validate_name(&name)?;
         if self.catalog.contains_key(&name) { return Err(DbError::TableExists(name)); }
         fs::create_dir_all(self.root.join("data").join(&name))?;
-        self.catalog.insert(name, schema);
+        self.catalog.insert(name.clone(), schema);
         if let Err(error) = save_catalog(&self.root.join("catalog").join("catalog.anc"), &self.catalog) {
-            // In-memory state is rolled back if catalog publication fails.
+            self.catalog.remove(&name);
             // The empty data directory is harmless and may be reused on retry.
             return Err(error);
         }
