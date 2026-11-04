@@ -284,6 +284,25 @@ mod tests {
     }
 
     #[test]
+    fn projected_decoder_only_returns_requested_columns() {
+        let schema = schema();
+        let rows = vec![
+            vec![Value::TimestampMicros(1), Value::Utf8("a".into()), Value::Float64(12.0), Value::Boolean(true)],
+            vec![Value::TimestampMicros(2), Value::Utf8("b".into()), Value::Null, Value::Boolean(false)],
+        ];
+        let encoded = encode_segment(&schema, &rows).unwrap();
+        let projected = decode_projected_segment(&encoded, &schema, &[3, 1]).unwrap();
+        assert_eq!(projected, vec![
+            vec![Value::Boolean(true), Value::Utf8("a".into())],
+            vec![Value::Boolean(false), Value::Utf8("b".into())],
+        ]);
+        assert!(matches!(
+            decode_projected_segment(&encoded, &schema, &[schema.len()]),
+            Err(FormatError::InvalidProjection(_))
+        ));
+    }
+
+    #[test]
     fn truncated_segment_is_rejected() {
         let schema = schema();
         let encoded = encode_segment(&schema, &[]).unwrap();
