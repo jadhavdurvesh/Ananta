@@ -145,7 +145,7 @@ The engine must not load an entire dataset into memory to answer a scan or aggre
 
 ## 9. Ingestion and consistency scope
 
-The first writer is single-process and single-writer. Validate a complete batch before publishing it. Write segments to temporary files and publish them using a documented platform-appropriate sequence. Metadata publication ordering must be tested.
+The first writer is single-process and single-writer. The API requires a mutable database handle for writes, but cross-process and multiple-handle file locking is not yet implemented; callers must ensure exclusive write access to a database directory. Validate a complete batch before publishing it. Write segments to temporary files and publish them using a documented platform-appropriate sequence. Metadata publication ordering must be tested.
 
 Do not advertise transaction guarantees in v0.1. Until WAL and recovery are implemented, document the exact durability boundary and possible loss window. Never silently accept partially written segments.
 
