@@ -12,6 +12,9 @@ const TEMP_SEGMENT_SUFFIX: &str = ".tmp";
 const CHRONICLE_PREFIX: &str = "segment-";
 const TEMP_CHRONICLE_PREFIX: &str = ".chronicle-";
 const CHRONICLE_SUFFIX: &str = ".chr";
+const CAPSULE_PREFIX: &str = "capsule-";
+const TEMP_CAPSULE_PREFIX: &str = ".capsule-";
+const CAPSULE_SUFFIX: &str = ".cap";
 
 /// Exclusive local writer lock. Stale locks are deliberately not broken automatically.
 pub(crate) struct DatabaseLock {
@@ -218,6 +221,50 @@ where
     Ok(final_path)
 }
 
+pub(crate) fn publish_capsule(
+    directory: &Path,
+    capsule_id: u64,
+    generation: u64,
+    bytes: &[u8],
+) -> Result<PathBuf, DbError> {
+    if capsule_id == 0 || generation == 0 {
+        return Err(DbError::LengthOverflow);
+    }
+    let final_path = directory.join(format!("{CAPSULE_PREFIX}{capsule_id:020}-g{generation:020}{CAPSULE_SUFFIX}"));
+    let temp_path = directory.join(format!("{TEMP_CAPSULE_PREFIX}{capsule_id:020}-g{generation:020}{TEMP_SEGMENT_SUFFIX}"));
+    let mut temporary_owned = false;
+    let mut published = false;
+    let result = (|| -> Result<(), DbError> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp_path)?;
+        temporary_owned = true;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&temp_path, &final_path)?;
+        published = true;
+        sync_directory(directory)?;
+        fs::remove_file(&temp_path)?;
+        temporary_owned = false;
+        sync_directory(directory)?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        if !published && temporary_owned {
+            let _ = fs::remove_file(&temp_path);
+        }
+        if published {
+            return Err(DbError::SegmentPublicationUncertain {
+                path: final_path,
+                reason: error.to_string(),
+            });
+        }
+        return Err(error);
+    }
+    Ok(final_path)
+}
+
 /// Remove only canonical regular-file temp segments. Temp names are never committed.
 pub(crate) fn cleanup_orphan_segment_temps(data_root: &Path) -> Result<Vec<PathBuf>, DbError> {
     let mut removed = Vec::new();
@@ -230,10 +277,29 @@ pub(crate) fn cleanup_orphan_segment_temps(data_root: &Path) -> Result<Vec<PathB
         let mut changed = false;
         for entry in fs::read_dir(&table_dir)? {
             let entry = entry?;
-            if !entry.file_type()?.is_file() {
+            let entry_type = entry.file_type()?;
+            let path = entry.path();
+            if entry_type.is_dir() && entry.file_name() == "capsules" {
+                for capsule_entry in fs::read_dir(&path)? {
+                    let capsule_entry = capsule_entry?;
+                    if !capsule_entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let capsule_path = capsule_entry.path();
+                    let Some(filename) = capsule_path.file_name().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    if is_canonical_temp_capsule_name(filename) {
+                        fs::remove_file(&capsule_path)?;
+                        removed.push(capsule_path);
+                        sync_directory(&path)?;
+                    }
+                }
                 continue;
             }
-            let path = entry.path();
+            if !entry_type.is_file() {
+                continue;
+            }
             let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
@@ -251,6 +317,20 @@ pub(crate) fn cleanup_orphan_segment_temps(data_root: &Path) -> Result<Vec<PathB
     Ok(removed)
 }
 
+
+
+fn is_canonical_temp_capsule_name(filename: &str) -> bool {
+    let Some(value) = filename.strip_prefix(TEMP_CAPSULE_PREFIX)
+        .and_then(|value| value.strip_suffix(TEMP_SEGMENT_SUFFIX))
+    else { return false; };
+    let Some((capsule_id, generation)) = value.split_once("-g") else { return false; };
+    let canonical = |text: &str| {
+        text.len() == 20
+            && text.bytes().all(|byte| byte.is_ascii_digit())
+            && text.parse::<u64>().is_ok_and(|id| id != 0 && format!("{id:020}") == text)
+    };
+    canonical(capsule_id) && canonical(generation)
+}
 
 fn is_canonical_temp_chronicle_name(filename: &str) -> bool {
     let Some(id_text) = filename
