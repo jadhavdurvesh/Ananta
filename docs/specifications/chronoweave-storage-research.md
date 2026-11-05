@@ -1,7 +1,7 @@
 # ChronoWeave Storage — ANANTA Research Proposal
 
 **Working name:** ChronoWeave  
-**Status:** Research architecture; Chronicle v0.1, derived Capsule v0.1 and correctness-first Navigation Map v0.1 prototypes implemented; Weave remains unimplemented  
+**Status:** ChronoWeave research prototype v0.1 complete for Chronicle, derived Capsule and correctness-first Navigation Map; Weave compaction and generation promotion remain M3 work  
 **Scope:** Hybrid analytical and time-series storage  
 **Related format:** ANANTA Native Format (ANF)
 
@@ -126,4 +126,4 @@ Run uniform, skewed, bursty and late-arriving datasets. Keep input seeds, query 
 6. Add correctness-preserving generation promotion and rollback.
 7. Build a workload profiler only after the basic compaction experiment is reproducible.
 
-ChronoWeave remains a research architecture until Capsules, Navigation Map pruning and Weave experiments are measured against baselines. The initial Capsule prototype is a derived immutable wrapper around ANF v0.2, not yet an adaptive storage engine. Do not claim that ChronoWeave is unique in the industry without a prior-art review and published evidence.
+ChronoWeave remains a research prototype, not an adaptive production storage engine. M2 measured Capsule sizes and demonstrated correctness-first Navigation Map pruning. M3 must now test whether time-first/entity-first Weaves improve representative workloads and introduce safe generation promotion/rollback. Do not claim that ChronoWeave is unique in the industry without a prior-art review and published evidence.
