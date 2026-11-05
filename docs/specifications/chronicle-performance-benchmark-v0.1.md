@@ -71,3 +71,38 @@ The benchmark is intentionally small enough for regular CI. It is not a high-sca
 Chronicle ingestion is expected to cost more than legacy insertion because it computes SHA-256, builds the metadata envelope, writes a larger record and publishes one durable receipt per accepted batch. Startup cost grows with Chronicle file count and payload bytes because this prototype verifies each receipt and payload fingerprint before accepting the database.
 
 These costs are recorded before Capsule and Navigation Map work so later changes have a baseline. If startup growth becomes material, an authenticated/checksummed checkpoint or receipt index may be evaluated, but it must not weaken replay detection or record verification.
+
+## Observed optimized CI results
+
+**Workflow:** [Native Rust run 42045182231](https://github.com/jadhavdurvesh/Ananta/actions/runs/42045182231)  
+**Build:** Rust release profile (optimized)  
+**Runner:** GitHub-hosted Ubuntu Linux
+
+### Ingestion comparison — 100 batches × 128 rows, 512-byte payloads
+
+| Mode | Rows | Data files | Stored bytes | Total ingest time | Per batch | Per row |
+|---|---:|---:|---:|---:|---:|---:|
+| Legacy ANF insert_batch | 12,800 | 100 | 7,034,000 | 134.643 ms | 1.346 ms | 10 µs |
+| Chronicle ingest_batch | 12,800 | 100 | 7,044,800 | 151.465 ms | 1.514 ms | 11 µs |
+
+Chronicle took 16.822 ms more for 100 batches, approximately **12.5%** higher elapsed time in this run. Stored bytes increased by exactly 10,800 bytes, or **108 bytes per record** (the 96-byte Chronicle header plus 12-byte trailer), approximately **0.154%** over the legacy ANF bytes.
+
+This is a whole-generator measurement: deterministic row construction, payload cloning, encoding, SHA-256, wrapping and publication are included. It is not a pure storage syscall benchmark.
+
+### Fresh-process database open and receipt-index rebuild
+
+| Dataset | Chronicle receipts | Rebuilt rows | Database::open elapsed |
+|---|---:|---:|---:|
+| Legacy ANF baseline | 0 | 0 Chronicle rows | 0.765 ms |
+| Chronicle small | 25 | 3,200 | 10.818 ms |
+| Chronicle large | 100 | 12,800 | 41.876 ms |
+
+A repeated open of the 100-receipt database in the same workflow measured 40.721 ms. The 25-to-100 receipt increase produced approximately 3.9× startup time, close to the 4× record-count increase. The open timer includes lock/catalog/schema startup, full Chronicle record and payload verification, and in-memory receipt-index reconstruction.
+
+The OS page cache was not cleared between processes. These are fresh-process measurements, not cold-storage latency.
+
+### M2.2 performance-gate conclusion
+
+For this bounded CI workload, ingestion overhead and receipt-index rebuild time are measured and recorded. Chronicle adds a modest per-record storage envelope and measurable validation work at startup. The startup behavior is approximately linear over 25–100 records; a receipt checkpoint/index optimization may be justified at larger scale, but should be driven by larger-workload measurements and must preserve the current recovery correctness.
+
+These results close the M2.2 benchmark requirement for the prototype. They do not establish a production-scale performance or latency guarantee.
