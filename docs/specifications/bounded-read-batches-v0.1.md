@@ -43,7 +43,7 @@ A file-backed ANF batch decoder:
 - Enforces nullability, boolean markers, UTF-8 validity, field-length bounds and payload boundaries.
 - Supports both ANF v0.1 and v0.2 without changing their bytes.
 
-The checksum pass reads the entire file sequentially but does not retain it in memory. The decoder uses a fixed 64 KiB checksum scratch buffer plus selected output values for the current batch.
+The checksum pass reads the entire file sequentially but does not retain it in memory. The decoder uses a fixed 64 KiB checksum scratch buffer plus selected output values for the current batch. The output cell cap bounds count-based memory; UTF-8 and binary values remain subject to the existing 64 MiB per-field format limit.
 
 ## 5. Schema compatibility
 
