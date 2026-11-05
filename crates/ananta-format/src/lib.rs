@@ -85,7 +85,7 @@ pub fn encode_segment(schema: &Schema, rows: &[Vec<Value>]) -> Result<Vec<u8>, F
 
     let mut payloads = Vec::with_capacity(schema.len());
     let mut total_payload_bytes = 0_usize;
-    for (column_index, column) in schema.columns().iter().enumerate() {
+    for (column_index, _column) in schema.columns().iter().enumerate() {
         let mut payload = Vec::new();
         for row in rows {
             encode_value(&mut payload, &row[column_index])?;
