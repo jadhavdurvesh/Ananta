@@ -23,14 +23,14 @@ impl DatabaseLock {
             }
             Err(error) => return Err(DbError::Io(error)),
         };
-        let result = (|| -> Result<(), DbError> {
-            writeln!(file, "pid={}", std::process::id())?;
-            file.sync_all()?;
-            drop(file);
-            sync_directory(root)?;
-            Ok(())
-        })();
-        if let Err(error) = result {
+        let file_result = writeln!(file, "pid={}", std::process::id())
+            .and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(error) = file_result {
+            let _ = fs::remove_file(&path);
+            return Err(DbError::Io(error));
+        }
+        if let Err(error) = sync_directory(root) {
             let _ = fs::remove_file(&path);
             return Err(error);
         }
@@ -176,7 +176,7 @@ fn is_canonical_temp_segment_name(filename: &str) -> bool {
     if id_text.len() != 20 || !id_text.bytes().all(|byte| byte.is_ascii_digit()) {
         return false;
     }
-    id_text.parse::<u64>().map_or(false, |id| {
+    id_text.parse::<u64>().is_ok_and(|id| {
         id != 0 && format!("{id:020}") == id_text
     })
 }
@@ -239,7 +239,7 @@ mod tests {
         ] {
             let result = publish_segment_with_hook(&root, 1, bytes, |stage| {
                 if stage == failing_stage {
-                    Err(io::Error::new(io::ErrorKind::Other, "injected interruption"))
+                    Err(io::Error::other("injected interruption"))
                 } else {
                     Ok(())
                 }
