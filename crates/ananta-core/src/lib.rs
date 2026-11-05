@@ -543,6 +543,8 @@ fn resolve_rows_by_column_id(
         }
         current.schema.validate_row(&logical_row)
             .map_err(|_| DbError::SchemaCompatibility("resolved row violates the current logical schema"))?;
+        current.schema.validate_row(&logical_row)
+            .map_err(|_| DbError::SchemaCompatibility("resolved row violates the current logical schema"))?;
         logical_rows.push(logical_row);
     }
     Ok(logical_rows)
