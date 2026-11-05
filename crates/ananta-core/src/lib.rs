@@ -1,4 +1,4 @@
-use ananta_format::{decode_projected_segment, encode_segment, FormatError};
+use ananta_format::{decode_projected_segment, encode_segment, FormatError, MAX_SEGMENT_BYTES};
 use ananta_types::{Column, DataType, Schema, TypeError, Value};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -157,7 +157,12 @@ impl Database {
         let mut rows = Vec::new();
         for segment in segments {
             let mut file = File::open(segment)?;
-            let mut bytes = Vec::new();
+            let file_len = file.metadata()?.len();
+            if file_len > MAX_SEGMENT_BYTES as u64 {
+                return Err(DbError::Format(FormatError::LimitExceeded("segment bytes")));
+            }
+            let capacity = usize::try_from(file_len).map_err(|_| DbError::LengthOverflow)?;
+            let mut bytes = Vec::with_capacity(capacity);
             file.read_to_end(&mut bytes)?;
             rows.extend(decode_projected_segment(&bytes, schema, projection)?);
         }
