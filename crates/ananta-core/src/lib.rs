@@ -1056,6 +1056,95 @@ impl Database {
         })
     }
 
+    /// Create a canonical CIM1 snapshot from verified Chronicle receipts and
+    /// named immutable Capsule generations. Filesystem paths are derived by the engine.
+    pub fn create_compaction_input_manifest(
+        &self,
+        table: &str,
+        job_id: CompactionJobId,
+        attempt: u64,
+        first_sequence: u64,
+        last_sequence: u64,
+        capsule_generations: &[(u64, u64)],
+    ) -> Result<CompactionInputManifest, DbError> {
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        let index = self.chronicle_indices.get(&definition.id)
+            .ok_or(DbError::CompactionPreflight("table Chronicle receipt index is missing"))?;
+        if first_sequence == 0 || last_sequence < first_sequence || last_sequence > index.last_sequence {
+            return Err(DbError::CompactionPreflight("requested source sequence interval is invalid"));
+        }
+
+        let table_dir = self.root.join("data").join(table);
+        let mut receipts = Vec::new();
+        let mut expected_row_count = 0_u64;
+        for sequence in first_sequence..=last_sequence {
+            let receipt = index.by_batch_id.values()
+                .find(|receipt| receipt.metadata.sequence == sequence)
+                .ok_or(DbError::CompactionPreflight("requested Chronicle sequence is missing"))?;
+            if !is_canonical_chronicle_path(&receipt.path, &table_dir) {
+                return Err(DbError::CompactionPreflight("Chronicle receipt path is not canonical"));
+            }
+            let metadata = fs::symlink_metadata(&receipt.path)?;
+            if !metadata.file_type().is_file() {
+                return Err(DbError::CompactionPreflight("Chronicle receipt is not a regular non-symlink file"));
+            }
+            let bytes = fs::read(&receipt.path)?;
+            let mut cursor = Cursor::new(bytes.as_slice());
+            let (decoded, _) = inspect_chronicle_reader(&mut cursor, definition.id.0)?;
+            if decoded != receipt.metadata {
+                return Err(DbError::ChronicleCorrupt("Chronicle record differs from its receipt index"));
+            }
+            expected_row_count = expected_row_count.checked_add(decoded.row_count)
+                .ok_or(DbError::LengthOverflow)?;
+            receipts.push(ChronicleReceiptReference {
+                sequence,
+                batch_id: *decoded.batch_id.as_bytes(),
+                payload_sha256: decoded.fingerprint,
+                row_count: decoded.row_count,
+                record_file_len: u64::try_from(bytes.len()).map_err(|_| DbError::LengthOverflow)?,
+                record_file_sha256: chronicle::sha256(&bytes),
+            });
+        }
+
+        let capsule_dir = table_dir.join("capsules");
+        require_real_directory(&capsule_dir)?;
+        let mut capsules = Vec::with_capacity(capsule_generations.len());
+        for (capsule_id, generation) in capsule_generations {
+            let path = capsule_dir.join(format!("capsule-{capsule_id:020}-g{generation:020}.cap"));
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.file_type().is_file() {
+                return Err(DbError::CompactionPreflight("Capsule path is not a regular non-symlink file"));
+            }
+            let capsule = self.validate_capsule(table, *capsule_id, *generation)?;
+            let bytes = fs::read(&path)?;
+            capsules.push(CapsuleSourceReference {
+                capsule_id: capsule.capsule_id,
+                generation: capsule.generation,
+                schema_revision: capsule.schema_revision,
+                first_sequence: capsule.first_ingestion_sequence,
+                last_sequence: capsule.last_ingestion_sequence,
+                row_count: capsule.row_count,
+                file_len: u64::try_from(bytes.len()).map_err(|_| DbError::LengthOverflow)?,
+                file_sha256: chronicle::sha256(&bytes),
+            });
+        }
+
+        let manifest = CompactionInputManifest {
+            table_id: definition.id.0,
+            job_id,
+            attempt,
+            target_schema_revision: definition.schema_revision,
+            first_sequence,
+            last_sequence,
+            expected_row_count,
+            capsules,
+            receipts,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
     /// Read all rows from one independently validated Capsule.
     ///
     /// This convenience API materialises the selected Capsule's full row set. Use
