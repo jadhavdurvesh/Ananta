@@ -333,6 +333,14 @@ where F: FnMut(PublishStage) -> std::io::Result<()> {
 }
 
 fn read_pointer(root: &Path, table_id: u64) -> Result<Option<ActiveWeavePointer>, DbError> {
+    let root_metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(DbError::Io(error)),
+    };
+    if !root_metadata.file_type().is_dir() {
+        return Err(DbError::CompactionExecution("Weave root is not a real non-symlink directory".into()));
+    }
     let path = root.join("active.awp");
     let metadata = match fs::symlink_metadata(&path) {
         Ok(m) => m,
