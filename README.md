@@ -108,8 +108,12 @@ Generation and scanning are separate process invocations. The scanner reports ro
 
 ## Ingestion contract status
 
-M2.1 defines the planned idempotent ingestion API: caller-supplied 128-bit BatchIds scoped to stable TableIds, SHA-256 payload fingerprints, whole-batch validation, per-table commit-order sequences, duplicate retry resolution, event-time neutrality and explicit result counters. **This is a design contract, not a runtime feature yet.** Durable receipts, sequence allocation, `IngestResult` and counter implementation are part of M2.2 Chronicle work. See the [contract](docs/specifications/ingestion-contract-v0.1.md) and [ADR 0007](docs/decisions/0007-idempotent-commit-ordered-ingestion.md).
+M2.1's idempotent ingestion contract now has an M2.2 runtime prototype: caller-supplied 128-bit BatchIds scoped to stable TableIds, SHA-256 payload fingerprints, whole-batch validation, per-table commit-order sequences, duplicate retry resolution and explicit result counters. Chronicle records make the data and receipt one immutable commit unit. See the [contract](docs/specifications/ingestion-contract-v0.1.md), [Chronicle format](docs/specifications/chronicle-record-v0.1.md) and [ADR 0007](docs/decisions/0007-idempotent-commit-ordered-ingestion.md).
 
 ## Chronicle ingestion prototype
 
 The additive `Database::ingest_batch(table, batch_id, rows)` API writes one immutable Chronicle file containing the complete ANF v0.2 payload, 128-bit BatchId, SHA-256 payload fingerprint, TableId, schema revision, per-table commit sequence and whole-record checksum. Identical retries return the original receipt; conflicting reuse fails. The receipt index and accepted totals are rebuilt from verified Chronicle records on open. The existing `insert_batch` API remains available and writes legacy ANF segment files; both formats are readable by full and bounded scans. This is an experimental single-writer prototype: startup currently verifies and indexes all Chronicle records, and ingestion encodes the complete record in memory.
+
+## Chronicle performance benchmark
+
+The CI workflow runs the reproducible ingestion and startup benchmark described in [Chronicle Performance Benchmark v0.1](docs/specifications/chronicle-performance-benchmark-v0.1.md). It compares the legacy insert_batch path with idempotent Chronicle ingestion on identical rows and measures fresh-process Database::open time as receipt count grows. Results are workload-specific and should be treated as a baseline, not a throughput guarantee.
