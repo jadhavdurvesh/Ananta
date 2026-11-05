@@ -57,7 +57,7 @@ This benchmark is a controlled, one-run CI comparison, not a statistically stabl
 
 ## Observed optimized CI results
 
-**Workflow:** [Final Native Rust run 42052298912](https://github.com/jadhavdurvesh/Ananta/actions/runs/42052298912)  
+**Workflow:** [Final green Native Rust run 42052832715](https://github.com/jadhavdurvesh/Ananta/actions/runs/42052832715)  
 **Build:** Rust release profile (optimized)  
 **Runner:** GitHub-hosted Ubuntu Linux  
 **Rows:** 16,384 per profile  
@@ -65,9 +65,9 @@ This benchmark is a controlled, one-run CI comparison, not a statistically stabl
 
 | Profile | Capsule count | Rows/Capsule | Capsule bytes total | Capsule build | Map build | Baseline scan | Mapped scan | Capsules skipped/read |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Small | 32 | 512 | 9,005,568 | 363.124 ms | 123.952 ms | 271.537 ms | 84.087 ms | 24 / 8 |
-| Medium | 8 | 2,048 | 8,993,664 | 346.532 ms | 125.930 ms | 277.840 ms | 87.648 ms | 6 / 2 |
-| Large | 2 | 8,192 | 8,990,688 | 349.158 ms | 127.558 ms | 282.192 ms | 131.695 ms | 1 / 1 |
+| Small | 32 | 512 | 9,005,568 | 399.322 ms | 133.216 ms | 300.800 ms | 88.853 ms | 24 / 8 |
+| Medium | 8 | 2,048 | 8,993,664 | 384.761 ms | 130.817 ms | 297.847 ms | 98.053 ms | 6 / 2 |
+| Large | 2 | 8,192 | 8,990,688 | 374.708 ms | 132.765 ms | 297.266 ms | 139.765 ms | 1 / 1 |
 
 ### Decode and verification work
 
