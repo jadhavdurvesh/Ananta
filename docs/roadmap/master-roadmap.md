@@ -181,20 +181,20 @@ M0 is complete only when:
 
 ## M1.2 Improve native catalog
 
-### M1.2.1 Define catalog identity and schema revision model — current task
-- [~] Define a stable database-local ObjectId for tables and columns.
-- [~] Separate display names from internal object identity.
-- [~] Define monotonic ID allocation and no-reuse semantics.
-- [~] Separate database catalog revision from per-table schema revision.
-- [~] Define rename, drop, add-column and type-change policies.
-- [~] Define catalog v1-to-v2 migration safety requirements.
-- [~] Define the logical fields required by catalog v2.
+### M1.2.1 Define catalog identity and schema revision model — complete
+- [x] Define a stable database-local ObjectId for tables and columns.
+- [x] Separate display names from internal object identity.
+- [x] Define monotonic ID allocation and no-reuse semantics.
+- [x] Separate database catalog revision from per-table schema revision.
+- [x] Define rename, drop, add-column and type-change policies.
+- [x] Define catalog v1-to-v2 migration safety requirements.
+- [x] Define the logical fields required by catalog v2.
 
-Design proposal: `docs/specifications/catalog-v0.2-identity-proposal.md`.
+Design: `docs/specifications/catalog-v0.2-identity-proposal.md`.
 ADR: `docs/decisions/0004-stable-catalog-object-identity.md`.
-These items are documented but await review/merge.
+**Completed:** [PR #6 merged](https://github.com/jadhavdurvesh/Ananta/pull/6); [CI passed](https://github.com/jadhavdurvesh/Ananta/actions/runs/41990915185).
 
-### M1.2.2 Implement catalog v2 — in progress
+### M1.2.2 Implement catalog v2 — complete
 - [x] Add typed ObjectId and catalog object models.
 - [x] Implement catalog v2 header, feature flags and revisions.
 - [x] Persist table IDs, column IDs and schema revisions.
@@ -205,19 +205,62 @@ These items are documented but await review/merge.
 - [x] Verify failed migration preserves the original catalog and pre-existing temp files.
 - [x] Ensure failed catalog writes do not advance in-memory state.
 
-Implementation branch: `feat/m1-catalog-v2`. These items remain implemented-but-unverified until the PR CI passes and the change is merged.
-
 Binary specification: `docs/specifications/catalog-v2-binary-format.md`.
+**Completed:** [PR #7 merged](https://github.com/jadhavdurvesh/Ananta/pull/7); [CI passed](https://github.com/jadhavdurvesh/Ananta/actions/runs/41992080767).
 
-### M1.2.3 Schema evolution — not started
-- [ ] Implement table rename while preserving table ID.
-- [ ] Define and test table drop/tombstone semantics.
-- [ ] Implement column rename while preserving column ID.
-- [ ] Define schema compatibility for old segments.
-- [ ] Add nullable-column support only after old-segment reads can synthesize NULL safely.
-- [ ] Keep non-null additions and type changes rejected until backfill/rewrite semantics exist.
-- [ ] Add catalog consistency checker.
-- [ ] Add catalog inspection utility.
+### M1.2.3 Schema evolution compatibility — current work
+
+#### M1.2.3.1 Define immutable snapshots and mixed-segment resolution — complete
+- [x] Define immutable per-table schema snapshots.
+- [x] Define ANF v0.2 table ID/schema revision/column ID metadata.
+- [x] Define ANF v0.1 legacy interpretation using revision-1 snapshots.
+- [x] Define resolver mapping historical columns by stable ColumnId.
+- [x] Define initial compatibility policy for nullable-column addition, rename and reorder.
+- [x] Defer unsafe table rename, drop, non-null additions and type changes.
+- [x] Define snapshot-first/catalog-second publication and recovery rules.
+
+Design: `docs/specifications/schema-evolution-compatibility.md`.
+ADR: `docs/decisions/0005-schema-evolution-needs-immutable-snapshots.md`.
+**Completed:** [PR #8 merged](https://github.com/jadhavdurvesh/Ananta/pull/8); [CI passed](https://github.com/jadhavdurvesh/Ananta/actions/runs/41992649744).
+
+#### M1.2.3.2 Implement immutable schema snapshot files — complete
+- [x] Define ANS1 v1 sidecar format keyed by table ObjectId and schema revision.
+- [x] Implement snapshot encode/decode with bounds, checksum, flags, IDs and schema validation.
+- [x] Implement immutable write/read APIs with exclusive temporary-file creation.
+- [x] Reject overwrites where an existing revision has different contents.
+- [x] Add golden-byte fixture, round-trip, corruption and immutability tests.
+- [x] Expose explicit database methods to write/read a current or historical snapshot.
+- [x] Add catalog consistency checker for catalog-to-snapshot references.
+- [x] Add safe orphan snapshot detection and reporting.
+
+Specification: `docs/specifications/schema-snapshot-ans1-v1.md`.
+**Completed:** [PR #9 merged](https://github.com/jadhavdurvesh/Ananta/pull/9); [CI passed](https://github.com/jadhavdurvesh/Ananta/actions/runs/41993765088).
+
+#### M1.2.3.3 Implement ANF v0.2 and segment schema resolver — in progress
+- [x] Specify ANF v0.2 header and directory with TableId, schema revision and ColumnIds.
+- [x] Add ANF v0.2 writer for new inserts.
+- [x] Preserve the ANF v0.1 decoder for legacy segments.
+- [x] Add segment-version dispatch and ANF v0.2 identity inspection.
+- [x] Resolve v0.1 segments against the immutable revision-one snapshot.
+- [x] Resolve v0.2 segments against their exact table/revision snapshot.
+- [x] Map historical values into current logical column order by stable ColumnId.
+- [x] Synthesize NULL only for current nullable columns absent from an older segment.
+- [x] Reject wrong table IDs, future revisions, identity mismatches and incompatible type/nullability.
+- [x] Add ANF v0.2 golden fixture and malformed identity tests.
+- [x] Add mixed v0.1/v0.2 test including a newly added nullable column and close/reopen.
+- [ ] Run and pass PR CI, then merge.
+
+Implementation branch: `feat/m1-anf-v2-segment-identity`.
+Specification: `docs/specifications/anf-v0.2-prototype.md`.
+
+#### M1.2.3.4 Enable the first safe schema changes — not started
+- [ ] Add nullable column API with old-segment NULL synthesis.
+- [ ] Rename column while preserving ColumnId.
+- [ ] Reorder columns while preserving ColumnIds.
+- [ ] Add failure-injection tests for snapshot/catalog publication order.
+- [ ] Verify current logical results across mixed segment revisions.
+
+Table rename/drop, type changes and non-null additions remain deferred until path identity, tombstones, backfill and compaction protocols are designed.
 
 ## M1.3 Implement bounded read batches
 - [ ] Define a column-vector/batch representation.
@@ -768,4 +811,4 @@ Do these in order. Do not skip ahead.
 10. [ ] Mark M0 complete only after all exit criteria pass.
 11. [ ] Start M1 with exactly one small PR: the ANF format/golden-fixture and safety work package.
 
-**Current focus: M1.2.3.3 — implement ANF v0.2 segment identity and a dual-version reader. Keep schema-changing DDL disabled until mixed-revision reads are proven.**
+**Current focus: M1.2.3.3 — validate ANF v0.2 golden bytes and mixed-revision reads. Keep schema-changing DDL disabled until the PR passes CI and is merged.**

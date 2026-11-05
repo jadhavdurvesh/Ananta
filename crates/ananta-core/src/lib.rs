@@ -1,4 +1,4 @@
-use ananta_format::{decode_projected_segment, encode_segment, FormatError, MAX_SEGMENT_BYTES};
+use ananta_format::{decode_projected_segment, decode_segment_v2, encode_segment_v2, inspect_segment_v2, segment_version, FormatError, MAX_SEGMENT_BYTES};
 use ananta_types::{Column, DataType, Schema, TypeError, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -40,6 +40,7 @@ pub enum DbError {
     TableNotFound(String),
     ColumnNotFound(String),
     CorruptCatalog(&'static str),
+    SchemaCompatibility(&'static str),
     UnsupportedCatalogVersion(u16),
     ChecksumMismatch,
     LengthOverflow,
@@ -56,6 +57,7 @@ impl fmt::Display for DbError {
             Self::TableNotFound(s) => write!(f, "table not found: {s}"),
             Self::ColumnNotFound(s) => write!(f, "column not found: {s}"),
             Self::CorruptCatalog(s) => write!(f, "corrupt ANANTA catalog: {s}"),
+            Self::SchemaCompatibility(s) => write!(f, "ANANTA schema compatibility error: {s}"),
             Self::UnsupportedCatalogVersion(v) => write!(f, "unsupported catalog version: {v}"),
             Self::ChecksumMismatch => f.write_str("catalog checksum mismatch"),
             Self::LengthOverflow => f.write_str("catalog field exceeds supported limits"),
@@ -125,6 +127,7 @@ impl Database {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Catalog::empty(),
             Err(error) => return Err(DbError::Io(error)),
         };
+        ensure_initial_schema_snapshots(&root, &catalog)?;
         Ok(Self { root, catalog })
     }
 
@@ -145,13 +148,21 @@ impl Database {
 
         let table_dir = self.root.join("data").join(&name);
         fs::create_dir_all(&table_dir)?;
-        candidate.tables.insert(name, TableDefinition {
+        candidate.tables.insert(name.clone(), TableDefinition {
             id: table_id,
             schema_revision: 1,
             column_ids,
             schema,
         });
 
+        // Persist revision-one identity before publishing the catalog that references it.
+        let definition = candidate.tables.get(&name).expect("new table inserted");
+        SchemaSnapshot::new(
+            definition.id,
+            definition.schema_revision,
+            &definition.schema,
+            &definition.column_ids,
+        )?.write_to(&self.root)?;
         save_catalog(&self.root.join("catalog").join("catalog.anc"), &candidate)?;
         self.catalog = candidate;
         Ok(())
@@ -265,7 +276,7 @@ impl Database {
                         }
 
                         match SchemaSnapshot::read_from(&self.root, table_id, revision) {
-                            Ok(snapshot) => match current.get(&table_id) {
+                            Ok(_) => match current.get(&table_id) {
                                 None => report.orphaned_files.push(path),
                                 Some(current_revision) if revision > *current_revision => {
                                     report.orphaned_files.push(path)
@@ -322,17 +333,27 @@ impl Database {
     }
 
     pub fn insert_batch(&mut self, table: &str, rows: &[Vec<Value>]) -> Result<Option<PathBuf>, DbError> {
-        let schema = self.schema(table)?;
-        for row in rows { schema.validate_row(row)?; }
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        for row in rows { definition.schema.validate_row(row)?; }
         if rows.is_empty() { return Ok(None); }
+
+        let table_id = definition.id.0;
+        let schema_revision = definition.schema_revision;
+        let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let bytes = encode_segment_v2(
+            &definition.schema,
+            rows,
+            table_id,
+            schema_revision,
+            &column_ids,
+        )?;
 
         let table_dir = self.root.join("data").join(table);
         fs::create_dir_all(&table_dir)?;
         let segment_id = next_segment_id(&table_dir)?;
-        let filename = format!("segment-{segment_id:020}.anf");
-        let final_path = table_dir.join(filename);
+        let final_path = table_dir.join(format!("segment-{segment_id:020}.anf"));
         let temp_path = table_dir.join(format!(".segment-{segment_id:020}.tmp"));
-        let bytes = encode_segment(schema, rows)?;
 
         let write_result = (|| -> Result<(), DbError> {
             let mut file = OpenOptions::new().write(true).create_new(true).open(&temp_path)?;
@@ -349,14 +370,11 @@ impl Database {
     pub fn scan(&self, table: &str) -> Result<Vec<Vec<Value>>, DbError> {
         let schema = self.schema(table)?;
         let projection = (0..schema.len()).collect::<Vec<_>>();
-        self.scan_projected_indices(table, schema, &projection)
+        self.scan_projected_indices(table, &projection)
     }
 
-    /// Decode only the requested columns, preserving the caller's column order.
-    ///
-    /// The current implementation still reads the complete segment into memory
-    /// because ANF v0.1 uses a whole-segment checksum. Bounded column-range I/O
-    /// requires a later format revision and streaming storage API.
+    /// Return only the requested logical columns, preserving caller order.
+    /// ANF v0.1 and v0.2 segments are resolved independently using their stored schema identity.
     pub fn scan_columns(&self, table: &str, columns: &[&str]) -> Result<Vec<Vec<Value>>, DbError> {
         let schema = self.schema(table)?;
         let mut projection = Vec::with_capacity(columns.len());
@@ -365,15 +383,20 @@ impl Database {
                 .ok_or_else(|| DbError::ColumnNotFound((*name).to_owned()))?;
             projection.push(index);
         }
-        self.scan_projected_indices(table, schema, &projection)
+        self.scan_projected_indices(table, &projection)
     }
 
     fn scan_projected_indices(
         &self,
         table: &str,
-        schema: &Schema,
         projection: &[usize],
     ) -> Result<Vec<Vec<Value>>, DbError> {
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        if let Some(index) = projection.iter().find(|index| **index >= definition.schema.len()) {
+            return Err(DbError::Format(FormatError::InvalidProjection(*index)));
+        }
+
         let table_dir = self.root.join("data").join(table);
         let mut segments = Vec::new();
         for entry in fs::read_dir(&table_dir)? {
@@ -384,9 +407,10 @@ impl Database {
             }
         }
         segments.sort();
+
         let mut rows = Vec::new();
         for segment in segments {
-            let mut file = File::open(segment)?;
+            let mut file = File::open(&segment)?;
             let file_len = file.metadata()?.len();
             if file_len > MAX_SEGMENT_BYTES as u64 {
                 return Err(DbError::Format(FormatError::LimitExceeded("segment bytes")));
@@ -394,10 +418,136 @@ impl Database {
             let capacity = usize::try_from(file_len).map_err(|_| DbError::LengthOverflow)?;
             let mut bytes = Vec::with_capacity(capacity);
             file.read_to_end(&mut bytes)?;
-            rows.extend(decode_projected_segment(&bytes, schema, projection)?);
+            let logical_rows = self.decode_and_resolve_segment(table, definition, &bytes)?;
+            for row in logical_rows {
+                rows.push(projection.iter().map(|index| row[*index].clone()).collect());
+            }
         }
         Ok(rows)
     }
+
+    fn decode_and_resolve_segment(
+        &self,
+        _table: &str,
+        current: &TableDefinition,
+        bytes: &[u8],
+    ) -> Result<Vec<Vec<Value>>, DbError> {
+        let version = segment_version(bytes)?;
+        let snapshot = match version {
+            1 => {
+                // ANF v0.1 has no table or schema identity. It is interpreted
+                // only against the table's immutable initial schema snapshot.
+                SchemaSnapshot::read_from(&self.root, current.id, 1)
+                    .map_err(|_| DbError::SchemaCompatibility("ANF v0.1 requires the table's revision-one schema snapshot"))?
+            }
+            2 => {
+                let identity = inspect_segment_v2(bytes)?;
+                if identity.table_id != current.id.0 {
+                    return Err(DbError::SchemaCompatibility("segment table identity does not match its catalog table"));
+                }
+                if identity.schema_revision > current.schema_revision {
+                    return Err(DbError::SchemaCompatibility("segment schema revision is newer than the current catalog schema"));
+                }
+                let snapshot = SchemaSnapshot::read_from(&self.root, current.id, identity.schema_revision)
+                    .map_err(|_| DbError::SchemaCompatibility("segment schema snapshot is missing or invalid"))?;
+                if snapshot.column_ids().map(|id| id.0).collect::<Vec<_>>() != identity.column_ids {
+                    return Err(DbError::SchemaCompatibility("segment column identities do not match its schema snapshot"));
+                }
+                snapshot
+            }
+            other => return Err(DbError::Format(FormatError::UnsupportedVersion(other))),
+        };
+
+        let physical_schema = snapshot.schema()?;
+        let physical_rows = match version {
+            1 => {
+                let projection = (0..physical_schema.len()).collect::<Vec<_>>();
+                decode_projected_segment(bytes, &physical_schema, &projection)?
+            }
+            2 => {
+                let identity = inspect_segment_v2(bytes)?;
+                decode_segment_v2(
+                    bytes,
+                    &physical_schema,
+                    current.id.0,
+                    snapshot.revision(),
+                    &identity.column_ids,
+                )?
+            }
+            _ => unreachable!(),
+        };
+
+        resolve_rows_by_column_id(&snapshot, current, physical_rows)
+    }
+
+}
+
+/// Ensure a revision-one snapshot exists for every table created by older
+/// catalog-v2 builds before snapshot publication became part of table creation.
+fn ensure_initial_schema_snapshots(root: &Path, catalog: &Catalog) -> Result<(), DbError> {
+    for definition in catalog.tables.values() {
+        if definition.schema_revision == 1 {
+            let snapshot = SchemaSnapshot::new(
+                definition.id,
+                definition.schema_revision,
+                &definition.schema,
+                &definition.column_ids,
+            )?;
+            snapshot.write_to(root)?;
+        }
+    }
+    Ok(())
+}
+
+/// Map historical physical rows into the current logical schema by stable ColumnId.
+/// Missing historical columns are synthesised as NULL only when the current column is nullable.
+fn resolve_rows_by_column_id(
+    historical: &SchemaSnapshot,
+    current: &TableDefinition,
+    physical_rows: Vec<Vec<Value>>,
+) -> Result<Vec<Vec<Value>>, DbError> {
+    if historical.table_id() != current.id {
+        return Err(DbError::SchemaCompatibility("schema snapshot table ID does not match current table"));
+    }
+
+    let historical_columns = historical.columns();
+    let historical_ids = historical.column_ids().collect::<Vec<_>>();
+    let current_columns = current.schema.columns();
+    let mut physical_indexes = Vec::with_capacity(current.column_ids.len());
+
+    for (current_id, current_column) in current.column_ids.iter().zip(current_columns) {
+        match historical_ids.iter().position(|id| id == current_id) {
+            Some(index) => {
+                if historical_columns[index].data_type() != current_column.data_type {
+                    return Err(DbError::SchemaCompatibility("column data type changed across schema revisions"));
+                }
+                physical_indexes.push(Some(index));
+            }
+            None if current_column.nullable => physical_indexes.push(None),
+            None => return Err(DbError::SchemaCompatibility("a non-nullable current column is absent from an older segment")),
+        }
+    }
+
+    let mut logical_rows = Vec::with_capacity(physical_rows.len());
+    for physical_row in physical_rows {
+        if physical_row.len() != historical_columns.len() {
+            return Err(DbError::SchemaCompatibility("decoded row width does not match historical schema"));
+        }
+        let mut logical_row = Vec::with_capacity(current_columns.len());
+        for (index, current_column) in physical_indexes.iter().zip(current_columns) {
+            match index {
+                Some(index) => logical_row.push(physical_row[*index].clone()),
+                None if current_column.nullable => logical_row.push(Value::Null),
+                None => return Err(DbError::SchemaCompatibility("cannot synthesise NULL for a non-nullable column")),
+            }
+        }
+        current.schema.validate_row(&logical_row)
+            .map_err(|_| DbError::SchemaCompatibility("resolved row violates the current logical schema"))?;
+        current.schema.validate_row(&logical_row)
+            .map_err(|_| DbError::SchemaCompatibility("resolved row violates the current logical schema"))?;
+        logical_rows.push(logical_row);
+    }
+    Ok(logical_rows)
 }
 
 fn validate_name(name: &str) -> Result<(), DbError> {
@@ -746,6 +896,7 @@ fn checksum64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ananta_format::encode_segment;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path() -> PathBuf {
@@ -908,6 +1059,8 @@ mod tests {
         let mut db = Database::open(&path).unwrap();
         db.create_table("telemetry", sample_schema()).unwrap();
 
+        let snapshot_path = SchemaSnapshot::path(&path, db.table_id("telemetry").unwrap(), 1).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
         let report = db.check_schema_snapshot_consistency().unwrap();
         assert_eq!(report.missing_current, vec![(db.table_id("telemetry").unwrap(), 1)]);
         assert!(report.invalid_files.is_empty());
@@ -964,6 +1117,158 @@ mod tests {
         assert!(report.invalid_files.contains(&snapshot_path));
         assert_eq!(report.missing_current, vec![(table_id, 1)]);
 
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn new_inserts_use_anf_v0_2_and_existing_v0_1_segments_remain_readable() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        let schema_v1 = sample_schema();
+        db.create_table("telemetry", schema_v1.clone()).unwrap();
+
+        let old_rows = vec![vec![
+            Value::TimestampMicros(10),
+            Value::Utf8("old-sensor".into()),
+            Value::Float64(20.0),
+        ]];
+        let legacy_bytes = encode_segment(&schema_v1, &old_rows).unwrap();
+        let table_dir = path.join("data").join("telemetry");
+        fs::write(table_dir.join("segment-00000000000000000001.anf"), legacy_bytes).unwrap();
+
+        let mut candidate = db.catalog.clone();
+        // Allocate in the candidate, not in the live catalog, then publish
+        // the revised snapshot before updating the catalog pointer.
+        let new_column_id = allocate_object_id(&mut candidate).unwrap();
+        let definition = candidate.tables.get_mut("telemetry").unwrap();
+        let schema_v2 = Schema::new(vec![
+            Column::new("timestamp", DataType::TimestampMicros, false),
+            Column::new("device", DataType::Utf8, false),
+            Column::new("temperature", DataType::Float64, true),
+            Column::new("humidity", DataType::Float64, true),
+        ]).unwrap();
+        definition.schema = schema_v2;
+        definition.column_ids.push(new_column_id);
+        definition.schema_revision = 2;
+        increment_catalog_revision(&mut candidate).unwrap();
+
+        let revised = candidate.tables.get("telemetry").unwrap();
+        SchemaSnapshot::new(
+            revised.id,
+            revised.schema_revision,
+            &revised.schema,
+            &revised.column_ids,
+        ).unwrap().write_to(&path).unwrap();
+        save_catalog(&path.join("catalog").join("catalog.anc"), &candidate).unwrap();
+        db.catalog = candidate;
+
+        let new_rows = vec![vec![
+            Value::TimestampMicros(20),
+            Value::Utf8("new-sensor".into()),
+            Value::Float64(22.5),
+            Value::Float64(55.0),
+        ]];
+        let new_segment = db.insert_batch("telemetry", &new_rows).unwrap().unwrap();
+        let bytes = fs::read(&new_segment).unwrap();
+        assert_eq!(segment_version(&bytes).unwrap(), 2);
+
+        let expected = vec![
+            vec![
+                Value::TimestampMicros(10),
+                Value::Utf8("old-sensor".into()),
+                Value::Float64(20.0),
+                Value::Null,
+            ],
+            new_rows[0].clone(),
+        ];
+        assert_eq!(db.scan("telemetry").unwrap(), expected);
+        assert_eq!(
+            db.scan_columns("telemetry", &["humidity", "device"]).unwrap(),
+            vec![
+                vec![Value::Null, Value::Utf8("old-sensor".into())],
+                vec![Value::Float64(55.0), Value::Utf8("new-sensor".into())],
+            ]
+        );
+
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap(), expected);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn mixed_anf_v0_1_and_v0_2_segments_resolve_by_column_id() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        let schema_v1 = sample_schema();
+        db.create_table("telemetry", schema_v1.clone()).unwrap();
+
+        let old_rows = vec![vec![
+            Value::TimestampMicros(10),
+            Value::Utf8("old-sensor".into()),
+            Value::Float64(20.0),
+        ]];
+        let legacy_bytes = encode_segment(&schema_v1, &old_rows).unwrap();
+        let table_dir = path.join("data").join("telemetry");
+        fs::write(
+            table_dir.join("segment-00000000000000000001.anf"),
+            legacy_bytes,
+        ).unwrap();
+
+        let mut candidate = db.catalog.clone();
+        let new_column_id = allocate_object_id(&mut candidate).unwrap();
+        let schema_v2 = Schema::new(vec![
+            Column::new("timestamp", DataType::TimestampMicros, false),
+            Column::new("device", DataType::Utf8, false),
+            Column::new("temperature", DataType::Float64, true),
+            Column::new("humidity", DataType::Float64, true),
+        ]).unwrap();
+        let definition = candidate.tables.get_mut("telemetry").unwrap();
+        definition.schema = schema_v2;
+        definition.column_ids.push(new_column_id);
+        definition.schema_revision = 2;
+        increment_catalog_revision(&mut candidate).unwrap();
+
+        let revised = candidate.tables.get("telemetry").unwrap();
+        SchemaSnapshot::new(
+            revised.id,
+            revised.schema_revision,
+            &revised.schema,
+            &revised.column_ids,
+        ).unwrap().write_to(&path).unwrap();
+        save_catalog(&path.join("catalog").join("catalog.anc"), &candidate).unwrap();
+        db.catalog = candidate;
+
+        let new_rows = vec![vec![
+            Value::TimestampMicros(20),
+            Value::Utf8("new-sensor".into()),
+            Value::Float64(22.5),
+            Value::Float64(55.0),
+        ]];
+        let new_segment = db.insert_batch("telemetry", &new_rows).unwrap().unwrap();
+        assert_eq!(segment_version(&fs::read(new_segment).unwrap()).unwrap(), 2);
+
+        let expected = vec![
+            vec![
+                Value::TimestampMicros(10),
+                Value::Utf8("old-sensor".into()),
+                Value::Float64(20.0),
+                Value::Null,
+            ],
+            new_rows[0].clone(),
+        ];
+        assert_eq!(db.scan("telemetry").unwrap(), expected);
+        assert_eq!(
+            db.scan_columns("telemetry", &["humidity", "device"]).unwrap(),
+            vec![
+                vec![Value::Null, Value::Utf8("old-sensor".into())],
+                vec![Value::Float64(55.0), Value::Utf8("new-sensor".into())],
+            ]
+        );
+
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap(), expected);
         fs::remove_dir_all(path).unwrap();
     }
 
