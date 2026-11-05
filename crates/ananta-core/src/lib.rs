@@ -2529,4 +2529,162 @@ mod tests {
         assert!(db.scan_columns("telemetry", &["missing"]).is_err());
         fs::remove_dir_all(path).unwrap();
     }
+
+    fn batches_to_rows(batches: Vec<RecordBatch>) -> Vec<Vec<Value>> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            for row_index in 0..batch.row_count {
+                rows.push(batch.columns.iter().map(|column| column[row_index].clone()).collect());
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn bounded_scan_returns_projected_columnar_batches_and_honours_limit() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let first_rows = vec![
+            vec![Value::TimestampMicros(1), Value::Utf8("a".into()), Value::Float64(1.0)],
+            vec![Value::TimestampMicros(2), Value::Utf8("b".into()), Value::Null],
+            vec![Value::TimestampMicros(3), Value::Utf8("c".into()), Value::Float64(3.0)],
+        ];
+        let second_rows = vec![
+            vec![Value::TimestampMicros(4), Value::Utf8("d".into()), Value::Float64(4.0)],
+            vec![Value::TimestampMicros(5), Value::Utf8("e".into()), Value::Float64(5.0)],
+        ];
+        db.insert_batch("telemetry", &first_rows).unwrap();
+        db.insert_batch("telemetry", &second_rows).unwrap();
+
+        let batches = db.scan_batches("telemetry", 2).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches.iter().map(|batch| batch.row_count).collect::<Vec<_>>(), vec![2, 1, 2]);
+        assert!(batches.iter().all(|batch| batch.row_count <= 2));
+        let mut expected = first_rows.clone();
+        expected.extend(second_rows.clone());
+        assert_eq!(batches_to_rows(batches), expected);
+
+        let projected = db.scan_columns_batches("telemetry", &["device", "temperature", "device"], 2).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            projected[0].schema.columns().iter().map(|column| column.name.as_str()).collect::<Vec<_>>(),
+            vec!["device", "temperature", "device"]
+        );
+        assert_eq!(
+            batches_to_rows(projected),
+            vec![
+                vec![Value::Utf8("a".into()), Value::Float64(1.0), Value::Utf8("a".into())],
+                vec![Value::Utf8("b".into()), Value::Null, Value::Utf8("b".into())],
+                vec![Value::Utf8("c".into()), Value::Float64(3.0), Value::Utf8("c".into())],
+                vec![Value::Utf8("d".into()), Value::Float64(4.0), Value::Utf8("d".into())],
+                vec![Value::Utf8("e".into()), Value::Float64(5.0), Value::Utf8("e".into())],
+            ]
+        );
+
+        let limited = db.scan_columns_batches_with_limit(
+            "telemetry",
+            &["timestamp", "device"],
+            2,
+            3,
+        ).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(limited.iter().map(|batch| batch.row_count).collect::<Vec<_>>(), vec![2, 1]);
+        assert_eq!(
+            batches_to_rows(limited),
+            vec![
+                vec![Value::TimestampMicros(1), Value::Utf8("a".into())],
+                vec![Value::TimestampMicros(2), Value::Utf8("b".into())],
+                vec![Value::TimestampMicros(3), Value::Utf8("c".into())],
+            ]
+        );
+
+        assert!(db.scan_batches_with_limit("telemetry", 2, 0).unwrap().next().is_none());
+        assert!(db.scan_batches("telemetry", 0).is_err());
+        assert!(db.scan_batches("telemetry", MAX_BATCH_ROWS + 1).is_err());
+        assert!(db.scan_columns_batches("telemetry", &[], 2).is_err());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_scan_handles_empty_tables_and_one_row_batches() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        assert!(db.scan_batches("telemetry", 1).unwrap().next().is_none());
+
+        let rows = vec![
+            vec![Value::TimestampMicros(1), Value::Utf8("a".into()), Value::Float64(1.0)],
+            vec![Value::TimestampMicros(2), Value::Utf8("b".into()), Value::Float64(2.0)],
+        ];
+        db.insert_batch("telemetry", &rows).unwrap();
+        let batches = db.scan_batches("telemetry", 1).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches.iter().map(|batch| batch.row_count).collect::<Vec<_>>(), vec![1, 1]);
+        assert_eq!(batches_to_rows(batches), rows);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_scan_maps_legacy_columns_after_nullable_addition_and_reopen() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        let original = sample_schema();
+        db.create_table("telemetry", original.clone()).unwrap();
+        let old_rows = vec![
+            vec![Value::TimestampMicros(1), Value::Utf8("legacy-a".into()), Value::Float64(10.0)],
+            vec![Value::TimestampMicros(2), Value::Utf8("legacy-b".into()), Value::Float64(20.0)],
+        ];
+        let table_dir = path.join("data").join("telemetry");
+        fs::write(
+            table_dir.join("segment-00000000000000000001.anf"),
+            encode_segment(&original, &old_rows).unwrap(),
+        ).unwrap();
+        db.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
+        let new_rows = vec![
+            vec![Value::TimestampMicros(3), Value::Utf8("new-c".into()), Value::Float64(30.0), Value::Float64(40.0)],
+        ];
+        db.insert_batch("telemetry", &new_rows).unwrap();
+
+        let batches = db.scan_columns_batches("telemetry", &["humidity", "device"], 1).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches_to_rows(batches), vec![
+            vec![Value::Null, Value::Utf8("legacy-a".into())],
+            vec![Value::Null, Value::Utf8("legacy-b".into())],
+            vec![Value::Float64(40.0), Value::Utf8("new-c".into())],
+        ]);
+
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        let reopened_batches = reopened.scan_columns_batches("telemetry", &["humidity"], 2).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches_to_rows(reopened_batches), vec![
+            vec![Value::Null],
+            vec![Value::Null],
+            vec![Value::Float64(40.0)],
+        ]);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_scan_returns_corrupt_segment_error_once_then_stops() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("sensor".into()),
+            Value::Float64(12.5),
+        ]];
+        let segment = db.insert_batch("telemetry", &rows).unwrap().unwrap();
+        let mut bytes = fs::read(&segment).unwrap();
+        let last_payload = bytes.len() - 13;
+        bytes[last_payload] ^= 1;
+        fs::write(&segment, bytes).unwrap();
+
+        let mut iter = db.scan_batches("telemetry", 1).unwrap();
+        assert!(matches!(iter.next(), Some(Err(DbError::Format(FormatError::ChecksumMismatch)))));
+        assert!(iter.next().is_none());
+        fs::remove_dir_all(path).unwrap();
+    }
+
 }
