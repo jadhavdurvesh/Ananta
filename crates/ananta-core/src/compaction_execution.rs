@@ -51,7 +51,7 @@ struct ExecutionRow {
     origin: RowOrigin,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ProvenanceSidecar {
     table_id: u64,
     schema_revision: u64,
@@ -604,6 +604,10 @@ fn finish_cancelled(journal: &mut CompactionJobJournal, path: &Path, progress: C
 fn journal_state(path: &Path) -> Option<CompactionJobState> {
     crate::compaction::read_compaction_journal(path).ok()?.last().map(|event| event.state)
 }
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire))
+}
+
 fn check_cancel(cancel: Option<&AtomicBool>) -> Result<(), DbError> {
     if cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
         Err(DbError::CompactionExecution("compaction cancelled at a bounded work-unit boundary".into()))
