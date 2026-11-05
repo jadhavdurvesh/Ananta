@@ -3077,6 +3077,36 @@ mod tests {
     }
 
     #[test]
+    fn chronicle_precommit_publication_failure_consumes_no_sequence() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(44),
+            Value::Utf8("retry-after-write-failure".into()),
+            Value::Float64(4.4),
+        ]];
+        let blocked_temp = path.join("data").join("telemetry")
+            .join(".chronicle-00000000000000000001.tmp");
+        fs::write(&blocked_temp, b"owned by another attempt").unwrap();
+        let batch_id = BatchId::from_bytes([17; 16]).unwrap();
+
+        assert!(matches!(
+            db.ingest_batch("telemetry", batch_id, &rows),
+            Err(DbError::Io(_))
+        ));
+        assert_eq!(db.ingestion_stats("telemetry").unwrap().accepted_batches, 0);
+        assert_eq!(db.ingestion_stats("telemetry").unwrap().publication_failures, 1);
+        assert_eq!(fs::read(&blocked_temp).unwrap(), b"owned by another attempt");
+
+        fs::remove_file(blocked_temp).unwrap();
+        let accepted = db.ingest_batch("telemetry", batch_id, &rows).unwrap();
+        assert_eq!(accepted.ingestion_sequence, 1);
+        assert_eq!(db.ingestion_stats("telemetry").unwrap().accepted_batches, 1);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn chronicle_rejects_empty_and_invalid_batches_without_sequence_gaps() {
         let path = temp_path();
         let mut db = Database::open(&path).unwrap();
