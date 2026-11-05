@@ -9,6 +9,9 @@ const SEGMENT_PREFIX: &str = "segment-";
 const TEMP_SEGMENT_PREFIX: &str = ".segment-";
 const SEGMENT_SUFFIX: &str = ".anf";
 const TEMP_SEGMENT_SUFFIX: &str = ".tmp";
+const CHRONICLE_PREFIX: &str = "segment-";
+const TEMP_CHRONICLE_PREFIX: &str = ".chronicle-";
+const CHRONICLE_SUFFIX: &str = ".chr";
 
 /// Exclusive local writer lock. Stale locks are deliberately not broken automatically.
 pub(crate) struct DatabaseLock {
@@ -135,6 +138,50 @@ where
     Ok(final_path)
 }
 
+
+pub(crate) fn publish_chronicle(
+    directory: &Path,
+    file_id: u64,
+    bytes: &[u8],
+) -> Result<PathBuf, DbError> {
+    if file_id == 0 {
+        return Err(DbError::LengthOverflow);
+    }
+    let final_path = directory.join(format!("{CHRONICLE_PREFIX}{file_id:020}{CHRONICLE_SUFFIX}"));
+    let temp_path = directory.join(format!("{TEMP_CHRONICLE_PREFIX}{file_id:020}{TEMP_SEGMENT_SUFFIX}"));
+    let mut temporary_owned = false;
+    let mut published = false;
+    let result = (|| -> Result<(), DbError> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp_path)?;
+        temporary_owned = true;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&temp_path, &final_path)?;
+        published = true;
+        sync_directory(directory)?;
+        fs::remove_file(&temp_path)?;
+        temporary_owned = false;
+        sync_directory(directory)?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        if !published && temporary_owned {
+            let _ = fs::remove_file(&temp_path);
+        }
+        if published {
+            return Err(DbError::SegmentPublicationUncertain {
+                path: final_path,
+                reason: error.to_string(),
+            });
+        }
+        return Err(error);
+    }
+    Ok(final_path)
+}
+
 /// Remove only canonical regular-file temp segments. Temp names are never committed.
 pub(crate) fn cleanup_orphan_segment_temps(data_root: &Path) -> Result<Vec<PathBuf>, DbError> {
     let mut removed = Vec::new();
@@ -154,7 +201,7 @@ pub(crate) fn cleanup_orphan_segment_temps(data_root: &Path) -> Result<Vec<PathB
             let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if is_canonical_temp_segment_name(filename) {
+            if is_canonical_temp_segment_name(filename) || is_canonical_temp_chronicle_name(filename) {
                 fs::remove_file(&path)?;
                 removed.push(path);
                 changed = true;
@@ -166,6 +213,20 @@ pub(crate) fn cleanup_orphan_segment_temps(data_root: &Path) -> Result<Vec<PathB
     }
     removed.sort();
     Ok(removed)
+}
+
+
+fn is_canonical_temp_chronicle_name(filename: &str) -> bool {
+    let Some(id_text) = filename
+        .strip_prefix(TEMP_CHRONICLE_PREFIX)
+        .and_then(|value| value.strip_suffix(TEMP_SEGMENT_SUFFIX))
+    else {
+        return false;
+    };
+    if id_text.len() != 20 || !id_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    id_text.parse::<u64>().is_ok_and(|id| id != 0 && format!("{id:020}") == id_text)
 }
 
 fn is_canonical_temp_segment_name(filename: &str) -> bool {
