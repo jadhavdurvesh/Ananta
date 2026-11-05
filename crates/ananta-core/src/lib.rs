@@ -878,7 +878,9 @@ impl Database {
         for segment in segments {
             let mut file = File::open(&segment)?;
             let file_len = file.metadata()?.len();
-            if file_len > (MAX_SEGMENT_BYTES as u64 + 108) {
+            let is_chronicle = segment.extension().and_then(|value| value.to_str()) == Some("chr");
+            let maximum_file_len = MAX_SEGMENT_BYTES as u64 + if is_chronicle { 108 } else { 0 };
+            if file_len > maximum_file_len {
                 return Err(DbError::Format(FormatError::LimitExceeded("segment bytes")));
             }
             let capacity = usize::try_from(file_len).map_err(|_| DbError::LengthOverflow)?;
