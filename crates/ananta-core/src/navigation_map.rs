@@ -426,6 +426,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capsule::CapsuleColumnStats;
 
     #[test]
     fn range_pruning_keeps_missing_stats_and_respects_inclusive_exclusive_edges() {
