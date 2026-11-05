@@ -536,6 +536,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capsule_round_trip_preserves_identity_statistics_and_temporal_bounds() {
+        use ananta_types::Column;
+
+        let schema = Schema::new(vec![
+            Column::new("event_time", DataType::TimestampMicros, false),
+            Column::new("temperature", DataType::Float64, true),
+            Column::new("device", DataType::Utf8, false),
+            Column::new("all_null", DataType::Int64, true),
+        ]).unwrap();
+        let rows = vec![
+            vec![Value::TimestampMicros(100), Value::Float64(21.5), Value::Utf8("a".into()), Value::Null],
+            vec![Value::TimestampMicros(300), Value::Null, Value::Utf8("bb".into()), Value::Null],
+            vec![Value::TimestampMicros(200), Value::Float64(18.5), Value::Utf8("c".into()), Value::Null],
+        ];
+        let ids = vec![101, 102, 103, 104];
+        let payload = ananta_format::encode_segment_v2(&schema, &rows, 7, 2, &ids).unwrap();
+        let inspection = inspect_segment_v2_details(&payload).unwrap();
+        let columns = derive_column_stats(&schema, &ids, &rows, &inspection).unwrap();
+        let (temporal_min, temporal_max) = derive_temporal_bounds(&columns, Some(101)).unwrap();
+        let metadata = CapsuleMetadata {
+            table_id: 7,
+            capsule_id: 5,
+            generation: 2,
+            schema_revision: 2,
+            row_count: 3,
+            first_ingestion_sequence: 10,
+            last_ingestion_sequence: 12,
+            event_time_column_id: Some(101),
+            temporal_min,
+            temporal_max,
+            payload_len: 0,
+            payload_sha256: [0; 32],
+            columns,
+        };
+
+        let encoded = encode_capsule(metadata, &payload).unwrap();
+        let (decoded, decoded_payload) = decode_capsule(&encoded).unwrap();
+        assert_eq!(decoded.table_id, 7);
+        assert_eq!(decoded.capsule_id, 5);
+        assert_eq!(decoded.generation, 2);
+        assert_eq!(decoded.schema_revision, 2);
+        assert_eq!(decoded.row_count, 3);
+        assert_eq!((decoded.first_ingestion_sequence, decoded.last_ingestion_sequence), (10, 12));
+        assert_eq!((decoded.temporal_min, decoded.temporal_max), (Some(100), Some(300)));
+        assert_eq!(decoded_payload, payload);
+        assert_eq!(decoded.columns[1].null_count, 1);
+        assert_eq!(decoded.columns[1].minimum, Some(Value::Float64(18.5)));
+        assert_eq!(decoded.columns[1].maximum, Some(Value::Float64(21.5)));
+        assert_eq!(decoded.columns[2].minimum, None);
+        assert_eq!(decoded.columns[3].null_count, 3);
+        assert_eq!(decoded.columns[3].minimum, None);
+        assert_eq!(decoded.columns[3].maximum, None);
+    }
+
+    #[test]
+    fn capsule_rejects_checksum_and_payload_fingerprint_corruption() {
+        use ananta_types::Column;
+
+        let schema = Schema::new(vec![
+            Column::new("time", DataType::TimestampMicros, false),
+        ]).unwrap();
+        let rows = vec![vec![Value::TimestampMicros(1)]];
+        let payload = ananta_format::encode_segment_v2(&schema, &rows, 7, 1, &[9]).unwrap();
+        let inspection = inspect_segment_v2_details(&payload).unwrap();
+        let columns = derive_column_stats(&schema, &[9], &rows, &inspection).unwrap();
+        let metadata = CapsuleMetadata {
+            table_id: 7, capsule_id: 1, generation: 1, schema_revision: 1,
+            row_count: 1, first_ingestion_sequence: 1, last_ingestion_sequence: 1,
+            event_time_column_id: None, temporal_min: None, temporal_max: None,
+            payload_len: 0, payload_sha256: [0; 32], columns,
+        };
+        let encoded = encode_capsule(metadata, &payload).unwrap();
+
+        let mut checksum_corrupt = encoded.clone();
+        checksum_corrupt[HEADER_LEN] ^= 1;
+        assert!(matches!(decode_capsule(&checksum_corrupt), Err(DbError::CapsuleCorrupt("Capsule checksum mismatch"))));
+
+        let mut fingerprint_corrupt = encoded;
+        let payload_start = HEADER_LEN + COLUMN_DESCRIPTOR_LEN;
+        fingerprint_corrupt[payload_start] ^= 1;
+        let trailer_start = fingerprint_corrupt.len() - TRAILER_LEN;
+        let checksum = checksum64(&fingerprint_corrupt[..trailer_start]);
+        fingerprint_corrupt[trailer_start..trailer_start + 8].copy_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(decode_capsule(&fingerprint_corrupt), Err(DbError::CapsuleCorrupt("embedded ANF payload fingerprint mismatch"))));
+    }
+
+    #[test]
     fn scalar_stats_round_trip_preserves_f64_bits() {
         let metadata = CapsuleColumnStats {
             column_id: 9,
