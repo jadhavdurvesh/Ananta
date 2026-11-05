@@ -103,7 +103,7 @@ The embedded database currently exposes:
 - `Database::write_schema_snapshot(table)`
 - `Database::read_schema_snapshot(table, revision)`
 
-Writing a snapshot does not mutate the active catalog revision. It is currently an explicit operation; catalog-driven automatic snapshot publication will be wired in with schema evolution DDL after the segment resolver is implemented.
+Writing a snapshot does not mutate the active catalog revision. It is currently an explicit operation; catalog-driven automatic snapshot publication will be wired in with schema evolution DDL after the segment resolver is implemented. `Database::check_schema_snapshot_consistency()` reports missing current snapshots, malformed/corrupt files, temporary files and unreferenced table/future-revision snapshots. Valid historical revisions below the current revision are retained because segment references are not yet encoded in ANF.
 
 This snapshot file is not yet registered in a catalog history index. Its canonical key is the pair (table ObjectId, schema revision). A consistency checker/orphan scanner is planned before DDL is enabled.
 
