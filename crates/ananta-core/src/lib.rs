@@ -1,4 +1,4 @@
-use ananta_format::{decode_projected_segment, decode_segment_v2, encode_segment_v2, inspect_segment_v2, segment_version, FormatError, SegmentBatchReader, MAX_BATCH_CELLS, MAX_BATCH_COLUMNS, MAX_BATCH_ROWS, MAX_SEGMENT_BYTES};
+use ananta_format::{decode_projected_segment, decode_segment_v2, encode_segment_v2, inspect_segment_v2, inspect_segment_v2_details, segment_version, FormatError, SegmentBatchReader, MAX_BATCH_CELLS, MAX_BATCH_COLUMNS, MAX_BATCH_ROWS, MAX_SEGMENT_BYTES};
 use ananta_types::{Column, DataType, Schema, TypeError, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -11,10 +11,13 @@ mod nullable_ddl;
 mod column_rename_reorder;
 mod segment_publication;
 mod chronicle;
+mod capsule;
 pub use chronicle::{BatchId, IngestOutcome, IngestResult, IngestionStats};
+pub use capsule::{CapsuleColumnStats, CapsuleMetadata};
 use schema_snapshot::{SchemaSnapshot, SchemaSnapshotConsistencyReport};
-use segment_publication::{cleanup_orphan_segment_temps, publish_segment, publish_chronicle, DatabaseLock};
+use segment_publication::{cleanup_orphan_segment_temps, publish_segment, publish_chronicle, publish_capsule, DatabaseLock};
 use chronicle::{encode_record, extract_payload, inspect_file as inspect_chronicle_file, scan_table_index, BatchReceipt, PayloadReader, TableChronicleIndex};
+use capsule::{decode_capsule, derive_column_stats, derive_temporal_bounds, encode_capsule};
 
 const CATALOG_MAGIC: &[u8; 4] = b"ANC1";
 const CATALOG_END: &[u8; 4] = b"CEND";
@@ -60,6 +63,7 @@ pub enum DbError {
     BatchIdConflict(BatchId),
     ChronicleCorrupt(&'static str),
     IngestRowValidation { row_index: usize, message: String },
+    CapsuleCorrupt(&'static str),
 }
 
 impl fmt::Display for DbError {
@@ -86,6 +90,7 @@ impl fmt::Display for DbError {
             Self::BatchIdConflict(id) => write!(f, "BatchId {id} was already committed with a different payload"),
             Self::ChronicleCorrupt(message) => write!(f, "corrupt Chronicle record: {message}"),
             Self::IngestRowValidation { row_index, message } => write!(f, "ingestion row {row_index} failed validation: {message}"),
+            Self::CapsuleCorrupt(message) => write!(f, "corrupt Capsule: {message}"),
         }
     }
 }
@@ -721,6 +726,171 @@ impl Database {
         }
     }
 
+    /// Build one immutable Capsule from an inclusive contiguous range of committed Chronicle sequences.
+    ///
+    /// The current logical schema is used for the derived ANF payload. Historical source
+    /// batches are resolved by stable ColumnId. No Chronicle records are removed or hidden.
+    pub fn build_capsule(
+        &self,
+        table: &str,
+        capsule_id: u64,
+        generation: u64,
+        first_sequence: u64,
+        last_sequence: u64,
+        event_time_column: Option<&str>,
+    ) -> Result<PathBuf, DbError> {
+        if capsule_id == 0 || generation == 0 || first_sequence == 0 || last_sequence < first_sequence {
+            return Err(DbError::CapsuleCorrupt("Capsule identity, generation or source sequence range is invalid"));
+        }
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?
+            .clone();
+        let index = self.chronicle_indices.get(&definition.id)
+            .ok_or(DbError::CapsuleCorrupt("table has no Chronicle receipt index"))?;
+        let mut receipts = index.by_batch_id.values()
+            .filter(|receipt| receipt.metadata.sequence >= first_sequence
+                && receipt.metadata.sequence <= last_sequence)
+            .cloned()
+            .collect::<Vec<_>>();
+        receipts.sort_by_key(|receipt| receipt.metadata.sequence);
+        let expected_receipts = last_sequence.checked_sub(first_sequence)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(DbError::LengthOverflow)?;
+        if u64::try_from(receipts.len()).map_err(|_| DbError::LengthOverflow)? != expected_receipts {
+            return Err(DbError::CapsuleCorrupt("source sequence range is not fully committed and contiguous"));
+        }
+
+        let mut rows = Vec::new();
+        for (offset, receipt) in receipts.iter().enumerate() {
+            let expected_sequence = first_sequence.checked_add(offset as u64).ok_or(DbError::LengthOverflow)?;
+            if receipt.metadata.sequence != expected_sequence {
+                return Err(DbError::CapsuleCorrupt("source Chronicle sequences contain a gap"));
+            }
+            let record_bytes = fs::read(&receipt.path)?;
+            let (record_metadata, payload) = extract_payload(&record_bytes, definition.id.0)?;
+            if record_metadata.batch_id != receipt.metadata.batch_id
+                || record_metadata.sequence != receipt.metadata.sequence
+                || record_metadata.fingerprint != receipt.metadata.fingerprint
+            {
+                return Err(DbError::ChronicleCorrupt("receipt index differs from source Chronicle record"));
+            }
+            let mut batch_rows = self.decode_and_resolve_segment(table, &definition, &payload)?;
+            rows.append(&mut batch_rows);
+            let cells = rows.len().checked_mul(definition.schema.len()).ok_or(DbError::LengthOverflow)?;
+            if rows.len() > 1_000_000 || cells > 1_000_000 {
+                return Err(DbError::CapsuleCorrupt("Capsule exceeds ANF row or decoded-cell limits"));
+            }
+        }
+        if rows.is_empty() {
+            return Err(DbError::CapsuleCorrupt("Capsule cannot be empty"));
+        }
+
+        let event_time_index = match event_time_column {
+            Some(name) => {
+                let index = definition.schema.columns().iter().position(|column| column.name == name)
+                    .ok_or_else(|| DbError::ColumnNotFound(name.to_owned()))?;
+                if definition.schema.columns()[index].data_type != DataType::TimestampMicros {
+                    return Err(DbError::CapsuleCorrupt("event-time column must have type TIMESTAMP_MICROS"));
+                }
+                Some(index)
+            }
+            None => None,
+        };
+        let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let payload = encode_segment_v2(
+            &definition.schema,
+            &rows,
+            definition.id.0,
+            definition.schema_revision,
+            &column_ids,
+        )?;
+        let inspection = inspect_segment_v2_details(&payload)?;
+        let columns = derive_column_stats(&definition.schema, &column_ids, &rows, &inspection)?;
+        let event_time_column_id = event_time_index.map(|index| column_ids[index]);
+        let (temporal_min, temporal_max) = derive_temporal_bounds(&columns, event_time_column_id)?;
+        let metadata = CapsuleMetadata {
+            table_id: definition.id.0,
+            capsule_id,
+            generation,
+            schema_revision: definition.schema_revision,
+            row_count: u64::try_from(rows.len()).map_err(|_| DbError::LengthOverflow)?,
+            first_ingestion_sequence: first_sequence,
+            last_ingestion_sequence: last_sequence,
+            event_time_column_id,
+            temporal_min,
+            temporal_max,
+            payload_len: 0,
+            payload_sha256: [0; 32],
+            columns,
+        };
+        let capsule_bytes = encode_capsule(metadata, &payload)?;
+        let capsule_directory = self.root.join("data").join(table).join("capsules");
+        fs::create_dir_all(&capsule_directory)?;
+        publish_capsule(&capsule_directory, capsule_id, generation, &capsule_bytes)
+    }
+
+    /// Independently validate a Capsule file and recompute every statistic from its ANF payload.
+    pub fn validate_capsule(
+        &self,
+        table: &str,
+        capsule_id: u64,
+        generation: u64,
+    ) -> Result<CapsuleMetadata, DbError> {
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        if capsule_id == 0 || generation == 0 {
+            return Err(DbError::CapsuleCorrupt("Capsule identity and generation must be nonzero"));
+        }
+        let path = self.root.join("data").join(table).join("capsules")
+            .join(format!("capsule-{capsule_id:020}-g{generation:020}.cap"));
+        let file_len = fs::metadata(&path)?.len();
+        if file_len > capsule::MAX_CAPSULE_BYTES as u64 {
+            return Err(DbError::CapsuleCorrupt("Capsule file exceeds size limit"));
+        }
+        let bytes = fs::read(path)?;
+        let (metadata, payload) = decode_capsule(&bytes)?;
+        if metadata.table_id != definition.id.0
+            || metadata.capsule_id != capsule_id
+            || metadata.generation != generation
+        {
+            return Err(DbError::CapsuleCorrupt("Capsule identity does not match requested table/path"));
+        }
+        if metadata.schema_revision > definition.schema_revision {
+            return Err(DbError::CapsuleCorrupt("Capsule schema revision is newer than the current table"));
+        }
+        let snapshot = SchemaSnapshot::read_from(&self.root, definition.id, metadata.schema_revision)
+            .map_err(|_| DbError::CapsuleCorrupt("Capsule schema snapshot is missing or corrupt"))?;
+        let historical_schema = snapshot.schema()?;
+        let historical_ids = snapshot.column_ids().map(|id| id.0).collect::<Vec<_>>();
+        let rows = decode_segment_v2(
+            &payload,
+            &historical_schema,
+            definition.id.0,
+            metadata.schema_revision,
+            &historical_ids,
+        )?;
+        if rows.len() as u64 != metadata.row_count {
+            return Err(DbError::CapsuleCorrupt("Capsule row count differs from decoded payload"));
+        }
+        let inspection = inspect_segment_v2_details(&payload)?;
+        let recomputed = derive_column_stats(&historical_schema, &historical_ids, &rows, &inspection)?;
+        if !capsule_stats_equal(&metadata.columns, &recomputed) {
+            return Err(DbError::CapsuleCorrupt("Capsule column statistics do not match decoded payload"));
+        }
+        let (temporal_min, temporal_max) = derive_temporal_bounds(&recomputed, metadata.event_time_column_id)?;
+        if temporal_min != metadata.temporal_min || temporal_max != metadata.temporal_max {
+            return Err(DbError::CapsuleCorrupt("Capsule temporal bounds do not match decoded payload"));
+        }
+        let index = self.chronicle_indices.get(&definition.id)
+            .ok_or(DbError::CapsuleCorrupt("table Chronicle index is missing"))?;
+        for sequence in metadata.first_ingestion_sequence..=metadata.last_ingestion_sequence {
+            if !index.by_batch_id.values().any(|receipt| receipt.metadata.sequence == sequence) {
+                return Err(DbError::CapsuleCorrupt("Capsule source Chronicle sequence is no longer available"));
+            }
+        }
+        Ok(metadata)
+    }
+
     /// Durable accepted counters are reconstructed from Chronicle receipts on open.
     /// Request/failure counters are process-local and reset after restart.
     pub fn ingestion_stats(&self, table: &str) -> Result<IngestionStats, DbError> {
@@ -1026,6 +1196,27 @@ fn resolve_rows_by_column_id(
         logical_rows.push(logical_row);
     }
     Ok(logical_rows)
+}
+
+
+fn capsule_values_equal(left: &Option<Value>, right: &Option<Value>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(Value::Float64(left)), Some(Value::Float64(right))) => left.to_bits() == right.to_bits(),
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn capsule_stats_equal(left: &[CapsuleColumnStats], right: &[CapsuleColumnStats]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|(left, right)| {
+        left.column_id == right.column_id
+            && left.data_type == right.data_type
+            && left.null_count == right.null_count
+            && left.encoded_bytes == right.encoded_bytes
+            && capsule_values_equal(&left.minimum, &right.minimum)
+            && capsule_values_equal(&left.maximum, &right.maximum)
+    })
 }
 
 fn validate_name(name: &str) -> Result<(), DbError> {
