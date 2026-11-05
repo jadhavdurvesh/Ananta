@@ -6,6 +6,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+pub mod schema_snapshot;
+use schema_snapshot::SchemaSnapshot;
+
 const CATALOG_MAGIC: &[u8; 4] = b"ANC1";
 const CATALOG_END: &[u8; 4] = b"CEND";
 const CATALOG_V1_VERSION: u16 = 1;
@@ -191,6 +194,32 @@ impl Database {
         self.catalog.tables.get(table)
             .map(|definition| definition.schema_revision)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))
+    }
+
+    /// Persist the current table schema as an immutable sidecar snapshot.
+    ///
+    /// This does not change the active catalog revision or enable schema DDL.
+    pub fn write_schema_snapshot(&self, table: &str) -> Result<PathBuf, DbError> {
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        let snapshot = SchemaSnapshot::new(
+            definition.id,
+            definition.schema_revision,
+            &definition.schema,
+            &definition.column_ids,
+        )?;
+        snapshot.write_to(&self.root)
+    }
+
+    /// Load a historical schema snapshot for a table by revision.
+    pub fn read_schema_snapshot(
+        &self,
+        table: &str,
+        revision: u64,
+    ) -> Result<SchemaSnapshot, DbError> {
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        SchemaSnapshot::read_from(&self.root, definition.id, revision)
     }
 
     pub fn insert_batch(&mut self, table: &str, rows: &[Vec<Value>]) -> Result<Option<PathBuf>, DbError> {
@@ -745,6 +774,32 @@ mod tests {
         assert_eq!(db.table_names().count(), 0);
         assert_eq!(fs::read(path.join("catalog").join("catalog.anc.tmp")).unwrap(), b"reserved");
 
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn database_persists_immutable_schema_snapshot_without_catalog_mutation() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let revision = db.catalog_revision();
+        let table_id = db.table_id("telemetry").unwrap();
+        let column_ids = ["timestamp", "device", "temperature"]
+            .map(|name| db.column_id("telemetry", name).unwrap());
+
+        let snapshot_path = db.write_schema_snapshot("telemetry").unwrap();
+        assert!(snapshot_path.exists());
+        assert_eq!(db.catalog_revision(), revision);
+
+        let snapshot = db.read_schema_snapshot("telemetry", 1).unwrap();
+        assert_eq!(snapshot.table_id(), table_id);
+        assert_eq!(snapshot.revision(), 1);
+        assert_eq!(snapshot.column_ids().collect::<Vec<_>>(), column_ids);
+        assert_eq!(snapshot.schema().unwrap(), *db.schema("telemetry").unwrap());
+
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.read_schema_snapshot("telemetry", 1).unwrap(), snapshot);
         fs::remove_dir_all(path).unwrap();
     }
 
