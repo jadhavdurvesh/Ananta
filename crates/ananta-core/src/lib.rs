@@ -3930,4 +3930,218 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
+
+    #[test]
+    fn navigation_map_prunes_without_changing_query_results_and_reports_diagnostics() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+
+        for capsule_index in 0..4_i64 {
+            let start = capsule_index * 10;
+            let rows = (0..10_i64).map(|offset| {
+                let timestamp = start + offset;
+                vec![
+                    Value::TimestampMicros(timestamp),
+                    Value::Utf8(format!("device-{}", capsule_index)),
+                    Value::Float64((timestamp + 10) as f64),
+                ]
+            }).collect::<Vec<_>>();
+            let sequence = capsule_index as u8 + 1;
+            db.ingest_batch(
+                "telemetry",
+                BatchId::from_bytes([sequence; 16]).unwrap(),
+                &rows,
+            ).unwrap();
+            db.build_capsule(
+                "telemetry",
+                sequence as u64,
+                1,
+                sequence as u64,
+                sequence as u64,
+                Some("timestamp"),
+            ).unwrap();
+        }
+
+        let map_path = db.build_navigation_map("telemetry", 1).unwrap();
+        assert!(map_path.is_file());
+
+        let request = CapsuleScanRequest {
+            ranges: vec![
+                ColumnRangePredicate::new(
+                    "timestamp",
+                    Some(Value::TimestampMicros(15)),
+                    true,
+                    Some(Value::TimestampMicros(25)),
+                    true,
+                ),
+                ColumnRangePredicate::new(
+                    "temperature",
+                    Some(Value::Float64(25.0)),
+                    true,
+                    Some(Value::Float64(45.0)),
+                    true,
+                ),
+            ],
+            projection: Some(vec!["device".into(), "temperature".into()]),
+        };
+        let reference = db.scan_capsules("telemetry", &request, None).unwrap();
+        let pruned = db.scan_capsules("telemetry", &request, Some(1)).unwrap();
+        assert_eq!(pruned.rows, reference.rows);
+        assert_eq!(pruned.rows.len(), 11);
+        assert_eq!(reference.diagnostics.capsules_read, 4);
+        assert_eq!(reference.diagnostics.rows_examined, 40);
+        assert_eq!(pruned.diagnostics.capsules_considered, 4);
+        assert_eq!(pruned.diagnostics.capsules_skipped, 2);
+        assert_eq!(pruned.diagnostics.capsules_read, 2);
+        assert_eq!(pruned.diagnostics.rows_examined, 20);
+        assert_eq!(pruned.diagnostics.rows_returned, 11);
+        assert!(pruned.diagnostics.bytes_verified > 0);
+        assert!(pruned.diagnostics.payload_bytes_decoded < reference.diagnostics.payload_bytes_decoded);
+
+        // Inclusive endpoints must retain Capsules whose min/max only touches a bound.
+        let inclusive_edges = CapsuleScanRequest {
+            ranges: vec![ColumnRangePredicate::new(
+                "timestamp",
+                Some(Value::TimestampMicros(19)),
+                true,
+                Some(Value::TimestampMicros(20)),
+                true,
+            )],
+            projection: None,
+        };
+        let edge_reference = db.scan_capsules("telemetry", &inclusive_edges, None).unwrap();
+        let edge_pruned = db.scan_capsules("telemetry", &inclusive_edges, Some(1)).unwrap();
+        assert_eq!(edge_pruned.rows, edge_reference.rows);
+        assert_eq!(edge_pruned.rows.len(), 2);
+        assert_eq!(edge_pruned.diagnostics.capsules_skipped, 2);
+
+        // Exclusive touching endpoints have no matches and may prune both touching Capsules.
+        let exclusive_edges = CapsuleScanRequest {
+            ranges: vec![ColumnRangePredicate::new(
+                "timestamp",
+                Some(Value::TimestampMicros(19)),
+                false,
+                Some(Value::TimestampMicros(20)),
+                false,
+            )],
+            projection: None,
+        };
+        let exclusive_reference = db.scan_capsules("telemetry", &exclusive_edges, None).unwrap();
+        let exclusive_pruned = db.scan_capsules("telemetry", &exclusive_edges, Some(1)).unwrap();
+        assert_eq!(exclusive_pruned.rows, exclusive_reference.rows);
+        assert!(exclusive_pruned.rows.is_empty());
+        assert_eq!(exclusive_pruned.diagnostics.capsules_skipped, 4);
+        assert_eq!(exclusive_pruned.diagnostics.capsules_read, 0);
+
+        // UTF8 has no min/max in Capsule v0.1; missing stats conservatively keep all Capsules.
+        let string_filter = CapsuleScanRequest {
+            ranges: vec![ColumnRangePredicate::new(
+                "device",
+                Some(Value::Utf8("device-2".into())),
+                true,
+                Some(Value::Utf8("device-2".into())),
+                true,
+            )],
+            projection: Some(vec!["timestamp".into()]),
+        };
+        let string_reference = db.scan_capsules("telemetry", &string_filter, None).unwrap();
+        let string_pruned = db.scan_capsules("telemetry", &string_filter, Some(1)).unwrap();
+        assert_eq!(string_pruned.rows, string_reference.rows);
+        assert_eq!(string_pruned.rows.len(), 10);
+        assert_eq!(string_pruned.diagnostics.capsules_skipped, 0);
+        assert_eq!(string_pruned.diagnostics.capsules_read, 4);
+
+        assert!(matches!(
+            db.scan_capsules("telemetry", &CapsuleScanRequest {
+                ranges: vec![ColumnRangePredicate::new("temperature", Some(Value::Int64(1)), true, None, true)],
+                projection: None,
+            }, Some(1)),
+            Err(DbError::InvalidRange(_))
+        ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn navigation_map_detects_capsule_set_and_file_changes() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let make_rows = |time: i64| vec![vec![
+            Value::TimestampMicros(time),
+            Value::Utf8("sensor".into()),
+            Value::Float64(time as f64),
+        ]];
+        db.ingest_batch("telemetry", BatchId::from_bytes([40; 16]).unwrap(), &make_rows(10)).unwrap();
+        let first_capsule = db.build_capsule("telemetry", 1, 1, 1, 1, Some("timestamp")).unwrap();
+        db.build_navigation_map("telemetry", 1).unwrap();
+
+        db.ingest_batch("telemetry", BatchId::from_bytes([41; 16]).unwrap(), &make_rows(20)).unwrap();
+        db.build_capsule("telemetry", 2, 1, 2, 2, Some("timestamp")).unwrap();
+        let all_range = CapsuleScanRequest {
+            ranges: vec![ColumnRangePredicate::new(
+                "timestamp", Some(Value::TimestampMicros(0)), true,
+                Some(Value::TimestampMicros(100)), true,
+            )],
+            projection: None,
+        };
+        assert!(matches!(
+            db.scan_capsules("telemetry", &all_range, Some(1)),
+            Err(DbError::NavigationMapStale("Capsule set changed since this map generation was built"))
+        ));
+
+        // A new map records both files; any subsequent byte mutation is rejected before pruning.
+        db.build_navigation_map("telemetry", 2).unwrap();
+        let mut bytes = fs::read(&first_capsule).unwrap();
+        bytes[144] ^= 1;
+        fs::write(&first_capsule, bytes).unwrap();
+        assert!(matches!(
+            db.scan_capsules("telemetry", &all_range, Some(2)),
+            Err(DbError::NavigationMapStale("Capsule bytes changed after map publication"))
+        ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn navigation_map_pruning_survives_nullable_schema_evolution() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let first = vec![vec![
+            Value::TimestampMicros(10),
+            Value::Utf8("old".into()),
+            Value::Float64(1.0),
+        ]];
+        db.ingest_batch("telemetry", BatchId::from_bytes([42; 16]).unwrap(), &first).unwrap();
+        db.build_capsule("telemetry", 1, 1, 1, 1, Some("timestamp")).unwrap();
+
+        db.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
+        let second = vec![vec![
+            Value::TimestampMicros(20),
+            Value::Utf8("new".into()),
+            Value::Float64(2.0),
+            Value::Float64(50.0),
+        ]];
+        db.ingest_batch("telemetry", BatchId::from_bytes([43; 16]).unwrap(), &second).unwrap();
+        db.build_capsule("telemetry", 2, 1, 2, 2, Some("timestamp")).unwrap();
+        db.build_navigation_map("telemetry", 1).unwrap();
+
+        let request = CapsuleScanRequest {
+            ranges: vec![ColumnRangePredicate::new(
+                "humidity", Some(Value::Float64(40.0)), true,
+                Some(Value::Float64(60.0)), true,
+            )],
+            projection: None,
+        };
+        let reference = db.scan_capsules("telemetry", &request, None).unwrap();
+        let pruned = db.scan_capsules("telemetry", &request, Some(1)).unwrap();
+        assert_eq!(pruned.rows, reference.rows);
+        assert_eq!(pruned.rows.len(), 1);
+        // Older Capsule has no ColumnId/stat for humidity, so the map must retain it.
+        assert_eq!(pruned.diagnostics.capsules_skipped, 0);
+        assert_eq!(pruned.diagnostics.capsules_read, 2);
+        assert_eq!(pruned.rows[0][3], Value::Float64(50.0));
+        fs::remove_dir_all(path).unwrap();
+    }
+
 }
