@@ -92,21 +92,27 @@ struct TableDefinition {
 
 /// An owned, columnar batch returned by a bounded database scan.
 #[derive(Debug, Clone, PartialEq)]
+pub struct BatchColumn {
+    pub column: Column,
+    pub values: Vec<Value>,
+}
+
+/// An owned, columnar batch. Field descriptors preserve caller order and may
+/// repeat a logical column when the projection requests it more than once.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecordBatch {
-    pub schema: Schema,
-    pub columns: Vec<Vec<Value>>,
+    pub columns: Vec<BatchColumn>,
     pub row_count: usize,
 }
 
 impl RecordBatch {
-    pub fn schema(&self) -> &Schema { &self.schema }
     pub fn row_count(&self) -> usize { self.row_count }
     pub fn column(&self, index: usize) -> Option<&[Value]> {
-        self.columns.get(index).map(Vec::as_slice)
+        self.columns.get(index).map(|column| column.values.as_slice())
     }
     pub fn column_by_name(&self, name: &str) -> Option<&[Value]> {
-        self.schema.columns().iter().position(|column| column.name == name)
-            .and_then(|index| self.column(index))
+        self.columns.iter().find(|column| column.column.name == name)
+            .map(|column| column.values.as_slice())
     }
 }
 
@@ -121,7 +127,6 @@ pub struct ScanBatchIter {
     root: PathBuf,
     current: TableDefinition,
     projection: Vec<usize>,
-    output_schema: Schema,
     segments: Vec<PathBuf>,
     next_segment: usize,
     batch_rows: usize,
@@ -245,17 +250,20 @@ impl Iterator for ScanBatchIter {
                 }
             };
             let mut output_columns = Vec::with_capacity(active.output_slots.len());
-            for slot in &active.output_slots {
-                match slot {
-                    Some(index) => output_columns.push(decoded[*index].clone()),
-                    None => output_columns.push(vec![Value::Null; take]),
-                }
+            for (output_index, slot) in active.output_slots.iter().enumerate() {
+                let values = match slot {
+                    Some(index) => decoded[*index].clone(),
+                    None => vec![Value::Null; take],
+                };
+                output_columns.push(BatchColumn {
+                    column: self.current.schema.columns()[self.projection[output_index]].clone(),
+                    values,
+                });
             }
             if let Some(limit) = &mut self.remaining_limit {
                 *limit -= take;
             }
             return Some(Ok(RecordBatch {
-                schema: self.output_schema.clone(),
                 columns: output_columns,
                 row_count: take,
             }));
@@ -642,9 +650,6 @@ impl Database {
             return Err(DbError::Format(FormatError::InvalidProjection(*index)));
         }
 
-        let output_schema = Schema::new(
-            projection.iter().map(|index| definition.schema.columns()[*index].clone()).collect()
-        )?;
         let effective_batch_rows = batch_rows.min((MAX_BATCH_CELLS / projection.len()).max(1));
         let mut segments = Vec::new();
         if row_limit != Some(0) {
@@ -664,7 +669,6 @@ impl Database {
             root: self.root.clone(),
             current: definition.clone(),
             projection,
-            output_schema,
             segments,
             next_segment: 0,
             batch_rows: effective_batch_rows,
@@ -2534,7 +2538,7 @@ mod tests {
         let mut rows = Vec::new();
         for batch in batches {
             for row_index in 0..batch.row_count {
-                rows.push(batch.columns.iter().map(|column| column[row_index].clone()).collect());
+                rows.push(batch.columns.iter().map(|column| column.values[row_index].clone()).collect());
             }
         }
         rows
@@ -2568,7 +2572,7 @@ mod tests {
         let projected = db.scan_columns_batches("telemetry", &["device", "temperature", "device"], 2).unwrap()
             .collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(
-            projected[0].schema.columns().iter().map(|column| column.name.as_str()).collect::<Vec<_>>(),
+            projected[0].columns.iter().map(|column| column.column.name.as_str()).collect::<Vec<_>>(),
             vec!["device", "temperature", "device"]
         );
         assert_eq!(
