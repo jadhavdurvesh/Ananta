@@ -433,6 +433,7 @@ mod tests {
             .join("segment-00000000000000000001.anf");
         let file = OpenOptions::new().write(true).create_new(true).open(&segment_path).unwrap();
         file.set_len((MAX_SEGMENT_BYTES as u64) + 1).unwrap();
+        drop(file);
 
         assert!(matches!(
             db.scan("telemetry"),
