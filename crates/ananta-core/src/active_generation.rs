@@ -367,7 +367,7 @@ fn sync_directory(path: &Path) -> Result<(), DbError> { File::open(path)?.sync_a
 fn sync_directory(_path: &Path) -> Result<(), DbError> { Ok(()) }
 
 fn take<const N: usize>(b: &[u8], p: &mut usize) -> Result<[u8; N], DbError> {
-    let end = p.checked_add(N).ok_or(DbError::LengthOverflow)?;
+    let end = (*p).checked_add(N).ok_or(DbError::LengthOverflow)?;
     let slice = b.get(*p..end).ok_or(DbError::LengthOverflow)?;
     let mut value = [0_u8; N];
     value.copy_from_slice(slice);
