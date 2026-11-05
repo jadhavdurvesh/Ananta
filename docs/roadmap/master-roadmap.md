@@ -5,7 +5,7 @@
 **Owner:** DMJ  
 **Current release target:** 0.1.0 — Native Storage Prototype  
 **Roadmap status:** Active; review this file before starting work outside the current milestone
-**Current focus:** M2.1 ingestion contract accepted; next implementation is M2.2 Chronicle
+**Current focus:** M2.3 Capsule prototype; M2.2 Chronicle implementation and performance gate are complete
 
 ---
 
@@ -366,7 +366,7 @@ Decision: `docs/decisions/0007-idempotent-commit-ordered-ingestion.md`.
 
 **Status boundary:** M2.1 is a design/contract milestone only. Runtime BatchId, receipt persistence, sequence allocation, result types and counters are not implemented yet; they are explicit M2.2 work.
 
-## M2.2 Chronicle prototype — implementation in progress
+## M2.2 Chronicle prototype — complete
 - [x] Implement the public 128-bit BatchId and IngestResult types.
 - [x] Implement deterministic SHA-256 fingerprinting over canonical ANF v0.2 batch bytes and standard known-answer tests.
 - [x] Define and implement Chronicle commit-record metadata (BatchId, fingerprint, TableId, schema revision, sequence, row count, encoded bytes and embedded ANF payload).
@@ -384,12 +384,14 @@ Decision: `docs/decisions/0007-idempotent-commit-ordered-ingestion.md`.
 - [x] Test out-of-order timestamps, source row-order preservation and mixed legacy/Chronicle scans.
 - [x] Test pre-commit publication failures and post-commit uncertain outcomes at the Chronicle publication primitive.
 - [x] Test schema changes between calls and sequence overflow.
-- [ ] Benchmark Chronicle startup/index rebuild and ingestion overhead.
+- [x] Benchmark Chronicle startup/index rebuild and ingestion overhead.
+
+Benchmark: `docs/specifications/chronicle-performance-benchmark-v0.1.md`. Release-mode CI measured about 12.5% ingestion-time overhead and 10.8 ms/41.9 ms open time for 25/100 receipts.
 
 Specification: `docs/specifications/chronicle-record-v0.1.md`.
 Decision: `docs/decisions/0008-chronicle-record-commit-point.md`.
 
-**Status boundary:** runtime identity, receipts, sequence, scan compatibility and core failure paths are implemented on this branch; M2.2 is not complete until schema-evolution, overflow and performance tests pass.
+**Exit status:** M2.2 is complete. Identity, durable receipts, sequence allocation, retry/recovery, scan compatibility, schema-evolution and overflow tests pass; release-mode ingestion and startup-index costs are recorded. Capsule design and implementation are now the active M2.3 work.
 
 ## M2.3 Capsule prototype
 - [ ] Define Capsule identity and generation.

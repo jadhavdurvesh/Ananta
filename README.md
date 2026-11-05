@@ -28,7 +28,7 @@ This is an experimental first vertical slice, not a complete or production-ready
 
 ## Master execution roadmap
 
-The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M2 — ingestion and the first ChronoWeave concepts.** M1 (native storage correctness and bounded reads) passed its exit gate on 2026-11-05. M2.1 is the accepted ingestion design contract; durable ingestion behavior is scheduled for M2.2.
+The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M2.3 — Capsule prototype.** M1 is complete. M2.1's ingestion contract and the M2.2 Chronicle prototype are implemented; M2.2's release-mode ingestion/startup benchmark is recorded. Navigation Map and Weave research remain ahead.
 
 ## Native design documents
 
@@ -108,8 +108,14 @@ Generation and scanning are separate process invocations. The scanner reports ro
 
 ## Ingestion contract status
 
-M2.1 defines the planned idempotent ingestion API: caller-supplied 128-bit BatchIds scoped to stable TableIds, SHA-256 payload fingerprints, whole-batch validation, per-table commit-order sequences, duplicate retry resolution, event-time neutrality and explicit result counters. **This is a design contract, not a runtime feature yet.** Durable receipts, sequence allocation, `IngestResult` and counter implementation are part of M2.2 Chronicle work. See the [contract](docs/specifications/ingestion-contract-v0.1.md) and [ADR 0007](docs/decisions/0007-idempotent-commit-ordered-ingestion.md).
+M2.1's idempotent ingestion contract now has an M2.2 runtime prototype: caller-supplied 128-bit BatchIds scoped to stable TableIds, SHA-256 payload fingerprints, whole-batch validation, per-table commit-order sequences, duplicate retry resolution and explicit result counters. Chronicle records make the data and receipt one immutable commit unit. See the [contract](docs/specifications/ingestion-contract-v0.1.md), [Chronicle format](docs/specifications/chronicle-record-v0.1.md) and [ADR 0007](docs/decisions/0007-idempotent-commit-ordered-ingestion.md).
 
 ## Chronicle ingestion prototype
 
 The additive `Database::ingest_batch(table, batch_id, rows)` API writes one immutable Chronicle file containing the complete ANF v0.2 payload, 128-bit BatchId, SHA-256 payload fingerprint, TableId, schema revision, per-table commit sequence and whole-record checksum. Identical retries return the original receipt; conflicting reuse fails. The receipt index and accepted totals are rebuilt from verified Chronicle records on open. The existing `insert_batch` API remains available and writes legacy ANF segment files; both formats are readable by full and bounded scans. This is an experimental single-writer prototype: startup currently verifies and indexes all Chronicle records, and ingestion encodes the complete record in memory.
+
+## Chronicle performance benchmark
+
+The CI workflow runs the reproducible ingestion and startup benchmark described in [Chronicle Performance Benchmark v0.1](docs/specifications/chronicle-performance-benchmark-v0.1.md). It compares the legacy insert_batch path with idempotent Chronicle ingestion on identical rows and measures fresh-process Database::open time as receipt count grows. Results are workload-specific and should be treated as a baseline, not a throughput guarantee.
+
+The initial optimized CI benchmark measured 12.5% higher end-to-end ingestion elapsed time for Chronicle than legacy ANF on 100 × 128-row batches with 512-byte payloads. The Chronicle envelope added 108 bytes per batch. Fresh-process Database::open took 10.818 ms for 25 receipts and 41.876 ms for 100 receipts. See the full [benchmark report](docs/specifications/chronicle-performance-benchmark-v0.1.md); these are prototype CI results, not production guarantees.
