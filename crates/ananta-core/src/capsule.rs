@@ -228,8 +228,7 @@ pub(crate) fn encode_capsule(
     output.extend_from_slice(&checksum.to_le_bytes());
     output.extend_from_slice(END);
     // Round-trip through the validator so the writer never publishes invalid metadata.
-    let (verified, _) = decode_capsule(&output)?;
-    metadata = verified;
+    let _ = decode_capsule(&output)?;
     Ok(output)
 }
 
