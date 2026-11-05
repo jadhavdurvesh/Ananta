@@ -50,6 +50,8 @@ The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source
 - [Chronicle record format v0.1](docs/specifications/chronicle-record-v0.1.md)
 - [ADR 0008: Chronicle record as the ingestion commit point](docs/decisions/0008-chronicle-record-commit-point.md)
 - [ADR 0007: idempotent commit-ordered ingestion](docs/decisions/0007-idempotent-commit-ordered-ingestion.md)
+- [Compaction Manifest and Job Contract v0.1](docs/specifications/compaction-manifest-v0.1.md)
+- [ADR 0010: immutable compaction inputs and candidate outputs](docs/decisions/0010-compaction-input-snapshots-and-candidate-outputs.md)
 - [Segment publication and recovery contract](docs/specifications/segment-publication-recovery-v0.1.md)
 - [ADR 0006: atomic segment publication and exclusive local writer](docs/decisions/0006-atomic-segment-publication-and-writer-lock.md)
 - [Nullable-column DDL specification](docs/specifications/nullable-column-ddl-v0.1.md)
