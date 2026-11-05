@@ -511,7 +511,7 @@ impl Database {
             progress.temporary_bytes = temporary_bytes;
             limits.check(&progress).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
             verify_candidate_directory(&stage_dir, &output_manifest, schema, definition.id.0,
-                definition.schema_revision, &column_ids, &expected)?;
+                definition.schema_revision, &column_ids, &expected, cancel)?;
 
             append_state(&mut journal, &journal_path, CompactionJobState::Publishing, progress)?;
             write_new_synced(&stage_dir.join("manifest.owm"), &manifest_bytes)?;
@@ -817,9 +817,11 @@ fn sync_directory(_path: &Path) -> Result<(), DbError> { Ok(()) }
 fn verify_candidate_directory(
     candidate: &Path, manifest: &CompactionOutputManifest, schema: &crate::Schema,
     table_id: u64, schema_revision: u64, column_ids: &[u64], expected: &[RowOrigin],
+    cancel: Option<&AtomicBool>,
 ) -> Result<(), DbError> {
     let mut actual = Vec::with_capacity(expected.len());
     for artifact in &manifest.artifacts {
+        check_cancel(cancel)?;
         let data = read_regular_file(&candidate.join(artifact.data_relative_path()))?;
         let pvm_bytes = read_regular_file(&candidate.join(artifact.provenance_relative_path()))?;
         if data.len() as u64 != artifact.data_file_len || sha256(&data) != artifact.data_file_sha256
@@ -847,6 +849,7 @@ fn verify_candidate_directory(
             }
             actual.push(*origin);
         }
+        check_cancel(cancel)?;
     }
     actual.sort();
     if actual != expected {
