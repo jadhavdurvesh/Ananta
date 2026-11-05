@@ -158,6 +158,12 @@ The receipt and ingestion sequence must share one durable commit boundary. M2.2 
 - Verify accepted/duplicate/rejected counters and durable totals.
 - Verify sequence overflow fails closed.
 
-## 9. Non-goals
+## 9. Compatibility with the current API
+
+The existing `Database::insert_batch(table, rows)` API remains unchanged for source compatibility. It does not currently accept a BatchId, expose a durable ingestion receipt, or assign a logical ingestion sequence. It must not be described as idempotent.
+
+The future `ingest_batch` API is additive and is backed by Chronicle commit records. During M2.2, the implementation must define how pre-existing ANF segments created by legacy `insert_batch` are represented in the initial Chronicle history. Legacy data must remain readable, and migration/reconciliation must not invent BatchIds or claim duplicate protection for submissions made before receipts existed.
+
+## 10. Non-goals
 
 This contract does not implement Chronicle, Capsule, Navigation Map, compaction, Weaves, row-level deduplication, partial-row acceptance, asynchronous queues, parallel ingestion, multi-writer concurrency, transactions across multiple tables or event-time ordering. Those require later milestones and separate evidence.
