@@ -17,7 +17,7 @@ ANANTA is not a SQL wrapper, PostgreSQL extension or ClickHouse backend. Its nat
 
 The initial Rust implementation currently includes:
 - Typed values and schema validation.
-- Experimental ANF columnar segment encoder/decoder, including projected-column decoding (the full segment is currently read to verify its checksum).
+- Experimental ANF columnar segment encoder/decoder, including projected-column decoding, a golden binary fixture and defensive input-size limits.
 - Native local catalog file with persisted schemas.
 - Embedded database API for open, create-table, insert-batch, full scan and projected scan.
 - A basic telemetry example and unit/integration tests.
@@ -26,7 +26,7 @@ This is an experimental first vertical slice, not a complete or production-ready
 
 ## Master execution roadmap
 
-The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M0 — verify the existing Rust foundation.** Do not begin later milestones until M0 passes.
+The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M1 — native storage correctness and streaming.** M0 passed its exit gate on 2026-11-05.
 
 ## Native design documents
 

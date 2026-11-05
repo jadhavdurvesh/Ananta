@@ -49,7 +49,7 @@ Payload ranges are contiguous and ordered. The reader verifies the directory aga
 
 Every row value begins with one null marker byte: 0 means NULL and 1 means a following non-null payload. Other marker values are invalid. Nullability is checked against the table schema after decoding.
 
-UTF-8 and binary fields are currently limited to 64 MiB each. This is a defensive prototype limit, not a product promise.
+UTF-8 and binary fields are currently limited to 64 MiB each. The experimental codec also applies these defensive implementation limits: 256 MiB per complete segment, 1,000,000 rows, 4,096 columns and 1,000,000 decoded cells per call. The database scan path checks segment file size before reading the file into memory. These are prototype safety limits, not permanent product promises.
 
 ## Reader validation
 
@@ -82,7 +82,7 @@ The decoder can decode only selected column values, but the current database API
 ## Prototype limitations
 
 - FNV-1a is not cryptographic and must not be used for tamper resistance.
-- No compression, encryption, row groups, page cache, secondary indexes or compaction.
+- No compression, encryption, row groups, page cache, secondary indexes or compaction.\n- Size/row/column/cell limits are conservative prototype guards and may change only with tests and documentation.
 - No WAL, multi-writer transactions, MVCC or crash-recovery guarantee.
 - The single-writer assumption is required.
 - Durability and atomic-rename semantics depend on the host filesystem and platform.

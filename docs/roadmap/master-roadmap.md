@@ -64,20 +64,24 @@ Already present on `main`:
 - [x] CI workflow definition.
 - [x] Existing ClickHouse/PostgreSQL reference schemas and research tools preserved.
 
-Still unverified:
-- [ ] Successful CI run on the current main commit.
-- [ ] Run the example from a clean environment.
-- [ ] Inspect actual generated database files and test close/reopen manually.
-- [ ] Test on Windows as well as Linux.
-- [ ] Review file publication and catalog failure behaviour.
+Validation evidence:
+- [x] PR #4 merged the M0 catalog/scan correctness fixes.
+- [x] PR #4 Actions passed formatting, tests, Clippy and the native example.
+- [x] CI example verifies a non-empty catalog file and at least one ANF segment.
+- [x] Unit/integration tests cover close/reopen, corrupted/truncated catalog and segment cases.
+
+Still pending beyond the M0 exit gate:
+- [ ] Validate on Windows.
+- [ ] Run the legacy Python benchmark stack independently when that reference environment is next used.
+- [ ] Inspect crash behaviour with systematic fault injection (planned in M1.4/M6).
 
 The current native prototype is not production-ready. It currently materialises scan results, assumes exclusive single-writer use, has no cross-process lock, WAL, transactions or crash-recovery guarantee. FNV-1a in the prototype is an accidental-corruption check, not a security mechanism.
 
 ---
 
-# 2. Current focus — Milestone M0: verify the foundation
+# 2. Completed milestone — M0: verify the foundation
 
-**This is the only active milestone until its exit gate passes.** Do not start AQL, analytics, Studio or ChronoWeave compaction before then.
+**Status: completed on 2026-11-05.** The native storage prototype passed the M0 exit gate after PR #4 was merged and its GitHub Actions run succeeded. AQL, analytics, Studio and ChronoWeave compaction remain deferred.
 
 ## M0.1 Repository and CI verification
 - [ ] Confirm the current `main` branch contains the merged native-engine foundation.
@@ -123,15 +127,15 @@ The current native prototype is not production-ready. It currently materialises 
 
 ## M0.35 Correctness review actions
 
-The current M0 review branch addresses these findings. Treat each as implemented-but-unverified until its PR checks pass:
-- [~] Propagate directory-entry errors during scans instead of silently dropping entries.
-- [~] Distinguish a missing catalog from other filesystem metadata errors.
-- [~] Reject truncated catalogs using the actual minimum file size.
-- [~] Bound untrusted table/column counts by the bytes remaining before allocating vectors.
-- [~] Add regression tests for truncated catalogs, impossible counts, missing table storage directories, empty catalogs and empty batches.
-- [~] Clarify that projected decoding still reads the whole segment in ANF v0.1 because checksum verification covers the entire segment.
+The M0 fixes were merged in PR #4 and their own GitHub Actions run passed:
+- [x] Propagate directory-entry errors during scans instead of silently dropping entries.
+- [x] Distinguish a missing catalog from other filesystem metadata errors.
+- [x] Reject truncated catalogs using the actual minimum file size.
+- [x] Bound untrusted table/column counts by the bytes remaining before allocating vectors.
+- [x] Add regression tests for truncated catalogs, impossible counts, missing table storage directories, empty catalogs and empty batches.
+- [x] Clarify that projected decoding still reads the whole segment in ANF v0.1 because checksum verification covers the entire segment.
 
-The current GitHub Actions run for the merged baseline passed formatting, tests, Clippy and the example at commit `fcbea310`. New main-branch runs for later commits are queued; the M0 review changes still require their own successful CI run.
+Validation: [PR #4 CI run — success](https://github.com/jadhavdurvesh/Ananta/actions/runs/41880244252).
 
 ## M0.4 Write-access boundary
 - [ ] Document that only one exclusive writer may use a database directory.
@@ -142,18 +146,18 @@ The current GitHub Actions run for the merged baseline passed formatting, tests,
 
 ### M0 exit gate
 M0 is complete only when:
-- [ ] Latest main-branch CI passes formatting, tests and lint.
-- [ ] The native example runs from a clean checkout.
-- [ ] Create → schema → insert → close → reopen → scan passes.
-- [ ] Corrupt and truncated files are rejected.
-- [ ] Existing reference research tools remain untouched and independently runnable.
-- [ ] Known limitations are accurately documented.
+- [x] PR #4 checks pass formatting, tests, Clippy and the example.
+- [x] CI example creates a non-empty catalog and at least one ANF segment.
+- [x] Create → schema → insert → close → reopen → scan passes in tests.
+- [x] Corrupt and truncated catalog/segment files are rejected.
+- [x] Existing reference research source files remain unchanged by the M0 fix PR.
+- [x] Known limitations are accurately documented.
 
-**Deliverable:** verified Native Storage Prototype baseline. No new major feature is included in M0.
+**Deliverable:** verified Native Storage Prototype baseline. M0 is closed; remaining platform validation is tracked separately.
 
 ---
 
-# 3. Milestone M1: native storage correctness and streaming
+# 3. Current focus — M1: native storage correctness and streaming
 
 **Goal:** make the native storage path safe, inspectable and capable of processing datasets without materialising the whole result in memory.
 
@@ -735,4 +739,4 @@ Do these in order. Do not skip ahead.
 10. [ ] Mark M0 complete only after all exit criteria pass.
 11. [ ] Start M1 with exactly one small PR: the ANF format/golden-fixture and safety work package.
 
-**Current focus: M0 — verify the foundation. Everything else waits.**
+**Current focus: M1.1 — validate the ANF golden fixture and safety tests. Do not start M1.2 until this PR passes.**

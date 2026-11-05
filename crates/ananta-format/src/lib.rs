@@ -11,6 +11,10 @@ const HEADER_LEN: usize = 20;
 const DIRECTORY_ENTRY_LEN: usize = 17;
 const TRAILER_LEN: usize = 12;
 const MAX_FIELD_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_ROWS: usize = 1_000_000;
+const MAX_COLUMNS: usize = 4_096;
+const MAX_DECODED_CELLS: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatError {
@@ -25,6 +29,7 @@ pub enum FormatError {
     SchemaMismatch,
     Type(String),
     LengthOverflow,
+    LimitExceeded(&'static str),
 }
 
 impl fmt::Display for FormatError {
@@ -41,6 +46,7 @@ impl fmt::Display for FormatError {
             Self::SchemaMismatch => f.write_str("ANF schema does not match requested schema"),
             Self::Type(message) => f.write_str(message),
             Self::LengthOverflow => f.write_str("ANF length exceeds supported limits"),
+            Self::LimitExceeded(limit) => write!(f, "ANF limit exceeded: {limit}"),
         }
     }
 }
@@ -49,21 +55,50 @@ impl std::error::Error for FormatError {}
 #[derive(Debug, Clone, Copy)]
 struct Entry { type_code: u8, offset: usize, length: usize }
 
+fn validate_counts(row_count: usize, column_count: usize, validate_full_decode: bool) -> Result<(), FormatError> {
+    if row_count > MAX_ROWS {
+        return Err(FormatError::LimitExceeded("row count"));
+    }
+    if column_count == 0 || column_count > MAX_COLUMNS {
+        return Err(FormatError::LimitExceeded("column count"));
+    }
+    let cells = row_count.checked_mul(column_count).ok_or(FormatError::LengthOverflow)?;
+    if validate_full_decode && cells > MAX_DECODED_CELLS {
+        return Err(FormatError::LimitExceeded("decoded cells"));
+    }
+    Ok(())
+}
+
 pub fn encode_segment(schema: &Schema, rows: &[Vec<Value>]) -> Result<Vec<u8>, FormatError> {
+    let column_count = schema.len();
+    let row_count = rows.len();
+    validate_counts(row_count, column_count, true)?;
+
     for row in rows {
         schema.validate_row(row).map_err(|e| FormatError::Type(e.to_string()))?;
     }
 
-    let column_count = u32::try_from(schema.len()).map_err(|_| FormatError::LengthOverflow)?;
-    let row_count = u64::try_from(rows.len()).map_err(|_| FormatError::LengthOverflow)?;
-    let directory_len = schema.len().checked_mul(DIRECTORY_ENTRY_LEN).ok_or(FormatError::LengthOverflow)?;
+    let column_count_u32 = u32::try_from(column_count).map_err(|_| FormatError::LengthOverflow)?;
+    let row_count_u64 = u64::try_from(row_count).map_err(|_| FormatError::LengthOverflow)?;
+    let directory_len = column_count.checked_mul(DIRECTORY_ENTRY_LEN).ok_or(FormatError::LengthOverflow)?;
     let payload_start = HEADER_LEN.checked_add(directory_len).ok_or(FormatError::LengthOverflow)?;
 
     let mut payloads = Vec::with_capacity(schema.len());
-    for (column_index, column) in schema.columns().iter().enumerate() {
+    let mut total_payload_bytes = 0_usize;
+    for (column_index, _column) in schema.columns().iter().enumerate() {
         let mut payload = Vec::new();
         for row in rows {
             encode_value(&mut payload, &row[column_index])?;
+        }
+        total_payload_bytes = total_payload_bytes
+            .checked_add(payload.len())
+            .ok_or(FormatError::LengthOverflow)?;
+        let estimated_total = payload_start
+            .checked_add(total_payload_bytes)
+            .and_then(|size| size.checked_add(TRAILER_LEN))
+            .ok_or(FormatError::LengthOverflow)?;
+        if estimated_total > MAX_SEGMENT_BYTES {
+            return Err(FormatError::LimitExceeded("segment bytes"));
         }
         payloads.push(payload);
     }
@@ -72,8 +107,8 @@ pub fn encode_segment(schema: &Schema, rows: &[Vec<Value>]) -> Result<Vec<u8>, F
     output.extend_from_slice(MAGIC);
     output.extend_from_slice(&VERSION.to_le_bytes());
     output.extend_from_slice(&0_u16.to_le_bytes()); // reserved flags
-    output.extend_from_slice(&row_count.to_le_bytes());
-    output.extend_from_slice(&column_count.to_le_bytes());
+    output.extend_from_slice(&row_count_u64.to_le_bytes());
+    output.extend_from_slice(&column_count_u32.to_le_bytes());
 
     let mut cursor = payload_start;
     for (column, payload) in schema.columns().iter().zip(&payloads) {
@@ -83,6 +118,11 @@ pub fn encode_segment(schema: &Schema, rows: &[Vec<Value>]) -> Result<Vec<u8>, F
         cursor = cursor.checked_add(payload.len()).ok_or(FormatError::LengthOverflow)?;
     }
     for payload in payloads { output.extend_from_slice(&payload); }
+
+    let total_len = output.len().checked_add(TRAILER_LEN).ok_or(FormatError::LengthOverflow)?;
+    if total_len > MAX_SEGMENT_BYTES {
+        return Err(FormatError::LimitExceeded("segment bytes"));
+    }
 
     let checksum = checksum64(&output);
     output.extend_from_slice(&checksum.to_le_bytes());
@@ -103,6 +143,9 @@ pub fn decode_projected_segment(
     projection: &[usize],
 ) -> Result<Vec<Vec<Value>>, FormatError> {
     if bytes.len() < HEADER_LEN + TRAILER_LEN { return Err(FormatError::Truncated); }
+    if bytes.len() > MAX_SEGMENT_BYTES {
+        return Err(FormatError::LimitExceeded("segment bytes"));
+    }
     if &bytes[0..4] != MAGIC { return Err(FormatError::InvalidMagic); }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
     if version != VERSION { return Err(FormatError::UnsupportedVersion(version)); }
@@ -113,6 +156,11 @@ pub fn decode_projected_segment(
     let row_count = usize::try_from(row_count_u64).map_err(|_| FormatError::LengthOverflow)?;
     let column_count = usize::try_from(read_u32(bytes, 16)?).map_err(|_| FormatError::LengthOverflow)?;
     if column_count != schema.len() { return Err(FormatError::SchemaMismatch); }
+    validate_counts(row_count, column_count, false)?;
+    let decoded_cells = row_count.checked_mul(projection.len()).ok_or(FormatError::LengthOverflow)?;
+    if decoded_cells > MAX_DECODED_CELLS {
+        return Err(FormatError::LimitExceeded("decoded cells"));
+    }
     if let Some(index) = projection.iter().find(|index| **index >= column_count) {
         return Err(FormatError::InvalidProjection(*index));
     }
@@ -304,6 +352,219 @@ mod tests {
             decode_projected_segment(&encoded, &schema, &[schema.len()]),
             Err(FormatError::InvalidProjection(_))
         ));
+    }
+
+    fn read_fixture_hex() -> Vec<u8> {
+        include_str!("../tests/fixtures/anf-v0.1-int32-single-row.hex")
+            .split_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).expect("valid hex fixture byte"))
+            .collect()
+    }
+
+    fn refresh_checksum(bytes: &mut [u8]) {
+        let trailer_start = bytes.len() - TRAILER_LEN;
+        let checksum = checksum64(&bytes[..trailer_start]);
+        bytes[trailer_start..trailer_start + 8].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    fn column_payload_offset(bytes: &[u8], column_index: usize) -> usize {
+        let entry = HEADER_LEN + column_index * DIRECTORY_ENTRY_LEN;
+        let offset = u64::from_le_bytes(bytes[entry + 1..entry + 9].try_into().unwrap());
+        usize::try_from(offset).unwrap()
+    }
+
+    #[test]
+    fn anf_v0_1_golden_fixture_is_byte_for_byte_stable() {
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::Int32, false),
+        ]).unwrap();
+        let rows = vec![vec![Value::Int32(7)]];
+        let fixture = read_fixture_hex();
+
+        assert_eq!(encode_segment(&schema, &rows).unwrap(), fixture);
+        assert_eq!(decode_segment(&fixture, &schema).unwrap(), rows);
+    }
+
+    #[test]
+    fn malformed_null_marker_is_rejected_after_checksum_validation() {
+        let schema = schema();
+        let rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("sensor".into()),
+            Value::Float64(1.0),
+            Value::Boolean(true),
+        ]];
+        let mut bytes = encode_segment(&schema, &rows).unwrap();
+        let payload = column_payload_offset(&bytes, 0);
+        bytes[payload] = 2;
+        refresh_checksum(&mut bytes);
+
+        assert_eq!(
+            decode_segment(&bytes, &schema),
+            Err(FormatError::InvalidValue("invalid null marker"))
+        );
+    }
+
+    #[test]
+    fn malformed_boolean_payload_is_rejected() {
+        let schema = schema();
+        let rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("sensor".into()),
+            Value::Float64(1.0),
+            Value::Boolean(true),
+        ]];
+        let mut bytes = encode_segment(&schema, &rows).unwrap();
+        let payload = column_payload_offset(&bytes, 3);
+        bytes[payload + 1] = 2;
+        refresh_checksum(&mut bytes);
+
+        assert_eq!(
+            decode_segment(&bytes, &schema),
+            Err(FormatError::InvalidValue("boolean must be 0 or 1"))
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_payload_is_rejected() {
+        let schema = schema();
+        let rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("x".into()),
+            Value::Float64(1.0),
+            Value::Boolean(true),
+        ]];
+        let mut bytes = encode_segment(&schema, &rows).unwrap();
+        let payload = column_payload_offset(&bytes, 1);
+        bytes[payload + 5] = 0xff;
+        refresh_checksum(&mut bytes);
+
+        assert_eq!(
+            decode_segment(&bytes, &schema),
+            Err(FormatError::InvalidValue("invalid UTF-8"))
+        );
+    }
+
+    #[test]
+    fn invalid_directory_offset_is_rejected() {
+        let schema = schema();
+        let rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("x".into()),
+            Value::Float64(1.0),
+            Value::Boolean(true),
+        ]];
+        let mut bytes = encode_segment(&schema, &rows).unwrap();
+        let first_entry = HEADER_LEN;
+        bytes[first_entry + 1..first_entry + 9]
+            .copy_from_slice(&0_u64.to_le_bytes());
+        refresh_checksum(&mut bytes);
+
+        assert_eq!(decode_segment(&bytes, &schema), Err(FormatError::InvalidDirectory));
+    }
+
+    #[test]
+    fn unsupported_versions_and_feature_flags_are_rejected() {
+        let schema = schema();
+        let rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("x".into()),
+            Value::Float64(1.0),
+            Value::Boolean(true),
+        ]];
+        let valid = encode_segment(&schema, &rows).unwrap();
+
+        let mut unsupported = valid.clone();
+        unsupported[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(decode_segment(&unsupported, &schema), Err(FormatError::UnsupportedVersion(2)));
+
+        let mut flags = valid;
+        flags[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        assert_eq!(
+            decode_segment(&flags, &schema),
+            Err(FormatError::InvalidValue("unknown mandatory feature flags"))
+        );
+    }
+
+    #[test]
+    fn decoder_does_not_panic_on_deterministic_arbitrary_inputs() {
+        let schema = schema();
+        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+
+        for case in 0..2_000_usize {
+            let length = case % 512;
+            let mut bytes = vec![0_u8; length];
+            for byte in &mut bytes {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+
+            let outcome = std::panic::catch_unwind(|| decode_segment(&bytes, &schema));
+            assert!(outcome.is_ok(), "decoder panicked for generated input case {case}");
+        }
+    }
+
+    #[test]
+    fn row_and_decoded_cell_limits_are_enforced() {
+        assert_eq!(
+            validate_counts(MAX_ROWS + 1, 1, false),
+            Err(FormatError::LimitExceeded("row count"))
+        );
+        assert_eq!(
+            validate_counts(1, MAX_COLUMNS + 1, false),
+            Err(FormatError::LimitExceeded("column count"))
+        );
+        assert_eq!(
+            validate_counts(500_001, 2, true),
+            Err(FormatError::LimitExceeded("decoded cells"))
+        );
+    }
+
+    #[test]
+    fn encoder_rejects_a_schema_with_too_many_columns() {
+        let columns = (0..=MAX_COLUMNS)
+            .map(|index| Column::new(format!("c{index}"), DataType::Int32, false))
+            .collect::<Vec<_>>();
+        let schema = Schema::new(columns).unwrap();
+
+        assert_eq!(
+            encode_segment(&schema, &[]),
+            Err(FormatError::LimitExceeded("column count"))
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_header_row_count_above_limit_before_allocating() {
+        let schema = schema();
+        let mut bytes = encode_segment(&schema, &[]).unwrap();
+        bytes[8..16].copy_from_slice(&((MAX_ROWS as u64) + 1).to_le_bytes());
+
+        assert_eq!(
+            decode_segment(&bytes, &schema),
+            Err(FormatError::LimitExceeded("row count"))
+        );
+    }
+
+    #[test]
+    fn non_nullable_column_rejects_null_payload() {
+        let schema = schema();
+        let rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("sensor".into()),
+            Value::Float64(1.0),
+            Value::Boolean(true),
+        ]];
+        let mut bytes = encode_segment(&schema, &rows).unwrap();
+        let payload = column_payload_offset(&bytes, 0);
+        bytes[payload] = 0;
+        refresh_checksum(&mut bytes);
+
+        assert_eq!(
+            decode_segment(&bytes, &schema),
+            Err(FormatError::Type("column 'time' does not allow NULL".into()))
+        );
     }
 
     #[test]
