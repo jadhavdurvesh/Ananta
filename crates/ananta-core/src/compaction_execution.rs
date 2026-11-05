@@ -879,3 +879,155 @@ mod tests {
 
 
 }
+
+
+
+impl Database {
+    /// Reconcile candidate publication after a process interruption. A durable,
+    /// independently verifiable final candidate completes a journal stopped at
+    /// Publishing; all other unfinished attempts become Interrupted. Damaged
+    /// journals are preserved and cause open to fail closed.
+    pub(crate) fn recover_compaction_jobs(&self) -> Result<(), DbError> {
+        for (table, definition) in &self.catalog.tables {
+            let table_dir = self.root.join("data").join(table);
+            let jobs_root = table_dir.join("compaction").join("jobs");
+            let jobs_metadata = match fs::symlink_metadata(&jobs_root) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(DbError::Io(error)),
+            };
+            if !jobs_metadata.file_type().is_dir() {
+                return Err(DbError::CompactionPreflight("compaction jobs path is not a real directory"));
+            }
+            for job_entry in fs::read_dir(&jobs_root)? {
+                let job_entry = job_entry?;
+                if !job_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let job_dir = job_entry.path();
+                for attempt_entry in fs::read_dir(&job_dir)? {
+                    let attempt_entry = attempt_entry?;
+                    if !attempt_entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let journal_path = attempt_entry.path();
+                    if journal_path.extension().and_then(|v| v.to_str()) != Some("cje") {
+                        continue;
+                    }
+                    let events = crate::compaction::read_compaction_journal(&journal_path)
+                        .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
+                    let Some(last) = events.last() else {
+                        return Err(DbError::CompactionPreflight("compaction journal is empty during recovery"));
+                    };
+                    let stage = table_dir.join("weaves").join(format!(
+                        ".stage-{}-a{:020}",
+                        hex(last.job_id.as_bytes()),
+                        last.attempt,
+                    ));
+                    if last.state.is_terminal() {
+                        remove_attempt_stage_if_safe(&stage)?;
+                        continue;
+                    }
+
+                    let completed_candidate = if last.state == CompactionJobState::Publishing {
+                        self.find_verified_attempt_candidate(table, last.job_id, last.attempt, last.input_manifest_sha256)?
+                    } else {
+                        None
+                    };
+                    let mut journal = CompactionJobJournal::replay(&events)
+                        .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
+                    let (next_state, progress) = if completed_candidate.is_some() {
+                        (CompactionJobState::Completed, last.progress)
+                    } else {
+                        (CompactionJobState::Interrupted, last.progress)
+                    };
+                    let event = journal.append(next_state, progress)
+                        .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
+                    append_compaction_journal_event(&journal_path, &event)
+                        .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
+                    remove_attempt_stage_if_safe(&stage)?;
+                }
+            }
+            let _ = definition;
+        }
+        Ok(())
+    }
+
+    fn find_verified_attempt_candidate(
+        &self,
+        table: &str,
+        job_id: CompactionJobId,
+        attempt: u64,
+        input_fingerprint: [u8; 32],
+    ) -> Result<Option<(u64, u64)>, DbError> {
+        let weave_root = self.root.join("data").join(table).join("weaves");
+        let root_metadata = match fs::symlink_metadata(&weave_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(DbError::Io(error)),
+        };
+        if !root_metadata.file_type().is_dir() {
+            return Err(DbError::CompactionPreflight("Weave directory is not a real directory"));
+        }
+        let mut found = None;
+        for entry in fs::read_dir(&weave_root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let directory = entry.path();
+            if !entry.file_name().to_string_lossy().starts_with("weave-") {
+                continue;
+            }
+            let manifest_path = directory.join("manifest.owm");
+            let manifest_bytes = match read_regular_file(&manifest_path) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            let output = match CompactionOutputManifest::decode(&manifest_bytes) {
+                Ok(output) => output,
+                Err(_) => continue,
+            };
+            if output.job_id != job_id || output.attempt != attempt
+                || output.input_manifest_sha256 != input_fingerprint
+            {
+                continue;
+            }
+            if found.is_some() {
+                return Err(DbError::CompactionPreflight("multiple final candidates claim the same compaction attempt"));
+            }
+            let input_bytes = read_regular_file(&directory.join("input.cim"))?;
+            let input = CompactionInputManifest::decode(&input_bytes)?;
+            self.verify_compaction_candidate(table, &input, output.weave_id, output.generation)?;
+            found = Some((output.weave_id, output.generation));
+        }
+        Ok(found)
+    }
+}
+
+fn remove_attempt_stage_if_safe(path: &Path) -> Result<(), DbError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(DbError::Io(error)),
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(DbError::CompactionPreflight("attempt staging path is not a real directory"));
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            // Preserve unknown directories and symlinks as forensic evidence.
+            return Ok(());
+        }
+        files.push(entry.path());
+    }
+    for file in files {
+        fs::remove_file(file)?;
+    }
+    let parent = path.parent().ok_or(DbError::CompactionPreflight("attempt staging path has no parent"))?;
+    fs::remove_dir(path)?;
+    sync_directory(parent)?;
+    Ok(())
+}
