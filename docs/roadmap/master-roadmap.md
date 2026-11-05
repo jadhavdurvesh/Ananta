@@ -459,7 +459,8 @@ Specification: docs/specifications/navigation-map-v0.1.md.
 - [x] Recover unfinished attempts by appending one Interrupted event; reject partial/corrupt tails without truncating evidence.
 - [x] Implement canonical CIM1 input manifest codec, SHA-256 fingerprinting and structural Capsule/Chronicle coverage validation.
 - [x] Implement canonical OWM1 output manifest codec, artifact fingerprints, canonical relative paths and provenance-count checks.
-- [ ] Verify actual source and candidate artifact files against the pinned manifest references.
+- [x] Verify source Capsule and Chronicle files against CIM1 length/SHA-256 references before compaction; validate Capsule checksums, statistics and target-schema compatibility.
+- [ ] Verify candidate output files and provenance sidecars against OWM1 before publication.
 - [ ] Add bounded compaction execution, attempt-owned staging and crash-safe candidate publication.
 - [ ] Add database-level compaction correctness and fault-injection tests.
 
