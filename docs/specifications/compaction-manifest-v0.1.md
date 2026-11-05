@@ -117,7 +117,7 @@ The first runtime event codec uses a fixed 160-byte little-endian record:
 
 State codes are Planned=0, ValidatingInputs=1, Running=2, Verifying=3, Publishing=4, CancellationRequested=5, Completed=6, Cancelled=7, Failed=8 and Interrupted=9. Unknown state codes, nonzero reserved bytes, zero identity fields, wrong lengths and checksum mismatches are rejected.
 
-The current Rust implementation provides the event encoder/decoder, in-memory state reducer, durable append-only CJE1 journal file operations, full-file replay validation, and recovery that appends one Interrupted event for an unfinished attempt. Appends sync the journal file; first creation also syncs its parent directory on Unix. Partial tails, checksum damage, non-regular files and journals above 64 MiB are rejected without truncation. Recovery of a partial tail requires preserving the damaged attempt and creating a fresh attempt. Candidate-output reconciliation after publishing remains future work because output manifests are not yet implemented.
+The current Rust implementation provides the event encoder/decoder, in-memory state reducer, durable append-only CJE1 journal file operations, full-file replay validation, and recovery that appends one Interrupted event for an unfinished attempt. Each per-attempt journal is capped at 64 MiB (419,430 complete events). Appends sync the journal file; first creation also syncs its parent directory on Unix. Partial tails, checksum damage, non-regular files and journals above 64 MiB are rejected without truncation. Recovery of a partial tail requires preserving the damaged attempt and creating a fresh attempt. Candidate-output reconciliation after publishing remains future work because output manifests are not yet implemented.
 
 Recovery rules:
 
