@@ -84,13 +84,21 @@ pub fn encode_segment(schema: &Schema, rows: &[Vec<Value>]) -> Result<Vec<u8>, F
     let payload_start = HEADER_LEN.checked_add(directory_len).ok_or(FormatError::LengthOverflow)?;
 
     let mut payloads = Vec::with_capacity(schema.len());
+    let mut total_payload_bytes = 0_usize;
     for (column_index, column) in schema.columns().iter().enumerate() {
         let mut payload = Vec::new();
         for row in rows {
             encode_value(&mut payload, &row[column_index])?;
-            if payload.len() > MAX_SEGMENT_BYTES {
-                return Err(FormatError::LimitExceeded("column payload bytes"));
-            }
+        }
+        total_payload_bytes = total_payload_bytes
+            .checked_add(payload.len())
+            .ok_or(FormatError::LengthOverflow)?;
+        let estimated_total = payload_start
+            .checked_add(total_payload_bytes)
+            .and_then(|size| size.checked_add(TRAILER_LEN))
+            .ok_or(FormatError::LengthOverflow)?;
+        if estimated_total > MAX_SEGMENT_BYTES {
+            return Err(FormatError::LimitExceeded("segment bytes"));
         }
         payloads.push(payload);
     }
