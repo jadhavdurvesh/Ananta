@@ -52,8 +52,8 @@ jobs:
       - name: Benchmark Chronicle ingestion and startup index rebuild
         run: |
           set -euo pipefail
-          cargo build -p ananta-core --example chronicle_benchmark
-          BENCH=target/debug/examples/chronicle_benchmark
+          cargo build --release -p ananta-core --example chronicle_benchmark
+          BENCH=target/release/examples/chronicle_benchmark
           ROOT=/tmp/ananta-chronicle-bench
           CHR_SMALL="$ROOT/chronicle-small"
           CHR_LARGE="$ROOT/chronicle-large"
