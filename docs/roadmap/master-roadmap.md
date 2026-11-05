@@ -276,12 +276,14 @@ Specification: `docs/specifications/anf-v0.2-prototype.md`.
 
 Specification: `docs/specifications/nullable-column-ddl-v0.1.md`.
 
-#### M1.2.3.4.2 Rename and reorder columns — next
-- [ ] Define rename/reorder snapshot transition and compatibility rules.
+#### M1.2.3.4.2 Rename and reorder columns — current task
+- [x] Define rename/reorder snapshot transition and compatibility rules.
 - [ ] Implement column rename while preserving ColumnId.
 - [ ] Implement column reorder while preserving ColumnIds.
 - [ ] Verify historical segment mapping by ColumnId after rename/reorder.
-- [ ] Add failure-injection tests for snapshot/catalog publication.
+- [ ] Test no-op, invalid permutations, snapshot validation and publication failure/retry.
+
+Specification: `docs/specifications/column-rename-reorder-v0.1.md`.
 
 Table rename/drop, column drop, type changes and non-null additions remain deferred until path identity, tombstones, backfill and compaction protocols are designed.
 
@@ -834,4 +836,4 @@ Do these in order. Do not skip ahead.
 10. [ ] Mark M0 complete only after all exit criteria pass.
 11. [ ] Start M1 with exactly one small PR: the ANF format/golden-fixture and safety work package.
 
-**Current focus: M1.2.3.4.2 — define safe column rename/reorder semantics while preserving stable ColumnIds. Table/column drops, type changes and non-null additions remain disabled.**
+**Current focus: M1.2.3.4.2 — implement snapshot-first column rename/reorder while preserving stable ColumnIds. Table/column drops, type changes and non-null additions remain disabled.**
