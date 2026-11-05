@@ -5,7 +5,7 @@
 **Owner:** DMJ  
 **Current release target:** 0.1.0 — Native Storage Prototype  
 **Roadmap status:** Active; review this file before starting work outside the current milestone
-**Current focus:** M2.3 Capsule size and scan-behaviour evaluation plus M2.4 Navigation Map verification; M2.2 Chronicle implementation and performance gate are complete
+**Current focus:** M3.1 compaction foundation; M2 exit gate is complete
 
 ---
 
@@ -393,7 +393,7 @@ Decision: `docs/decisions/0008-chronicle-record-commit-point.md`.
 
 **Exit status:** M2.2 is complete. Identity, durable receipts, sequence allocation, retry/recovery, scan compatibility, schema-evolution and overflow tests pass; release-mode ingestion and startup-index costs are recorded. Capsule design and implementation are now the active M2.3 work.
 
-## M2.3 Capsule prototype — first immutable format implemented
+## M2.3 Capsule prototype — complete
 - [x] Define immutable Capsule identity and explicit generation.
 - [x] Store row count, TableId, stable ColumnIds and schema revision reference.
 - [x] Add optional temporal min/max bounds using an explicitly selected TIMESTAMP_MICROS column.
@@ -404,13 +404,14 @@ Decision: `docs/decisions/0008-chronicle-record-commit-point.md`.
 - [x] Add independent Capsule validator that verifies the wrapper, schema snapshot, embedded ANF and recomputed statistics.
 - [x] Build Capsules from contiguous, committed Chronicle sequence ranges while preserving historical ColumnId resolution.
 - [x] Publish Capsules immutably beside Chronicle data; keep source Chronicle files intact.
-- [ ] Compare multiple Capsule sizes on identical datasets.
-- [ ] Record Capsule build overhead, storage amplification and scan behaviour.
+- [x] Compare 512-row, 2,048-row and 8,192-row Capsules on identical datasets.
+- [x] Record Capsule build overhead, storage amplification, map build and scan behaviour.
 
+Benchmark: docs/specifications/capsule-size-scan-benchmark-v0.1.md.
 Specification: docs/specifications/capsule-format-v0.1.md.
 Decision: docs/decisions/0009-immutable-capsules-as-derived-chronicle-units.md.
 
-**Scope boundary:** Capsules are derived, explicitly built files. There is no active-generation manifest, Chronicle reclamation, Navigation Map or query pruning in M2.3.
+**Exit status:** M2.3 is complete. The size benchmark demonstrates the expected pruning-granularity trade-off; smaller Capsules skip more irrelevant units for the tested time range.
 
 ## M2.4 Navigation Map prototype — correctness-first pruning implemented
 - [x] Define a versioned metadata structure separate from Capsule payloads (NVM1, immutable map generations).
@@ -427,15 +428,15 @@ Specification: docs/specifications/navigation-map-v0.1.md.
 
 **Scope boundary:** the map verifies complete Capsule file fingerprints before pruning. It can reduce ANF decoding but does not yet guarantee fewer physical bytes read. Generation promotion, active manifests and partial-page reads remain M3 work.
 
-## M2 exit gate
-- [ ] Ingestion is deterministic and validates whole batches.
-- [ ] Chronicle units are immutable after publication.
-- [ ] Capsules can be independently read and verified.
-- [ ] Navigation Map pruning is correctness-tested.
-- [ ] Query results are identical with pruning enabled or disabled.
-- [ ] Ingestion and storage overhead are recorded.
+## M2 exit gate — complete
+- [x] Ingestion is deterministic and validates whole batches.
+- [x] Chronicle units are immutable after publication.
+- [x] Capsules can be independently read and verified.
+- [x] Navigation Map pruning is correctness-tested.
+- [x] Query results are identical with pruning enabled or disabled.
+- [x] Ingestion and storage overhead are recorded.
 
-**Deliverable:** ChronoWeave prototype v0.1. This is a research prototype, not yet adaptive production storage.
+**Deliverable:** ChronoWeave research prototype v0.1 (Chronicle, derived Capsules and correctness-first Navigation Map). This is not yet adaptive production storage: there is no Weave compaction, active-generation manifest, promotion/rollback or guaranteed page-level I/O pruning.
 
 ---
 
