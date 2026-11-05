@@ -35,6 +35,8 @@ The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source
 - [Native architecture and independence boundaries](docs/architecture/native-engine.md)
 - [Phase 1 implementation plan](docs/roadmap/phase-1-native-engine.md)
 - [ANF v0.1 prototype byte layout](docs/specifications/anf-v0.1-prototype.md)
+- [Catalog v0.2 identity proposal](docs/specifications/catalog-v0.2-identity-proposal.md)
+- [ADR 0004: stable catalog object identity](docs/decisions/0004-stable-catalog-object-identity.md)
 - [ChronoWeave storage research proposal](docs/specifications/chronoweave-storage-research.md)
 - [ANANTA Studio and developer platform roadmap](docs/roadmap/studio-and-platform.md)
 

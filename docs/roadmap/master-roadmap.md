@@ -162,33 +162,57 @@ M0 is complete only when:
 **Goal:** make the native storage path safe, inspectable and capable of processing datasets without materialising the whole result in memory.
 
 ## M1.1 Freeze the experimental ANF v0.1 contract
-- [ ] Review magic bytes and version field.
-- [ ] Review endian rules.
-- [ ] Review header and directory lengths.
-- [ ] Review type codes.
-- [ ] Review null markers.
-- [ ] Review UTF-8 and binary encoding.
-- [ ] Review footer and checksum coverage.
-- [ ] Set maximum file, row, column and field sizes.
-- [ ] Add golden binary fixtures.
-- [ ] Add byte-for-byte fixture tests.
-- [ ] Add malformed-directory tests.
-- [ ] Add fuzz/property tests for arbitrary byte input.
-- [ ] Define the format-version bump policy.
-- [ ] Mark the format experimental until compatibility tests are stable.
+- [x] Review magic bytes and version field.
+- [x] Review endian rules.
+- [x] Review header and directory lengths.
+- [x] Review type codes.
+- [x] Review null markers.
+- [x] Review UTF-8 and binary encoding.
+- [x] Review footer and checksum coverage.
+- [x] Set maximum file, row, column and field sizes.
+- [x] Add golden binary fixture.
+- [x] Add byte-for-byte fixture test.
+- [x] Add malformed-directory and payload tests.
+- [x] Add deterministic arbitrary-byte no-panic test.
+- [x] Define the format-version bump policy.
+- [x] Keep the format explicitly experimental until compatibility tests are stable.
+
+**Completed:** [PR #5 merged](https://github.com/jadhavdurvesh/Ananta/pull/5). [CI passed formatting, tests, Clippy and the native example](https://github.com/jadhavdurvesh/Ananta/actions/runs/41990538328).
 
 ## M1.2 Improve native catalog
-- [ ] Define stable database, table and column identifiers.
-- [ ] Separate display names from internal object IDs.
-- [ ] Add catalog format version and feature flags.
-- [ ] Add catalog checksum and bounds validation tests.
-- [ ] Define schema revision numbers.
-- [ ] Define rules for table rename and drop.
-- [ ] Define rules for adding nullable columns.
-- [ ] Define rules for adding non-null columns with existing rows.
-- [ ] Define incompatible schema-change behaviour.
+
+### M1.2.1 Define catalog identity and schema revision model — current task
+- [~] Define a stable database-local ObjectId for tables and columns.
+- [~] Separate display names from internal object identity.
+- [~] Define monotonic ID allocation and no-reuse semantics.
+- [~] Separate database catalog revision from per-table schema revision.
+- [~] Define rename, drop, add-column and type-change policies.
+- [~] Define catalog v1-to-v2 migration safety requirements.
+- [~] Define the logical fields required by catalog v2.
+
+Design proposal: `docs/specifications/catalog-v0.2-identity-proposal.md`.
+ADR: `docs/decisions/0004-stable-catalog-object-identity.md`.
+These items are documented but await review/merge.
+
+### M1.2.2 Implement catalog v2 — not started
+- [ ] Add typed ObjectId and catalog object models.
+- [ ] Implement catalog v2 header, feature flags and revisions.
+- [ ] Persist table IDs, column IDs and schema revisions.
+- [ ] Reject zero and duplicate IDs.
+- [ ] Reject unsupported mandatory feature flags and versions.
+- [ ] Add v2 byte fixtures and corruption tests.
+- [ ] Decide and implement a safe v1 migration tool.
+- [ ] Verify failed migration leaves the original catalog intact.
+
+### M1.2.3 Schema evolution — not started
+- [ ] Implement table rename while preserving table ID.
+- [ ] Define and test table drop/tombstone semantics.
+- [ ] Implement column rename while preserving column ID.
+- [ ] Define schema compatibility for old segments.
+- [ ] Add nullable-column support only after old-segment reads can synthesize NULL safely.
+- [ ] Keep non-null additions and type changes rejected until backfill/rewrite semantics exist.
 - [ ] Add catalog consistency checker.
-- [ ] Add catalog inspection command or test utility.
+- [ ] Add catalog inspection utility.
 
 ## M1.3 Implement bounded read batches
 - [ ] Define a column-vector/batch representation.
@@ -739,4 +763,4 @@ Do these in order. Do not skip ahead.
 10. [ ] Mark M0 complete only after all exit criteria pass.
 11. [ ] Start M1 with exactly one small PR: the ANF format/golden-fixture and safety work package.
 
-**Current focus: M1.1 — validate the ANF golden fixture and safety tests. Do not start M1.2 until this PR passes.**
+**Current focus: M1.2.1 — define stable catalog object identity and schema revision semantics. Do not implement catalog v2 until this design is reviewed.**
