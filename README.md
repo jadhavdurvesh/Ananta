@@ -28,7 +28,7 @@ This is an experimental first vertical slice, not a complete or production-ready
 
 ## Master execution roadmap
 
-The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M2 — ingestion and the first ChronoWeave concepts.** M1 (native storage correctness and bounded reads) passed its exit gate on 2026-11-05. M2.1 is the accepted ingestion design contract; durable ingestion behavior is scheduled for M2.2.
+The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M2.3 — Capsule prototype.** M1 is complete. M2.1's ingestion contract and the M2.2 Chronicle prototype are implemented; M2.2's release-mode ingestion/startup benchmark is recorded. Navigation Map and Weave research remain ahead.
 
 ## Native design documents
 
@@ -117,3 +117,5 @@ The additive `Database::ingest_batch(table, batch_id, rows)` API writes one immu
 ## Chronicle performance benchmark
 
 The CI workflow runs the reproducible ingestion and startup benchmark described in [Chronicle Performance Benchmark v0.1](docs/specifications/chronicle-performance-benchmark-v0.1.md). It compares the legacy insert_batch path with idempotent Chronicle ingestion on identical rows and measures fresh-process Database::open time as receipt count grows. Results are workload-specific and should be treated as a baseline, not a throughput guarantee.
+
+The initial optimized CI benchmark measured 12.5% higher end-to-end ingestion elapsed time for Chronicle than legacy ANF on 100 × 128-row batches with 512-byte payloads. The Chronicle envelope added 108 bytes per batch. Fresh-process Database::open took 10.818 ms for 25 receipts and 41.876 ms for 100 receipts. See the full [benchmark report](docs/specifications/chronicle-performance-benchmark-v0.1.md); these are prototype CI results, not production guarantees.
