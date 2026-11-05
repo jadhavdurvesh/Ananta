@@ -1276,6 +1276,241 @@ mod tests {
     }
 
     #[test]
+    fn add_nullable_column_supports_mixed_segments_and_reopen() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        let original_schema = sample_schema();
+        db.create_table("telemetry", original_schema.clone()).unwrap();
+
+        let table_id = db.table_id("telemetry").unwrap();
+        let original_ids = ["timestamp", "device", "temperature"]
+            .map(|name| db.column_id("telemetry", name).unwrap());
+
+        // ANF v0.1 has no schema identity and must continue to use revision one.
+        let v0_1_rows = vec![vec![
+            Value::TimestampMicros(10),
+            Value::Utf8("legacy-v0.1".into()),
+            Value::Float64(20.0),
+        ]];
+        let table_dir = path.join("data").join("telemetry");
+        fs::write(
+            table_dir.join("segment-00000000000000000001.anf"),
+            encode_segment(&original_schema, &v0_1_rows).unwrap(),
+        ).unwrap();
+
+        // This ANF v0.2 segment captures the old revision before DDL.
+        let v0_2_old_rows = vec![vec![
+            Value::TimestampMicros(20),
+            Value::Utf8("legacy-v0.2".into()),
+            Value::Float64(21.0),
+        ]];
+        db.insert_batch("telemetry", &v0_2_old_rows).unwrap();
+
+        let new_column_id = db.add_nullable_column(
+            "telemetry",
+            "humidity",
+            DataType::Float64,
+        ).unwrap();
+        assert!(new_column_id.0 > original_ids.iter().map(|id| id.0).max().unwrap());
+        assert_eq!(db.table_id("telemetry").unwrap(), table_id);
+        for (name, original_id) in ["timestamp", "device", "temperature"]
+            .into_iter().zip(original_ids)
+        {
+            assert_eq!(db.column_id("telemetry", name).unwrap(), original_id);
+        }
+        assert_eq!(db.column_id("telemetry", "humidity").unwrap(), new_column_id);
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 2);
+        assert_eq!(db.catalog_revision(), 2);
+        assert_eq!(db.schema("telemetry").unwrap().len(), 4);
+        assert!(db.schema("telemetry").unwrap().columns()[3].nullable);
+
+        // New writes use revision two and store the new column identity.
+        let v0_2_new_rows = vec![vec![
+            Value::TimestampMicros(30),
+            Value::Utf8("new-v0.2".into()),
+            Value::Float64(22.0),
+            Value::Float64(48.5),
+        ]];
+        let new_segment = db.insert_batch("telemetry", &v0_2_new_rows).unwrap().unwrap();
+        let new_bytes = fs::read(&new_segment).unwrap();
+        assert_eq!(segment_version(&new_bytes).unwrap(), 2);
+        let identity = inspect_segment_v2(&new_bytes).unwrap();
+        assert_eq!(identity.table_id, table_id.0);
+        assert_eq!(identity.schema_revision, 2);
+        assert_eq!(identity.column_ids.last(), Some(&new_column_id.0));
+
+        let expected = vec![
+            vec![
+                Value::TimestampMicros(10),
+                Value::Utf8("legacy-v0.1".into()),
+                Value::Float64(20.0),
+                Value::Null,
+            ],
+            vec![
+                Value::TimestampMicros(20),
+                Value::Utf8("legacy-v0.2".into()),
+                Value::Float64(21.0),
+                Value::Null,
+            ],
+            v0_2_new_rows[0].clone(),
+        ];
+        assert_eq!(db.scan("telemetry").unwrap(), expected);
+        assert_eq!(
+            db.scan_columns("telemetry", &["humidity", "device"]).unwrap(),
+            vec![
+                vec![Value::Null, Value::Utf8("legacy-v0.1".into())],
+                vec![Value::Null, Value::Utf8("legacy-v0.2".into())],
+                vec![Value::Float64(48.5), Value::Utf8("new-v0.2".into())],
+            ],
+        );
+        assert!(db.check_schema_snapshot_consistency().unwrap().is_clean());
+
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap(), expected);
+        assert_eq!(reopened.table_schema_revision("telemetry").unwrap(), 2);
+        assert_eq!(reopened.catalog_revision(), 2);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn add_nullable_column_to_empty_table_and_rejects_invalid_or_duplicate_names() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("empty_table", sample_schema()).unwrap();
+
+        let id = db.add_nullable_column("empty_table", "humidity", DataType::Float64).unwrap();
+        assert_eq!(db.column_id("empty_table", "humidity").unwrap(), id);
+        assert_eq!(db.schema("empty_table").unwrap().len(), 4);
+        assert!(db.scan("empty_table").unwrap().is_empty());
+
+        assert!(matches!(
+            db.add_nullable_column("empty_table", "HUMIDITY", DataType::Float64),
+            Err(DbError::ColumnExists(name)) if name == "HUMIDITY"
+        ));
+        assert!(matches!(
+            db.add_nullable_column("empty_table", "   ", DataType::Float64),
+            Err(DbError::Type(TypeError::InvalidSchema(_)))
+        ));
+        assert!(matches!(
+            db.add_nullable_column("missing_table", "humidity", DataType::Float64),
+            Err(DbError::TableNotFound(_))
+        ));
+        assert_eq!(db.table_schema_revision("empty_table").unwrap(), 2);
+        assert_eq!(db.catalog_revision(), 2);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn nullable_column_rejects_missing_or_corrupt_current_snapshot() {
+        for corrupt in [false, true] {
+            let path = temp_path();
+            let mut db = Database::open(&path).unwrap();
+            db.create_table("telemetry", sample_schema()).unwrap();
+            let table_id = db.table_id("telemetry").unwrap();
+            let snapshot_path = SchemaSnapshot::path(&path, table_id, 1).unwrap();
+            if corrupt {
+                fs::write(&snapshot_path, b"corrupt snapshot").unwrap();
+            } else {
+                fs::remove_file(&snapshot_path).unwrap();
+            }
+
+            assert!(matches!(
+                db.add_nullable_column("telemetry", "humidity", DataType::Float64),
+                Err(DbError::SchemaCompatibility(_))
+            ));
+            assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+            assert_eq!(db.catalog_revision(), 1);
+            assert_eq!(db.schema("telemetry").unwrap().len(), 3);
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn nullable_column_catalog_publication_failure_keeps_old_schema_and_reports_orphan() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let table_id = db.table_id("telemetry").unwrap();
+        let next_snapshot = SchemaSnapshot::path(&path, table_id, 2).unwrap();
+        let catalog_temp = path.join("catalog").join("catalog.anc.tmp");
+        fs::write(&catalog_temp, b"pre-existing temporary catalog").unwrap();
+
+        assert!(matches!(
+            db.add_nullable_column("telemetry", "humidity", DataType::Float64),
+            Err(DbError::Io(_))
+        ));
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+        assert_eq!(db.catalog_revision(), 1);
+        assert_eq!(db.schema("telemetry").unwrap().len(), 3);
+        let report = db.check_schema_snapshot_consistency().unwrap();
+        assert!(report.orphaned_files.contains(&next_snapshot));
+
+        drop(db);
+        fs::remove_file(catalog_temp).unwrap();
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.table_schema_revision("telemetry").unwrap(), 1);
+        assert_eq!(reopened.catalog_revision(), 1);
+        assert_eq!(reopened.schema("telemetry").unwrap().len(), 3);
+        assert!(reopened.check_schema_snapshot_consistency().unwrap()
+            .orphaned_files.contains(&next_snapshot));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn nullable_column_retry_reuses_identical_orphan_snapshot() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let temp = path.join("catalog").join("catalog.anc.tmp");
+        fs::write(&temp, b"block publication").unwrap();
+
+        assert!(db.add_nullable_column("telemetry", "humidity", DataType::Float64).is_err());
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+        fs::remove_file(temp).unwrap();
+
+        let id = db.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
+        assert_eq!(db.column_id("telemetry", "humidity").unwrap(), id);
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 2);
+        assert_eq!(db.catalog_revision(), 2);
+        assert!(db.check_schema_snapshot_consistency().unwrap().is_clean());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn nullable_column_refuses_to_overwrite_conflicting_orphan_snapshot() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let table_id = db.table_id("telemetry").unwrap();
+
+        let mut conflicting_columns = sample_schema().columns().to_vec();
+        conflicting_columns.push(Column::new("other", DataType::Utf8, true));
+        let conflicting_schema = Schema::new(conflicting_columns).unwrap();
+        let mut conflicting_ids = ["timestamp", "device", "temperature"]
+            .map(|name| db.column_id("telemetry", name).unwrap())
+            .to_vec();
+        conflicting_ids.push(ObjectId(999));
+        let conflicting_snapshot = SchemaSnapshot::new(
+            table_id,
+            2,
+            &conflicting_schema,
+            &conflicting_ids,
+        ).unwrap();
+        let conflicting_path = conflicting_snapshot.write_to(&path).unwrap();
+        let original_bytes = fs::read(&conflicting_path).unwrap();
+
+        assert!(matches!(
+            db.add_nullable_column("telemetry", "humidity", DataType::Float64),
+            Err(DbError::CorruptCatalog("immutable schema snapshot conflict"))
+        ));
+        assert_eq!(fs::read(&conflicting_path).unwrap(), original_bytes);
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+        assert_eq!(db.catalog_revision(), 1);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn database_survives_close_and_reopen_with_stable_object_ids() {
         let path = temp_path();
         let rows = vec![
