@@ -258,9 +258,16 @@ impl SchemaSnapshot {
         let parent = destination.parent().ok_or(DbError::LengthOverflow)?;
         fs::create_dir_all(parent)?;
 
-        match fs::read(&destination) {
-            Ok(existing) => {
-                let existing_snapshot = Self::decode(&existing)?;
+        match fs::metadata(&destination) {
+            Ok(metadata) => {
+                if metadata.len() > MAX_SNAPSHOT_BYTES {
+                    return Err(DbError::CorruptCatalog("schema snapshot exceeds size limit"));
+                }
+                let existing_snapshot = Self::read_from(
+                    root.as_ref(),
+                    self.table_id,
+                    self.revision,
+                )?;
                 if existing_snapshot == *self {
                     return Ok(destination);
                 }
