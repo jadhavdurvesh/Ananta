@@ -849,15 +849,13 @@ impl Database {
         capsule_id: u64,
         generation: u64,
     ) -> Result<Vec<Vec<Value>>, DbError> {
-        let metadata = self.validate_capsule(table, capsule_id, generation)?;
+        self.validate_capsule(table, capsule_id, generation)?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         let path = self.root.join("data").join(table).join("capsules")
             .join(format!("capsule-{capsule_id:020}-g{generation:020}.cap"));
         let bytes = fs::read(path)?;
         let (_, payload) = decode_capsule(&bytes)?;
-        let snapshot = SchemaSnapshot::read_from(&self.root, definition.id, metadata.schema_revision)
-            .map_err(|_| DbError::CapsuleCorrupt("Capsule schema snapshot is missing or corrupt"))?;
         // Resolve the historical Capsule schema into the current logical schema,
         // synthesising NULL for nullable columns added after this Capsule was built.
         self.decode_and_resolve_segment(table, definition, &payload)
@@ -929,6 +927,12 @@ impl Database {
                         predicate.column, data_type
                     )));
                 }
+            }
+            if predicate.lower.is_none() && predicate.upper.is_none() {
+                return Err(DbError::InvalidRange(format!(
+                    "column '{}' range requires at least one bound",
+                    predicate.column
+                )));
             }
             if let (Some(lower), Some(upper)) = (&predicate.lower, &predicate.upper) {
                 if capsule::compare_values(lower, upper).is_gt() {
