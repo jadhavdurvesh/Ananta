@@ -16,6 +16,8 @@ mod navigation_map;
 pub mod compaction;
 pub mod compaction_manifest;
 pub use compaction_manifest::{CapsuleSourceReference, ChronicleReceiptReference, CompactionInputManifest, ManifestError};
+pub mod compaction_output_manifest;
+pub use compaction_output_manifest::{CompactionOutputManifest, WeaveArtifactReference, WeaveLayoutProfile};
 pub use compaction::{CompactionError, CompactionJobEvent, CompactionJobId, CompactionJobJournal, CompactionJobState, CompactionProgress, CompactionResourceLimits};
 pub use chronicle::{BatchId, IngestOutcome, IngestResult, IngestionStats};
 pub use capsule::{CapsuleColumnStats, CapsuleMetadata};

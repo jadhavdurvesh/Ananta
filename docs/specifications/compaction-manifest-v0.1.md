@@ -198,3 +198,65 @@ This contract does not implement a compaction scheduler, online ingestion during
 
 
 **Implementation note (2026-11-05):** The Rust workspace now contains the CIM1 encoder/decoder, SHA-256 fingerprint calculation and structural validation for contiguous Capsule and Chronicle inventories. This does not verify on-disk files; exact file preflight, output-manifest encoding, provenance verification and compaction execution remain separate M3.1 tasks.
+
+
+
+## 13. Canonical Output Manifest Binary Format — OWM1
+
+OWM1 describes one immutable, invisible candidate Weave generation. It does not promote the candidate or change the normal read path.
+
+The record is:
+
+**OWM1 | 136-byte fixed header | ordered artifact references | SHA-256 | OEND**
+
+The SHA-256 covers the complete header and artifact-reference body. The four-byte OEND marker follows the digest. All integers are little-endian.
+
+### Fixed header (136 bytes)
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 4 | Magic: OWM1 |
+| 4 | 2 | Version: 1 |
+| 6 | 2 | Flags: zero |
+| 8 | 4 | Header length: 136 |
+| 12 | 8 | TableId |
+| 20 | 16 | JobId |
+| 36 | 8 | Attempt |
+| 44 | 8 | Candidate WeaveId |
+| 52 | 8 | Candidate generation |
+| 60 | 32 | Input CIM1 body SHA-256 fingerprint |
+| 92 | 8 | Target schema revision |
+| 100 | 8 | First source sequence |
+| 108 | 8 | Last source sequence |
+| 116 | 1 | Layout: 0 append-only, 1 time-first, 2 entity-first |
+| 117 | 3 | Reserved zero |
+| 120 | 8 | Expected total row count |
+| 128 | 4 | Artifact count |
+| 132 | 4 | Reserved zero |
+
+### Artifact reference (104 bytes each)
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 4 | Zero-based artifact ordinal |
+| 4 | 4 | Reserved zero |
+| 8 | 8 | Data file byte length |
+| 16 | 32 | SHA-256 of complete data file |
+| 48 | 8 | Data row count |
+| 56 | 8 | Provenance sidecar byte length |
+| 64 | 32 | SHA-256 of complete provenance sidecar |
+| 96 | 8 | Provenance entry count |
+
+The artifact ordinal derives the canonical relative paths beneath the candidate generation: data-NNNNNNNN.wvf and provenance-NNNNNNNN.pvm. Paths are not accepted from the manifest, preventing traversal and arbitrary file selection.
+
+### Canonical constraints
+
+- The total encoded record is limited to 64 MiB and 250,000 artifacts.
+- TableId, JobId, Attempt, WeaveId, generation, input fingerprint, target schema revision, source sequence interval and expected row count are nonzero/valid.
+- Artifact ordinals are contiguous and ordered from zero. Every data and provenance file has a nonzero length and nonzero SHA-256.
+- Each artifact has a positive row count and exactly the same provenance-entry count. The checked sum of artifact row counts equals ExpectedRowCount.
+- Unknown layout values, nonzero flags/reserved fields, invalid lengths, count/length mismatch, checksum mismatch and trailing bytes are rejected.
+- OWM1 does not prove that a provenance sidecar contains the correct origins. Before publication the worker must independently verify each file's length and SHA-256, decode every sidecar entry, and prove exact set equality with the input receipt inventory expanded by row ordinal. It must also decode output rows and validate their canonical typed-row fingerprints.
+- Candidate output remains invisible until M3.3 implements active-generation promotion and rollback.
+
+The OWM1 codec validates the immutable output inventory, not the physical Weave data format. Data and provenance codecs are implemented with M3.2 layout strategies.
