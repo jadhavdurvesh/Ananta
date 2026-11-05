@@ -981,7 +981,58 @@ impl Database {
             if temporal_min != metadata.temporal_min || temporal_max != metadata.temporal_max {
                 return Err(DbError::CapsuleCorrupt("Capsule temporal bounds do not match decoded payload"));
             }
-            let _resolved_rows = resolve_rows_by_column_id(&snapshot, definition, rows)?;
+            let resolved_rows = resolve_rows_by_column_id(&snapshot, definition, rows)?;
+
+            // Counts and statistics cannot prove row lineage. Reconstruct each source
+            // batch in sequence/row-ordinal order and compare canonical typed fingerprints.
+            let mut capsule_row_offset = 0_usize;
+            for receipt_reference in manifest.receipts.iter().filter(|receipt| {
+                receipt.sequence >= reference.first_sequence
+                    && receipt.sequence <= reference.last_sequence
+            }) {
+                let batch_id = BatchId::from_bytes(receipt_reference.batch_id)?;
+                let receipt = index.by_batch_id.get(&batch_id)
+                    .ok_or(DbError::CompactionPreflight("Capsule source receipt disappeared from the index"))?;
+                let record_bytes = read_verified_regular_file(
+                    &receipt.path,
+                    receipt_reference.record_file_len,
+                    receipt_reference.record_file_sha256,
+                )?;
+                let (_, source_payload) = extract_payload(&record_bytes, definition.id.0)?;
+                let source_rows = self.decode_and_resolve_segment(table, definition, &source_payload)?;
+                if u64::try_from(source_rows.len()).map_err(|_| DbError::LengthOverflow)?
+                    != receipt_reference.row_count
+                {
+                    return Err(DbError::CompactionPreflight("decoded Chronicle source row count differs from its receipt"));
+                }
+                for source_row in &source_rows {
+                    let capsule_row = resolved_rows.get(capsule_row_offset)
+                        .ok_or(DbError::CompactionPreflight("Capsule ended before its Chronicle source rows"))?;
+                    let source_fingerprint = canonical_typed_row_fingerprint(
+                        &definition.schema,
+                        definition.id.0,
+                        definition.schema_revision,
+                        &definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>(),
+                        source_row,
+                    )?;
+                    let capsule_fingerprint = canonical_typed_row_fingerprint(
+                        &definition.schema,
+                        definition.id.0,
+                        definition.schema_revision,
+                        &definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>(),
+                        capsule_row,
+                    )?;
+                    if source_fingerprint != capsule_fingerprint {
+                        return Err(DbError::CompactionPreflight(
+                            "Capsule rows differ from the Chronicle source rows at their declared origins"
+                        ));
+                    }
+                    capsule_row_offset = capsule_row_offset.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                }
+            }
+            if capsule_row_offset != resolved_rows.len() {
+                return Err(DbError::CompactionPreflight("Capsule contains rows outside its declared Chronicle source interval"));
+            }
             total_source_bytes = total_source_bytes.checked_add(reference.file_len)
                 .ok_or(DbError::LengthOverflow)?;
         }
@@ -1574,6 +1625,19 @@ fn resolve_rows_by_column_id(
 }
 
 
+
+
+fn canonical_typed_row_fingerprint(
+    schema: &Schema,
+    table_id: u64,
+    schema_revision: u64,
+    column_ids: &[u64],
+    row: &[Value],
+) -> Result<[u8; 32], DbError> {
+    schema.validate_row(row)?;
+    let bytes = encode_segment_v2(schema, &[row.to_vec()], table_id, schema_revision, column_ids)?;
+    Ok(chronicle::sha256(&bytes))
+}
 
 fn require_real_directory(path: &Path) -> Result<(), DbError> {
     let metadata = fs::symlink_metadata(path)?;
@@ -4489,5 +4553,78 @@ mod tests {
         drop(db);
         fs::remove_dir_all(path).unwrap();
     }
+
+    #[test]
+    fn compaction_preflight_rejects_capsule_rows_with_valid_stats_but_wrong_origins() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let source_rows = vec![
+            vec![Value::TimestampMicros(1_000), Value::Utf8("a".into()), Value::Float64(1.0)],
+            vec![Value::TimestampMicros(2_000), Value::Utf8("b".into()), Value::Float64(2.0)],
+        ];
+        let batch_id = BatchId::from_bytes([91; 16]).unwrap();
+        db.ingest_batch("telemetry", batch_id, &source_rows).unwrap();
+        db.build_capsule("telemetry", 31, 1, 1, 1, None).unwrap();
+
+        let table_id = db.table_id("telemetry").unwrap();
+        let receipt = db.chronicle_indices.get(&table_id).unwrap()
+            .by_batch_id.get(&batch_id).unwrap();
+        let receipt_bytes = fs::read(&receipt.path).unwrap();
+        let receipt_reference = crate::compaction_manifest::ChronicleReceiptReference {
+            sequence: 1,
+            batch_id: *receipt.metadata.batch_id.as_bytes(),
+            payload_sha256: receipt.metadata.fingerprint,
+            row_count: receipt.metadata.row_count,
+            record_file_len: receipt_bytes.len() as u64,
+            record_file_sha256: chronicle::sha256(&receipt_bytes),
+        };
+
+        let capsule_path = path.join("data").join("telemetry").join("capsules")
+            .join(format!("capsule-{:020}-g{:020}.cap", 31, 1));
+        let (mut metadata, _) = decode_capsule(&fs::read(&capsule_path).unwrap()).unwrap();
+        let mut reversed = source_rows.clone();
+        reversed.reverse();
+        let definition = db.catalog.tables.get("telemetry").unwrap();
+        let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let payload = encode_segment_v2(
+            &definition.schema, &reversed, table_id.0, definition.schema_revision, &column_ids,
+        ).unwrap();
+        let inspection = inspect_segment_v2_details(&payload).unwrap();
+        metadata.columns = derive_column_stats(&definition.schema, &column_ids, &reversed, &inspection).unwrap();
+        let forged_capsule = encode_capsule(metadata.clone(), &payload).unwrap();
+        fs::write(&capsule_path, &forged_capsule).unwrap();
+
+        let manifest = crate::compaction_manifest::CompactionInputManifest {
+            table_id: table_id.0,
+            job_id: CompactionJobId::from_bytes([92; 16]).unwrap(),
+            attempt: 1,
+            target_schema_revision: 1,
+            first_sequence: 1,
+            last_sequence: 1,
+            expected_row_count: 2,
+            capsules: vec![crate::compaction_manifest::CapsuleSourceReference {
+                capsule_id: 31,
+                generation: 1,
+                schema_revision: metadata.schema_revision,
+                first_sequence: 1,
+                last_sequence: 1,
+                row_count: 2,
+                file_len: forged_capsule.len() as u64,
+                file_sha256: chronicle::sha256(&forged_capsule),
+            }],
+            receipts: vec![receipt_reference],
+        };
+
+        assert!(matches!(
+            db.preflight_compaction_inputs("telemetry", &manifest),
+            Err(DbError::CompactionPreflight(
+                "Capsule rows differ from the Chronicle source rows at their declared origins"
+            ))
+        ));
+        drop(db);
+        fs::remove_dir_all(path).unwrap();
+    }
+
 
 }
