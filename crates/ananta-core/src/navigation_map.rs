@@ -260,6 +260,7 @@ fn validate_map(map: &NavigationMap) -> Result<(), DbError> {
         return Err(DbError::NavigationMapCorrupt("map identity must be nonzero"));
     }
     let mut previous = None;
+    let mut source_ranges = Vec::with_capacity(map.entries.len());
     for entry in &map.entries {
         let metadata = &entry.metadata;
         let identity = (metadata.capsule_id, metadata.generation);
@@ -276,6 +277,13 @@ fn validate_map(map: &NavigationMap) -> Result<(), DbError> {
             return Err(DbError::NavigationMapCorrupt("invalid Capsule entry"));
         }
         validate_entry_columns(metadata)?;
+        source_ranges.push((metadata.first_ingestion_sequence, metadata.last_ingestion_sequence));
+    }
+    source_ranges.sort_unstable();
+    for pair in source_ranges.windows(2) {
+        if pair[1].0 <= pair[0].1 {
+            return Err(DbError::NavigationMapCorrupt("Capsule source sequence ranges overlap"));
+        }
     }
     Ok(())
 }
