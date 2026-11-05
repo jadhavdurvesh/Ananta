@@ -144,6 +144,29 @@ pub(crate) fn publish_chronicle(
     file_id: u64,
     bytes: &[u8],
 ) -> Result<PathBuf, DbError> {
+    publish_chronicle_with_hook(directory, file_id, bytes, |_| Ok(()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChroniclePublicationStage {
+    TemporaryCreated,
+    BytesWritten,
+    TemporaryFileSynced,
+    FinalNamePublished,
+    DirectorySyncedAfterPublish,
+    TemporaryNameRemoved,
+    DirectorySyncedAfterCleanup,
+}
+
+fn publish_chronicle_with_hook<F>(
+    directory: &Path,
+    file_id: u64,
+    bytes: &[u8],
+    mut checkpoint: F,
+) -> Result<PathBuf, DbError>
+where
+    F: FnMut(ChroniclePublicationStage) -> io::Result<()>,
+{
     if file_id == 0 {
         return Err(DbError::LengthOverflow);
     }
@@ -154,16 +177,29 @@ pub(crate) fn publish_chronicle(
     let result = (|| -> Result<(), DbError> {
         let mut file = OpenOptions::new().write(true).create_new(true).open(&temp_path)?;
         temporary_owned = true;
+        checkpoint(ChroniclePublicationStage::TemporaryCreated).map_err(DbError::Io)?;
+
         file.write_all(bytes)?;
         file.flush()?;
+        checkpoint(ChroniclePublicationStage::BytesWritten).map_err(DbError::Io)?;
+
         file.sync_all()?;
         drop(file);
+        checkpoint(ChroniclePublicationStage::TemporaryFileSynced).map_err(DbError::Io)?;
+
         fs::hard_link(&temp_path, &final_path)?;
         published = true;
+        checkpoint(ChroniclePublicationStage::FinalNamePublished).map_err(DbError::Io)?;
+
         sync_directory(directory)?;
+        checkpoint(ChroniclePublicationStage::DirectorySyncedAfterPublish).map_err(DbError::Io)?;
+
         fs::remove_file(&temp_path)?;
         temporary_owned = false;
+        checkpoint(ChroniclePublicationStage::TemporaryNameRemoved).map_err(DbError::Io)?;
+
         sync_directory(directory)?;
+        checkpoint(ChroniclePublicationStage::DirectorySyncedAfterCleanup).map_err(DbError::Io)?;
         Ok(())
     })();
 
@@ -331,6 +367,43 @@ mod tests {
             assert_eq!(fs::read(final_path).unwrap(), bytes);
             // Cleanup is safe after an uncertain post-link error whether or not
             // the temp name survived the injected checkpoint.
+            cleanup_orphan_segment_temps(&root).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chronicle_publication_faults_are_classified_before_and_after_commit_link() {
+        let root = temp_path();
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete Chronicle receipt and payload";
+
+        for stage in [
+            ChroniclePublicationStage::TemporaryCreated,
+            ChroniclePublicationStage::BytesWritten,
+            ChroniclePublicationStage::TemporaryFileSynced,
+        ] {
+            let result = publish_chronicle_with_hook(&root, 1, bytes, |current| {
+                if current == stage { Err(io::Error::other("injected failure")) } else { Ok(()) }
+            });
+            assert!(matches!(result, Err(DbError::Io(_))));
+            assert!(!root.join("segment-00000000000000000001.chr").exists());
+            assert!(!root.join(".chronicle-00000000000000000001.tmp").exists());
+        }
+
+        for (index, stage) in [
+            ChroniclePublicationStage::FinalNamePublished,
+            ChroniclePublicationStage::DirectorySyncedAfterPublish,
+            ChroniclePublicationStage::TemporaryNameRemoved,
+            ChroniclePublicationStage::DirectorySyncedAfterCleanup,
+        ].into_iter().enumerate() {
+            let file_id = 2 + index as u64;
+            let result = publish_chronicle_with_hook(&root, file_id, bytes, |current| {
+                if current == stage { Err(io::Error::other("injected failure")) } else { Ok(()) }
+            });
+            assert!(matches!(result, Err(DbError::SegmentPublicationUncertain { .. })));
+            let final_path = root.join(format!("segment-{file_id:020}.chr"));
+            assert_eq!(fs::read(final_path).unwrap(), bytes);
             cleanup_orphan_segment_temps(&root).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
