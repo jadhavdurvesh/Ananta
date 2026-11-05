@@ -1,4 +1,4 @@
-use crate::capsule::{decode_column_descriptor, encode_column_descriptor, compare_values, CapsuleColumnStats, CapsuleMetadata};
+use crate::capsule::{decode_column_descriptor, encode_column_descriptor, compare_values, CapsuleMetadata};
 use crate::DbError;
 use ananta_types::{DataType, Value};
 use std::collections::BTreeSet;
