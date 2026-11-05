@@ -1511,6 +1511,91 @@ mod tests {
     }
 
     #[test]
+    fn nullable_column_rejects_snapshot_that_does_not_match_catalog() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+
+        let table_id = db.table_id("telemetry").unwrap();
+        let column_ids = ["timestamp", "device", "temperature"]
+            .map(|name| db.column_id("telemetry", name).unwrap());
+        let mismatched_schema = Schema::new(vec![
+            Column::new("timestamp", DataType::TimestampMicros, false),
+            Column::new("station", DataType::Utf8, false),
+            Column::new("temperature", DataType::Float64, true),
+        ]).unwrap();
+        let mismatched_snapshot = SchemaSnapshot::new(
+            table_id,
+            1,
+            &mismatched_schema,
+            &column_ids,
+        ).unwrap();
+        let snapshot_path = SchemaSnapshot::path(&path, table_id, 1).unwrap();
+        fs::remove_file(&snapshot_path).unwrap();
+        mismatched_snapshot.write_to(&path).unwrap();
+
+        assert!(matches!(
+            db.add_nullable_column("telemetry", "humidity", DataType::Float64),
+            Err(DbError::SchemaCompatibility(_))
+        ));
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+        assert_eq!(db.catalog_revision(), 1);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn nullable_column_rejects_object_and_revision_counter_overflow() {
+        // ObjectId allocator overflow.
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        db.catalog.next_object_id = u64::MAX;
+        assert!(matches!(
+            db.add_nullable_column("telemetry", "humidity", DataType::Float64),
+            Err(DbError::LengthOverflow)
+        ));
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+        assert_eq!(db.catalog_revision(), 1);
+        fs::remove_dir_all(path).unwrap();
+
+        // Table schema revision overflow with a matching immutable snapshot.
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let definition = db.catalog.tables.get("telemetry").unwrap().clone();
+        SchemaSnapshot::new(
+            definition.id,
+            u64::MAX,
+            &definition.schema,
+            &definition.column_ids,
+        ).unwrap().write_to(&path).unwrap();
+        db.catalog.tables.get_mut("telemetry").unwrap().schema_revision = u64::MAX;
+        assert!(matches!(
+            db.add_nullable_column("telemetry", "humidity", DataType::Float64),
+            Err(DbError::LengthOverflow)
+        ));
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), u64::MAX);
+        assert_eq!(db.catalog_revision(), 1);
+        fs::remove_dir_all(path).unwrap();
+
+        // Database catalog revision overflow occurs before snapshot publication.
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        db.catalog.revision = u64::MAX;
+        let table_id = db.table_id("telemetry").unwrap();
+        let next_snapshot = SchemaSnapshot::path(&path, table_id, 2).unwrap();
+        assert!(matches!(
+            db.add_nullable_column("telemetry", "humidity", DataType::Float64),
+            Err(DbError::LengthOverflow)
+        ));
+        assert!(!next_snapshot.exists());
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+        assert_eq!(db.catalog_revision(), u64::MAX);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn database_survives_close_and_reopen_with_stable_object_ids() {
         let path = temp_path();
         let rows = vec![
