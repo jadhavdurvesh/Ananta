@@ -54,3 +54,35 @@ Map verification bytes are reported separately because M2.4 verifies the exact C
 ## Interpretation limits
 
 This benchmark is a controlled, one-run CI comparison, not a statistically stable performance claim. Capsule groups are bounded by Chronicle batch boundaries. It does not benchmark concurrent ingestion, OS cold-cache behavior, compression, predicate pushdown inside one Capsule, or cross-system comparisons. The benchmark's role is to establish a reproducible size/granularity baseline before M3 compaction research.
+
+## Observed optimized CI results
+
+**Workflow:** [Native Rust run 42051817205](https://github.com/jadhavdurvesh/Ananta/actions/runs/42051817205)  
+**Build:** Rust release profile (optimized)  
+**Runner:** GitHub-hosted Ubuntu Linux  
+**Rows:** 16,384 per profile  
+**Query:** 4,096 returned rows (event_time 4,096–8,191 inclusive)
+
+| Profile | Capsule count | Rows/Capsule | Capsule bytes total | Capsule build | Map build | Baseline scan | Mapped scan | Capsules skipped/read |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Small | 32 | 512 | 9,005,568 | 379.235 ms | 128.017 ms | 285.015 ms | 89.104 ms | 24 / 8 |
+| Medium | 8 | 2,048 | 8,993,664 | 367.716 ms | 127.008 ms | 283.449 ms | 87.189 ms | 6 / 2 |
+| Large | 2 | 8,192 | 8,990,688 | 368.933 ms | 128.617 ms | 288.015 ms | 136.006 ms | 1 / 1 |
+
+### Decode and verification work
+
+| Profile | Baseline rows examined | Mapped rows examined | Bytes verified against map | Baseline payload bytes decoded | Mapped payload bytes decoded |
+|---|---:|---:|---:|---:|---:|
+| Small | 16,384 | 4,096 | 9,005,568 | 8,994,432 | 2,248,864 |
+| Medium | 16,384 | 4,096 | 8,993,664 | 8,990,880 | 2,247,976 |
+| Large | 16,384 | 8,192 | 8,990,688 | 8,989,992 | 4,492,436 |
+
+All three mapped result sets were byte-for-byte/value-for-value equal to their unpruned reference result sets. Each returned 4,096 rows.
+
+### Interpretation
+
+Smaller Capsules provide finer pruning: the small profile skipped 24 of 32 Capsules, the medium profile skipped 6 of 8, and the large profile skipped 1 of 2. The small and medium profiles decoded approximately one quarter of the ANF payload bytes that the baseline decoded for this query; the large profile decoded approximately half.
+
+Capsule total storage differed by only about 14.9 KiB between the smallest and largest layouts for this fixed payload-heavy dataset. The fixed per-Capsule metadata overhead is visible but small relative to the payload.
+
+**Important:** M2.4 currently reads and SHA-256 verifies the complete bytes of every Capsule before using its statistics. Therefore the map reduces row examination and ANF decoding, but this benchmark does not establish reduced physical disk bytes read. Timings are one CI run and may be affected by filesystem cache and runner variance; they are not latency guarantees.
