@@ -42,6 +42,7 @@ The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source
 - [ANS1 v1 schema snapshot format](docs/specifications/schema-snapshot-ans1-v1.md)
 - [ANF v0.2 segment identity format](docs/specifications/anf-v0.2-prototype.md)
 - [Nullable-column DDL specification](docs/specifications/nullable-column-ddl-v0.1.md)
+- [Column rename and reorder specification](docs/specifications/column-rename-reorder-v0.1.md)
 - [ADR 0004: stable catalog object identity](docs/decisions/0004-stable-catalog-object-identity.md)
 - [ChronoWeave storage research proposal](docs/specifications/chronoweave-storage-research.md)
 - [ANANTA Studio and developer platform roadmap](docs/roadmap/studio-and-platform.md)
