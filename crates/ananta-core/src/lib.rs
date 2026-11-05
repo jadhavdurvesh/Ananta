@@ -1798,7 +1798,7 @@ mod tests {
                     0 => fs::remove_file(&snapshot_path).unwrap(),
                     1 => fs::write(&snapshot_path, b"broken snapshot").unwrap(),
                     _ => {
-                        let mut ids = ["timestamp", "device", "temperature"]
+                        let ids = ["timestamp", "device", "temperature"]
                             .map(|name| db.column_id("telemetry", name).unwrap()).to_vec();
                         let mismatch = Schema::new(vec![
                             Column::new("timestamp", DataType::TimestampMicros, false),
@@ -1808,7 +1808,6 @@ mod tests {
                         let bad = SchemaSnapshot::new(table_id, 1, &mismatch, &ids).unwrap();
                         fs::remove_file(&snapshot_path).unwrap();
                         bad.write_to(&path).unwrap();
-                        ids.clear();
                     }
                 }
 
@@ -1817,7 +1816,7 @@ mod tests {
                 } else {
                     db.reorder_columns("telemetry", &["temperature", "device", "timestamp"])
                 };
-                assert!(matches!(result, Err(DbError::SchemaCompatibility(_)));
+                assert!(matches!(result, Err(DbError::SchemaCompatibility(_))));
                 assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
                 assert_eq!(db.catalog_revision(), 1);
                 assert_eq!(db.schema("telemetry").unwrap().len(), 3);
