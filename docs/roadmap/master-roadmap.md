@@ -307,8 +307,10 @@ Table rename/drop, column drop, type changes and non-null additions remain defer
 - [x] Ensure iterator errors are surfaced once and stop iteration.
 - [x] Test empty, one-row, exact batch size and batch-size-plus-one boundaries.
 - [x] Test projection order, repeated projections and mixed schema revisions.
-- [ ] Measure peak memory while scanning a generated dataset.
-- [ ] Demonstrate with a reproducible benchmark that decoded memory scales with configured batch output, not total result rows.
+- [x] Measure peak memory while scanning a generated dataset in isolated Linux processes.
+- [x] Demonstrate with a reproducible benchmark that decoded memory scales with configured batch output, not total result rows.
+
+Benchmark: `docs/specifications/bounded-scan-memory-benchmark-v0.1.md`. A 10× row-count increase at 512-row batches changed peak RSS from 4,824 KiB to 5,144 KiB; a 256→1,024→4,096 batch sweep on 50k rows reported 3,992→7,240→20,036 KiB peak RSS.
 
 Specification: `docs/specifications/bounded-read-batches-v0.1.md`.
 
@@ -333,7 +335,7 @@ ADR: `docs/decisions/0006-atomic-segment-publication-and-writer-lock.md`.
 - [x] Deterministic malformed-input tests reject invalid data without panics.
 - [x] Catalog survives repeated close/reopen.
 - [x] Projected streaming scans work without full-result materialisation.
-- [ ] Memory is measured and bounded by configured batches.
+- [x] Memory is measured and bounded by configured batches for the documented benchmark workload.
 - [x] Publication failure tests pass.
 - [x] Exclusive-writer boundary is enforced with a fail-closed local lock.
 
