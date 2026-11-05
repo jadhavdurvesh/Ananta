@@ -536,6 +536,38 @@ mod tests {
     }
 
     #[test]
+    fn decoder_rejects_header_row_count_above_limit_before_allocating() {
+        let schema = schema();
+        let mut bytes = encode_segment(&schema, &[]).unwrap();
+        bytes[8..16].copy_from_slice(&((MAX_ROWS as u64) + 1).to_le_bytes());
+
+        assert_eq!(
+            decode_segment(&bytes, &schema),
+            Err(FormatError::LimitExceeded("row count"))
+        );
+    }
+
+    #[test]
+    fn non_nullable_column_rejects_null_payload() {
+        let schema = schema();
+        let rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("sensor".into()),
+            Value::Float64(1.0),
+            Value::Boolean(true),
+        ]];
+        let mut bytes = encode_segment(&schema, &rows).unwrap();
+        let payload = column_payload_offset(&bytes, 0);
+        bytes[payload] = 0;
+        refresh_checksum(&mut bytes);
+
+        assert_eq!(
+            decode_segment(&bytes, &schema),
+            Err(FormatError::Type("column 'time' does not allow NULL".into()))
+        );
+    }
+
+    #[test]
     fn truncated_segment_is_rejected() {
         let schema = schema();
         let encoded = encode_segment(&schema, &[]).unwrap();
