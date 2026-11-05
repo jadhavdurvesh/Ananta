@@ -2700,4 +2700,94 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
+
+    #[test]
+    fn database_handle_enforces_exclusive_writer_lock_and_releases_it_on_drop() {
+        let path = temp_path();
+        let db = Database::open(&path).unwrap();
+        assert!(path.join(".ananta.lock").is_file());
+        assert!(matches!(
+            Database::open(&path),
+            Err(DbError::DatabaseLocked(_))
+        ));
+
+        drop(db);
+        assert!(!path.join(".ananta.lock").exists());
+        let reopened = Database::open(&path).unwrap();
+        assert!(path.join(".ananta.lock").is_file());
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn database_open_cleans_orphan_temp_segments_but_preserves_published_and_unknown_files() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("published".into()),
+            Value::Float64(12.5),
+        ]];
+        let published = db.insert_batch("telemetry", &rows).unwrap().unwrap();
+        assert!(published.is_file());
+        drop(db);
+
+        let table_dir = path.join("data").join("telemetry");
+        let orphan_temp = table_dir.join(".segment-00000000000000000099.tmp");
+        let unrelated = table_dir.join(".segment-99.tmp");
+        let unknown = table_dir.join("notes.txt");
+        fs::write(&orphan_temp, b"interrupted segment write").unwrap();
+        fs::write(&unrelated, b"not a canonical temp segment").unwrap();
+        fs::write(&unknown, b"leave untouched").unwrap();
+
+        let reopened = Database::open(&path).unwrap();
+        assert!(!orphan_temp.exists());
+        assert_eq!(fs::read(unrelated).unwrap(), b"not a canonical temp segment");
+        assert_eq!(fs::read(unknown).unwrap(), b"leave untouched");
+        assert_eq!(reopened.scan("telemetry").unwrap(), rows);
+        assert!(published.exists());
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn database_open_fails_closed_on_stale_writer_lock() {
+        let path = temp_path();
+        fs::create_dir_all(&path).unwrap();
+        let lock_path = path.join(".ananta.lock");
+        fs::write(&lock_path, b"pid=unverified\n").unwrap();
+
+        assert!(matches!(
+            Database::open(&path),
+            Err(DbError::DatabaseLocked(found)) if found == lock_path
+        ));
+        assert_eq!(fs::read(&lock_path).unwrap(), b"pid=unverified\n");
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn insert_batch_publishes_complete_segment_without_leaving_temp_name() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(7),
+            Value::Utf8("sensor".into()),
+            Value::Float64(21.0),
+        ]];
+
+        let final_path = db.insert_batch("telemetry", &rows).unwrap().unwrap();
+        assert_eq!(
+            final_path.file_name().and_then(|name| name.to_str()),
+            Some("segment-00000000000000000001.anf")
+        );
+        assert!(final_path.is_file());
+        assert!(!path.join("data").join("telemetry")
+            .join(".segment-00000000000000000001.tmp").exists());
+        assert_eq!(db.scan("telemetry").unwrap(), rows);
+        drop(db);
+        fs::remove_dir_all(path).unwrap();
+    }
+
 }
