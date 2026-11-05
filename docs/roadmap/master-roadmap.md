@@ -255,28 +255,32 @@ Specification: `docs/specifications/schema-snapshot-ans1-v1.md`.
 
 Specification: `docs/specifications/anf-v0.2-prototype.md`.
 
-### M1.2.3.4 Enable the first safe schema changes — current work
+### M1.2.3.4 Enable the first safe schema changes — active
 
-#### M1.2.3.4.1 Add nullable column — current task
-- [~] Specify `Database::add_nullable_column(table, name, data_type)`.
-- [~] Require the current immutable schema snapshot to match the catalog before a change.
-- [~] Allocate one new stable ColumnId without changing existing IDs.
-- [~] Increment table schema revision and catalog revision with checked arithmetic.
-- [~] Publish the new immutable schema snapshot before the catalog pointer.
-- [~] Keep the old catalog/in-memory schema active if publication fails.
-- [~] Define handling for orphan snapshot conflicts and retries.
-- [ ] Implement the nullable-column API.
-- [ ] Add mixed v0.1/v0.2 historical segment tests with NULL synthesis.
-- [ ] Test new v0.2 writes at the new schema revision.
-- [ ] Test close/reopen, projections and revision counters.
-- [ ] Test duplicate names, missing/corrupt snapshots and publication failure.
+#### M1.2.3.4.1 Add nullable column — implementation and CI complete
+- [x] Specify `Database::add_nullable_column(table, name, data_type)`.
+- [x] Require the current immutable schema snapshot to match the catalog before a change.
+- [x] Allocate one new stable ColumnId without changing existing IDs.
+- [x] Increment table schema revision and catalog revision with checked arithmetic.
+- [x] Publish the new immutable schema snapshot before the catalog pointer.
+- [x] Keep the old catalog/in-memory schema active if publication fails.
+- [x] Preserve orphan snapshots, permit identical retry and reject conflicting revisions.
+- [x] Implement the nullable-column API.
+- [x] Test mixed v0.1/v0.2 historical segments with NULL synthesis.
+- [x] Test new v0.2 writes at the new schema revision.
+- [x] Test close/reopen, full/projected scans, stable IDs and revision counters.
+- [x] Test duplicate names, empty names, missing/corrupt/mismatched snapshots, publication failure and counter overflow.
+- [x] Pass formatting, workspace tests, Clippy and the native example.
+
+**Validated in [PR #11](https://github.com/jadhavdurvesh/Ananta/pull/11); [latest CI run passed](https://github.com/jadhavdurvesh/Ananta/actions/runs/42017366696).**
 
 Specification: `docs/specifications/nullable-column-ddl-v0.1.md`.
 
-#### M1.2.3.4.2 Rename and reorder columns — not started
+#### M1.2.3.4.2 Rename and reorder columns — next
+- [ ] Define rename/reorder snapshot transition and compatibility rules.
 - [ ] Implement column rename while preserving ColumnId.
 - [ ] Implement column reorder while preserving ColumnIds.
-- [ ] Verify old segment mapping by ColumnId.
+- [ ] Verify historical segment mapping by ColumnId after rename/reorder.
 - [ ] Add failure-injection tests for snapshot/catalog publication.
 
 Table rename/drop, column drop, type changes and non-null additions remain deferred until path identity, tombstones, backfill and compaction protocols are designed.
@@ -830,4 +834,4 @@ Do these in order. Do not skip ahead.
 10. [ ] Mark M0 complete only after all exit criteria pass.
 11. [ ] Start M1 with exactly one small PR: the ANF format/golden-fixture and safety work package.
 
-**Current focus: M1.2.3.4.1 — implement nullable-column DDL with snapshot-first publication and mixed-revision reads. All other schema-changing operations remain disabled.**
+**Current focus: M1.2.3.4.2 — define safe column rename/reorder semantics while preserving stable ColumnIds. Table/column drops, type changes and non-null additions remain disabled.**
