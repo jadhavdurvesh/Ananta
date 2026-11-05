@@ -30,7 +30,7 @@ This is an experimental first vertical slice, not a complete or production-ready
 
 ## Master execution roadmap
 
-The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M2.3 — Capsule prototype.** M1 is complete. M2.1's ingestion contract and the M2.2 Chronicle prototype are implemented; M2.2's release-mode ingestion/startup benchmark is recorded. Navigation Map and Weave research remain ahead.
+The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M3.1 — compaction foundation.** M1 and M2 are complete. M2 delivered the Chronicle ingestion contract and prototype, immutable Capsule v0.1 files, a correctness-first Navigation Map, and reproducible M2 benchmarks. M3 begins with fingerprinted compaction manifests, row provenance, bounded job execution and safely discardable attempts.
 
 ## Native design documents
 
@@ -50,6 +50,8 @@ The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source
 - [Chronicle record format v0.1](docs/specifications/chronicle-record-v0.1.md)
 - [ADR 0008: Chronicle record as the ingestion commit point](docs/decisions/0008-chronicle-record-commit-point.md)
 - [ADR 0007: idempotent commit-ordered ingestion](docs/decisions/0007-idempotent-commit-ordered-ingestion.md)
+- [Compaction Manifest and Job Contract v0.1](docs/specifications/compaction-manifest-v0.1.md)
+- [ADR 0010: immutable compaction inputs and candidate outputs](docs/decisions/0010-compaction-input-snapshots-and-candidate-outputs.md)
 - [Segment publication and recovery contract](docs/specifications/segment-publication-recovery-v0.1.md)
 - [ADR 0006: atomic segment publication and exclusive local writer](docs/decisions/0006-atomic-segment-publication-and-writer-lock.md)
 - [Nullable-column DDL specification](docs/specifications/nullable-column-ddl-v0.1.md)

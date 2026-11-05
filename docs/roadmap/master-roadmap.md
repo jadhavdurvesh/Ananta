@@ -445,15 +445,19 @@ Specification: docs/specifications/navigation-map-v0.1.md.
 **Goal:** test whether reorganising Capsules into Weaves improves actual workloads.
 
 ## M3.1 Compaction foundation
-- [ ] Define compaction input and output manifests.
-- [ ] Define source-generation references.
-- [ ] Define compaction job states.
-- [ ] Define temporary output handling.
-- [ ] Define duplicate/missing row detection.
-- [ ] Define compaction memory and disk limits.
-- [ ] Define compaction cancellation.
-- [ ] Make compaction restartable or safely discardable.
-- [ ] Add compaction correctness tests.
+- [x] Define compaction input and output manifests.
+- [x] Define source-generation references.
+- [x] Define compaction job states.
+- [x] Define temporary output handling.
+- [x] Define duplicate/missing row detection through stable row provenance.
+- [x] Define compaction memory and disk limits.
+- [x] Define compaction cancellation boundaries.
+- [x] Define safely discardable attempts and fresh-attempt retry semantics.
+- [ ] Implement manifests, job journal, bounded execution and staging publication.
+- [ ] Add compaction correctness and fault-injection tests.
+
+Specification: docs/specifications/compaction-manifest-v0.1.md.
+Decision: docs/decisions/0010-compaction-input-snapshots-and-candidate-outputs.md.
 
 ## M3.2 First Weave strategies
 - [ ] Implement baseline append-only layout.
