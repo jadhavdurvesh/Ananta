@@ -13,6 +13,8 @@ mod segment_publication;
 mod chronicle;
 mod capsule;
 mod navigation_map;
+mod compaction_execution;
+pub use compaction_execution::{CompactionExecutionReport, RowOrigin};
 pub mod compaction;
 pub mod compaction_manifest;
 pub use compaction_manifest::{CapsuleSourceReference, ChronicleReceiptReference, CompactionInputManifest, ManifestError};
@@ -76,6 +78,7 @@ pub enum DbError {
     NavigationMapCorrupt(&'static str),
     NavigationMapStale(&'static str),
     InvalidRange(String),
+    CompactionExecution(String),
     CompactionManifest(crate::compaction_manifest::ManifestError),
     CompactionPreflight(&'static str),
 }
@@ -108,6 +111,7 @@ impl fmt::Display for DbError {
             Self::NavigationMapCorrupt(message) => write!(f, "corrupt Navigation Map: {message}"),
             Self::NavigationMapStale(message) => write!(f, "stale Navigation Map: {message}"),
             Self::InvalidRange(message) => write!(f, "invalid Capsule scan range: {message}"),
+            Self::CompactionExecution(message) => write!(f, "compaction execution failed: {message}"),
             Self::CompactionManifest(error) => write!(f, "invalid compaction manifest: {error}"),
             Self::CompactionPreflight(message) => write!(f, "compaction input preflight failed: {message}"),
         }

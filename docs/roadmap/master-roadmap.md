@@ -460,7 +460,11 @@ Specification: docs/specifications/navigation-map-v0.1.md.
 - [x] Implement canonical CIM1 input manifest codec, SHA-256 fingerprinting and structural Capsule/Chronicle coverage validation.
 - [x] Implement canonical OWM1 output manifest codec, artifact fingerprints, canonical relative paths and provenance-count checks.
 - [x] Verify source Capsule and Chronicle files against CIM1 length/SHA-256 references before compaction; validate Capsule checksums, statistics and target-schema compatibility.
-- [ ] Verify candidate output files and provenance sidecars against OWM1 before publication.
+- [x] Verify candidate output files and PVM1 provenance sidecars against OWM1 before publication; require exact row-origin and typed-fingerprint set equality.
+- [x] Add budget-checked candidate execution with attempt-owned staging, chunked ANF-v2 output artifacts, work-unit cancellation and CJE1 progress.
+- [x] Implement append-only, time-first and entity-first candidate ordering with deterministic origin tie-breaking.
+- [ ] Measure candidate read latency, process CPU time and repeatable workload benefit; mixed layout remains conditional on evidence.
+- [ ] Add crash-safe active-generation promotion, rollback and recovery.
 - [ ] Add bounded compaction execution, attempt-owned staging and crash-safe candidate publication.
 - [ ] Add database-level compaction correctness and fault-injection tests.
 
@@ -468,11 +472,11 @@ Specification: docs/specifications/compaction-manifest-v0.1.md.
 Decision: docs/decisions/0010-compaction-input-snapshots-and-candidate-outputs.md.
 
 ## M3.2 First Weave strategies
-- [ ] Implement baseline append-only layout.
-- [ ] Implement time-first candidate.
-- [ ] Implement entity-first candidate.
+- [x] Implement baseline append-only layout.
+- [x] Implement time-first candidate.
+- [x] Implement entity-first candidate.
 - [ ] Implement mixed candidate only if workloads justify it.
-- [ ] Preserve logical row equivalence across all layouts.
+- [x] Preserve logical row equivalence across all layouts with one-to-one provenance and canonical typed-row fingerprints.
 - [ ] Record compaction duration and CPU.
 - [ ] Record temporary disk amplification.
 - [ ] Record final storage size.

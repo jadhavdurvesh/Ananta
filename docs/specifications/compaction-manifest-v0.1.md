@@ -269,3 +269,17 @@ The database source-preflight API accepts a decoded CIM1 manifest and checks tha
 Before a source is accepted, the preflight checks each parent directory is a real directory (not a symlink), each source is a regular non-symlink file, the exact byte length and complete-file SHA-256 match CIM1, and the embedded format validator accepts the Chronicle or Capsule record. Capsule validation also recomputes ANF column statistics and temporal bounds and verifies ColumnId-based resolution into the target schema. No source is modified, renamed or deleted.
 
 The preflight report returns verified Capsule and Chronicle-record counts, aggregate source bytes, total rows and the exact CIM1 body fingerprint. This is a read-only preflight primitive; it does not yet run compaction or publish candidate outputs.
+
+
+
+## 15. Runtime candidate execution — first prototype
+
+The first bounded executor uses deterministic attempt-owned staging beneath the table's weaves directory. It snapshots and rechecks CIM1 preflight, enforces max_rows and a conservative input-derived working-memory estimate before allocating row vectors, and emits ANF-v2 data artifacts no larger than the configured work unit, 65,536 rows or the ANF decoded-cell limit. This prototype uses a finite in-memory working set rather than an external-sort spill engine: workloads whose estimate exceeds max_working_memory_bytes fail before execution. This is a finite prototype limit, not a claim of unlimited-scale external sorting.
+
+Append-only preserves source sequence and row ordinal. Time-first sorts by the first TIMESTAMP_MICROS column. Entity-first sorts by the first UTF8/integer column. Sorted profiles sort bounded runs and perform a deterministic k-way merge with source origin as tie-breaker. Mixed layout is not implemented unless later workload evidence justifies it.
+
+Each artifact has an ANF-v2 data object and a PVM1 sidecar. PVM1 stores IngestionSequence, RowOrdinal and TypedRowSHA256 per physical row. Candidate verification reopens every staged file, verifies its OWM1 length/hash, decodes the data and PVM1, and proves exact equality with the input origin/fingerprint inventory. OWM1 is written last; the complete staging directory is atomically renamed into the immutable candidate generation path. It remains inactive.
+
+The executor journals Planned, ValidatingInputs, Running, Verifying, Publishing and Completed transitions in CJE1. Cancellation is checked between source Capsules, bounded sort runs and output merge work units; once Publishing is journalled, cancellation is too late. Progress tracks input/output/temp bytes, estimated working memory, rows and open files. Wall duration is recorded. Process CPU time is currently reported as unavailable by the portable prototype and remains an M3.2 measurement task.
+
+execute_compaction and verify_compaction_candidate do not modify source Chronicle/Capsule files or normal scan visibility. They create only an immutable candidate directory and per-attempt journal. Active-generation promotion remains M3.3.
