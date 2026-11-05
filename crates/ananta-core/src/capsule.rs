@@ -501,6 +501,8 @@ pub(crate) fn compare_values(left: &Value, right: &Value) -> std::cmp::Ordering 
         (Value::Int64(left), Value::Int64(right)) => left.cmp(right),
         (Value::TimestampMicros(left), Value::TimestampMicros(right)) => left.cmp(right),
         (Value::Float64(left), Value::Float64(right)) => left.total_cmp(right),
+        (Value::Utf8(left), Value::Utf8(right)) => left.cmp(right),
+        (Value::Binary(left), Value::Binary(right)) => left.cmp(right),
         _ => std::cmp::Ordering::Equal,
     }
 }
