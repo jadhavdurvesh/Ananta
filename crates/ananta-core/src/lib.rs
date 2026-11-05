@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub mod schema_snapshot;
-use schema_snapshot::SchemaSnapshot;
+use schema_snapshot::{SchemaSnapshot, SchemaSnapshotConsistencyReport};
 
 const CATALOG_MAGIC: &[u8; 4] = b"ANC1";
 const CATALOG_END: &[u8; 4] = b"CEND";
@@ -194,6 +194,105 @@ impl Database {
         self.catalog.tables.get(table)
             .map(|definition| definition.schema_revision)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))
+    }
+
+    /// Check catalog-to-snapshot references and report missing, corrupt or orphaned files.
+    ///
+    /// Valid historical revisions below the current catalog revision are retained;
+    /// the checker cannot classify them as garbage until segment manifests carry
+    /// schema revision references.
+    pub fn check_schema_snapshot_consistency(
+        &self,
+    ) -> Result<SchemaSnapshotConsistencyReport, DbError> {
+        let mut report = SchemaSnapshotConsistencyReport::default();
+        let current = self.catalog.tables.values()
+            .map(|definition| (definition.id, definition.schema_revision))
+            .collect::<BTreeMap<_, _>>();
+        let mut found_current = BTreeSet::new();
+        let schemas_root = self.root.join("catalog").join("schemas");
+
+        match fs::read_dir(&schemas_root) {
+            Ok(table_dirs) => {
+                for table_entry in table_dirs {
+                    let table_entry = table_entry?;
+                    let table_dir = table_entry.path();
+                    let file_type = table_entry.file_type()?;
+                    let table_name = table_entry.file_name();
+                    let table_name = table_name.to_string_lossy();
+
+                    if !file_type.is_dir() {
+                        report.invalid_files.push(table_dir);
+                        continue;
+                    }
+                    let table_id = match table_name.parse::<u64>() {
+                        Ok(id) if id != 0 && id.to_string() == table_name => ObjectId(id),
+                        _ => {
+                            report.invalid_files.push(table_dir);
+                            continue;
+                        }
+                    };
+
+                    for entry in fs::read_dir(&table_dir)? {
+                        let entry = entry?;
+                        let path = entry.path();
+                        let filename = entry.file_name();
+                        let filename = filename.to_string_lossy();
+                        let file_type = entry.file_type()?;
+
+                        if filename.starts_with("schema-") && path.extension().and_then(|s| s.to_str()) == Some("tmp") {
+                            report.orphaned_files.push(path);
+                            continue;
+                        }
+                        if path.extension().and_then(|s| s.to_str()) != Some("ans") {
+                            continue;
+                        }
+                        if !file_type.is_file() {
+                            report.invalid_files.push(path);
+                            continue;
+                        }
+
+                        let revision = path.file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .and_then(|stem| stem.strip_prefix("schema-"))
+                            .and_then(|value| value.parse::<u64>().ok());
+                        let Some(revision) = revision else {
+                            report.invalid_files.push(path);
+                            continue;
+                        };
+                        if filename != format!("schema-{revision:020}.ans") || revision == 0 {
+                            report.invalid_files.push(path);
+                            continue;
+                        }
+
+                        match SchemaSnapshot::read_from(&self.root, table_id, revision) {
+                            Ok(snapshot) => match current.get(&table_id) {
+                                None => report.orphaned_files.push(path),
+                                Some(current_revision) if revision > *current_revision => {
+                                    report.orphaned_files.push(path)
+                                }
+                                Some(current_revision) if revision == *current_revision => {
+                                    found_current.insert((table_id, *current_revision));
+                                }
+                                Some(_) => {}
+                            },
+                            Err(_) => report.invalid_files.push(path),
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DbError::Io(error)),
+        }
+
+        for (table_id, revision) in current {
+            if !found_current.contains(&(table_id, revision)) {
+                report.missing_current.push((table_id, revision));
+            }
+        }
+        report.missing_current.sort();
+        report.invalid_files.sort();
+        report.orphaned_files.sort();
+        Ok(report)
     }
 
     /// Persist the current table schema as an immutable sidecar snapshot.
