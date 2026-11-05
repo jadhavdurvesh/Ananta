@@ -768,4 +768,4 @@ Do these in order. Do not skip ahead.
 10. [ ] Mark M0 complete only after all exit criteria pass.
 11. [ ] Start M1 with exactly one small PR: the ANF format/golden-fixture and safety work package.
 
-**Current focus: M1.2.2 — validate native catalog v2 implementation and safe v1 migration. Do not start schema evolution until this PR passes.**
+**Current focus: M1.2.3.1 — review immutable schema snapshots and mixed-segment compatibility. Do not enable DDL APIs until snapshot history and ANF v0.2 resolution are implemented and tested.**
