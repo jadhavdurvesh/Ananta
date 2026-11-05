@@ -41,6 +41,7 @@ The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source
 - [ADR 0005: immutable schema snapshots](docs/decisions/0005-schema-evolution-needs-immutable-snapshots.md)
 - [ANS1 v1 schema snapshot format](docs/specifications/schema-snapshot-ans1-v1.md)
 - [ANF v0.2 segment identity format](docs/specifications/anf-v0.2-prototype.md)
+- [Bounded read batch contract](docs/specifications/bounded-read-batches-v0.1.md)
 - [Nullable-column DDL specification](docs/specifications/nullable-column-ddl-v0.1.md)
 - [Column rename and reorder specification](docs/specifications/column-rename-reorder-v0.1.md)
 - [ADR 0004: stable catalog object identity](docs/decisions/0004-stable-catalog-object-identity.md)
