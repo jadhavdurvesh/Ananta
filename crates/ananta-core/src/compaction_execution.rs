@@ -274,6 +274,9 @@ impl Database {
                 return Err(DbError::CompactionPreflight("input snapshot changed after planning"));
             }
             append_state(&mut journal, &journal_path, CompactionJobState::Running, progress)?;
+            let input_manifest_bytes = input.encode()
+                .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
+            write_new_synced(&stage_dir.join("manifest.cim"), &input_manifest_bytes)?;
 
             let mut rows = Vec::with_capacity(usize::try_from(input.expected_row_count)
                 .map_err(|_| DbError::LengthOverflow)?);
@@ -517,6 +520,12 @@ impl Database {
         let directory = weave_root.join(format!("weave-{weave_id:020}-g{generation:020}"));
         require_directory(&weave_root)?;
         require_directory(&directory)?;
+        let input_bytes = read_regular_file(&directory.join("manifest.cim"))?;
+        let stored_input = CompactionInputManifest::decode(&input_bytes)
+            .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
+        if stored_input != *input {
+            return Err(DbError::CompactionPreflight("candidate CIM1 snapshot differs from supplied input manifest"));
+        }
         let bytes = read_regular_file(&directory.join("manifest.owm"))?;
         let output = CompactionOutputManifest::decode(&bytes)
             .map_err(|e| DbError::CompactionExecution(e.to_string()))?;
