@@ -608,6 +608,10 @@ fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire))
 }
 
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire))
+}
+
 fn check_cancel(cancel: Option<&AtomicBool>) -> Result<(), DbError> {
     if cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
         Err(DbError::CompactionExecution("compaction cancelled at a bounded work-unit boundary".into()))
