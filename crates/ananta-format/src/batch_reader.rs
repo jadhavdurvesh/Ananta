@@ -225,8 +225,8 @@ impl<R: Read + Seek> SegmentBatchReader<R> {
         let mut batch = Vec::with_capacity(self.columns.len());
         for column in &mut self.columns {
             let mut values = Vec::with_capacity(count);
+            self.reader.seek(SeekFrom::Start(column.cursor)).map_err(io_error)?;
             for _ in 0..count {
-                self.reader.seek(SeekFrom::Start(column.cursor)).map_err(io_error)?;
                 values.push(read_value(
                     &mut self.reader,
                     column.end,
@@ -314,5 +314,108 @@ fn map_read_error(error: std::io::Error) -> FormatError {
         FormatError::Truncated
     } else {
         io_error(error)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ananta_types::Column;
+    use std::io::Cursor;
+
+    fn schema() -> Schema {
+        Schema::new(vec![
+            Column::new("id", DataType::Int64, false),
+            Column::new("label", DataType::Utf8, true),
+            Column::new("enabled", DataType::Boolean, false),
+            Column::new("payload", DataType::Binary, true),
+        ]).unwrap()
+    }
+
+    fn rows() -> Vec<Vec<Value>> {
+        vec![
+            vec![Value::Int64(1), Value::Utf8("one".into()), Value::Boolean(true), Value::Binary(vec![1, 2])],
+            vec![Value::Int64(2), Value::Null, Value::Boolean(false), Value::Null],
+            vec![Value::Int64(3), Value::Utf8("three".into()), Value::Boolean(true), Value::Binary(vec![3])],
+        ]
+    }
+
+    #[test]
+    fn v1_file_reader_emits_projected_column_batches() {
+        let schema = schema();
+        let encoded = encode_segment(&schema, &rows()).unwrap();
+        let mut decoder = SegmentBatchReader::new(Cursor::new(encoded), &schema, &[1, 0], None).unwrap();
+
+        let first = decoder.next_batch(2).unwrap().unwrap();
+        assert_eq!(first, vec![
+            vec![Value::Utf8("one".into()), Value::Null],
+            vec![Value::Int64(1), Value::Int64(2)],
+        ]);
+        assert_eq!(decoder.remaining_rows(), 1);
+
+        let second = decoder.next_batch(2).unwrap().unwrap();
+        assert_eq!(second, vec![
+            vec![Value::Utf8("three".into())],
+            vec![Value::Int64(3)],
+        ]);
+        assert!(decoder.next_batch(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn v2_file_reader_checks_identity_and_decodes_batches() {
+        let schema = schema();
+        let ids = vec![10, 11, 12, 13];
+        let encoded = encode_segment_v2(&schema, &rows(), 7, 4, &ids).unwrap();
+        let mut decoder = SegmentBatchReader::new(
+            Cursor::new(encoded.clone()),
+            &schema,
+            &[3, 0],
+            Some((7, 4, ids.clone())),
+        ).unwrap();
+        assert_eq!(decoder.next_batch(1).unwrap().unwrap(), vec![
+            vec![Value::Binary(vec![1, 2])],
+            vec![Value::Int64(1)],
+        ]);
+        assert!(matches!(
+            SegmentBatchReader::new(
+                Cursor::new(encoded),
+                &schema,
+                &[0],
+                Some((7, 3, ids)),
+            ),
+            Err(FormatError::SchemaMismatch)
+        ));
+    }
+
+    #[test]
+    fn null_only_projection_still_advances_rows() {
+        let schema = schema();
+        let encoded = encode_segment(&schema, &rows()).unwrap();
+        let mut decoder = SegmentBatchReader::new(Cursor::new(encoded), &schema, &[], None).unwrap();
+        assert_eq!(decoder.next_batch(2).unwrap().unwrap(), Vec::<Vec<Value>>::new());
+        assert_eq!(decoder.remaining_rows(), 1);
+        assert_eq!(decoder.next_batch(2).unwrap().unwrap(), Vec::<Vec<Value>>::new());
+        assert!(decoder.next_batch(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn checksum_is_verified_before_first_batch() {
+        let schema = schema();
+        let mut encoded = encode_segment(&schema, &rows()).unwrap();
+        encoded[encoded.len() - 13] ^= 0x01;
+        assert_eq!(
+            SegmentBatchReader::new(Cursor::new(encoded), &schema, &[0], None).err(),
+            Some(FormatError::ChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn batch_size_bounds_are_enforced() {
+        let schema = schema();
+        let encoded = encode_segment(&schema, &rows()).unwrap();
+        let mut decoder = SegmentBatchReader::new(Cursor::new(encoded), &schema, &[0], None).unwrap();
+        assert!(matches!(decoder.next_batch(0), Err(FormatError::LimitExceeded(_))));
+        assert!(matches!(decoder.next_batch(MAX_BATCH_ROWS + 1), Err(FormatError::LimitExceeded(_))));
     }
 }
