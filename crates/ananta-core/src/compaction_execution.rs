@@ -225,8 +225,14 @@ impl Database {
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         let schema = &definition.schema;
         let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        if input.expected_row_count > limits.max_rows {
+            return Err(DbError::CompactionExecution(format!(
+                "row budget {} is below the manifest row count {}",
+                limits.max_rows, input.expected_row_count
+            )));
+        }
         let estimated_memory = preflight.total_source_bytes.checked_mul(4)
-            .and_then(|n| n.checked_add(input.expected_row_count.checked_mul(160)?))
+            .and_then(|n| n.checked_add(input.expected_row_count.checked_mul(256)?))
             .ok_or(DbError::LengthOverflow)?;
         if estimated_memory > limits.max_working_memory_bytes {
             return Err(DbError::CompactionExecution(format!(
@@ -298,6 +304,7 @@ impl Database {
             let mut rows = Vec::with_capacity(usize::try_from(input.expected_row_count)
                 .map_err(|_| DbError::LengthOverflow)?);
             let mut expected = Vec::with_capacity(rows.capacity());
+            let mut rows_since_boundary = 0_u64;
             for capsule in &input.capsules {
                 check_cancel(cancel)?;
                 let capsule_rows = self.scan_capsule(table, capsule.capsule_id, capsule.generation)?;
@@ -321,8 +328,16 @@ impl Database {
                         rows.push(ExecutionRow { values: row.clone(), origin });
                         capsule_index = capsule_index.checked_add(1).ok_or(DbError::LengthOverflow)?;
                         progress.rows_processed = progress.rows_processed.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                        rows_since_boundary = rows_since_boundary.checked_add(1).ok_or(DbError::LengthOverflow)?;
                         if progress.rows_processed > limits.max_rows {
                             return Err(DbError::CompactionExecution("row budget exceeded while reading inputs".into()));
+                        }
+                        if rows_since_boundary >= limits.max_work_unit_rows {
+                            check_cancel(cancel)?;
+                            progress.working_memory_bytes = estimated_memory;
+                            progress.current_work_unit_rows = rows_since_boundary;
+                            limits.check(&progress).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+                            rows_since_boundary = 0;
                         }
                     }
                 }
@@ -330,9 +345,9 @@ impl Database {
                     return Err(DbError::CompactionPreflight("Capsule has rows outside its source receipt interval"));
                 }
                 progress.working_memory_bytes = estimated_memory;
-                progress.current_work_unit_rows = u64::try_from(capsule_index)
-                    .map_err(|_| DbError::LengthOverflow)?.min(limits.max_work_unit_rows);
+                progress.current_work_unit_rows = rows_since_boundary;
                 limits.check(&progress).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+                rows_since_boundary = 0;
             }
             if rows.len() as u64 != input.expected_row_count {
                 return Err(DbError::CompactionPreflight("materialised row count differs from CIM1"));
