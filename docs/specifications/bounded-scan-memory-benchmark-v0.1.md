@@ -44,3 +44,34 @@ The payload-byte metric is a deterministic decoded-output lower-bound/proxy, whi
 For the fixed-batch comparison, peak RSS should remain in the same general range as row count grows tenfold; it need not be bit-for-bit equal because allocator and OS behavior vary. For the batch sweep, maximum decoded payload bytes should scale linearly with batch rows (512 KiB, 2 MiB and 8 MiB respectively), and RSS should show the same directional trend.
 
 This is a single Linux-runner measurement. It does not replace repeated multi-platform performance testing, allocator profiling, or a workload-specific memory budget. The benchmark is run by the native Rust GitHub Actions workflow and its raw output is retained in the workflow log.
+
+## Observed CI results
+
+**Run:** [Native Rust workflow run 42038587833](https://github.com/jadhavdurvesh/Ananta/actions/runs/42038587833)  
+**Runner:** GitHub-hosted Ubuntu Linux  
+**Commit under test:** `7cb637d982822d42df6409007aea2fe1026130ce`
+
+### Dataset-size comparison — 512-row batches
+
+| Dataset rows | Max batch rows | Max decoded payload per batch | Peak RSS | Scan time |
+|---:|---:|---:|---:|---:|
+| 5,000 | 512 | 1,048,576 bytes (1 MiB) | 4,824 KiB | 131 ms |
+| 50,000 | 512 | 1,048,576 bytes (1 MiB) | 5,144 KiB | 1,004 ms |
+
+The table grew by 10× while peak RSS rose by 320 KiB (about 6.6%). This is consistent with the bounded scan not retaining the complete result.
+
+### Batch-size comparison — 50,000-row dataset
+
+| Configured batch rows | Observed max batch rows | Max decoded payload per batch | Peak RSS | Scan time |
+|---:|---:|---:|---:|---:|
+| 256 | 256 | 524,288 bytes (0.5 MiB) | 3,992 KiB | 1,006 ms |
+| 1,024 | 1,024 | 2,097,152 bytes (2 MiB) | 7,240 KiB | 1,011 ms |
+| 4,096 | 4,096 | 8,388,608 bytes (8 MiB) | 20,036 KiB | 1,024 ms |
+
+The largest requested batch was fully exercised after setting generator segment size to 10,000 rows. Decoded payload bytes scale exactly with the batch row count. Peak RSS increases directionally with batch payload size and also includes runtime, allocator and metadata overhead.
+
+### Conclusion
+
+The M1.3 measurement gate is satisfied for this benchmark workload: increasing total rows tenfold at a fixed batch size did not materially increase peak RSS, while increasing batch size increased the measured memory footprint as expected.
+
+These are one-run Linux CI measurements, not a universal production memory guarantee. Different allocators, payload sizes, selected-column widths, operating systems and filesystem caches can change absolute RSS.
