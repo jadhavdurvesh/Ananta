@@ -254,6 +254,7 @@ impl SchemaSnapshot {
     /// never removed or overwritten.
     pub fn write_to(&self, root: impl AsRef<Path>) -> Result<PathBuf, DbError> {
         let bytes = self.encode()?;
+        let root = root.as_ref();
         let destination = Self::path(root, self.table_id, self.revision)?;
         let parent = destination.parent().ok_or(DbError::LengthOverflow)?;
         fs::create_dir_all(parent)?;
