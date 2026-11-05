@@ -1,4 +1,4 @@
-use ananta_format::{decode_projected_segment, decode_segment_v2, encode_segment_v2, inspect_segment_v2, segment_version, FormatError, SegmentBatchReader, MAX_BATCH_CELLS, MAX_BATCH_ROWS, MAX_SEGMENT_BYTES};
+use ananta_format::{decode_projected_segment, decode_segment_v2, encode_segment_v2, inspect_segment_v2, segment_version, FormatError, SegmentBatchReader, MAX_BATCH_CELLS, MAX_BATCH_COLUMNS, MAX_BATCH_ROWS, MAX_SEGMENT_BYTES};
 use ananta_types::{Column, DataType, Schema, TypeError, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -90,7 +90,8 @@ struct TableDefinition {
 }
 
 
-/// An owned, columnar batch returned by a bounded database scan.
+/// One typed output column in a RecordBatch. Duplicate names are allowed here because
+/// a projection may explicitly request the same logical column more than once.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchColumn {
     pub column: Column,
@@ -648,6 +649,9 @@ impl Database {
         }
         if let Some(index) = projection.iter().find(|index| **index >= definition.schema.len()) {
             return Err(DbError::Format(FormatError::InvalidProjection(*index)));
+        }
+        if projection.len() > MAX_BATCH_COLUMNS {
+            return Err(DbError::Format(FormatError::LimitExceeded("batch projection column count")));
         }
 
         let effective_batch_rows = batch_rows.min((MAX_BATCH_CELLS / projection.len()).max(1));
@@ -2585,6 +2589,10 @@ mod tests {
                 vec![Value::Utf8("e".into()), Value::Float64(5.0), Value::Utf8("e".into())],
             ]
         );
+
+        let exact = db.scan_batches_with_limit("telemetry", 2, 4).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(exact.iter().map(|batch| batch.row_count).collect::<Vec<_>>(), vec![2, 2]);
 
         let limited = db.scan_columns_batches_with_limit(
             "telemetry",
