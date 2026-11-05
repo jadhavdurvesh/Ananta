@@ -265,6 +265,8 @@ impl Database {
             return finish_cancelled(&mut journal, &journal_path, progress);
         }
         fs::create_dir(&stage_dir)?;
+        let input_bytes = input.encode()?;
+        write_new_synced(&stage_dir.join("input.cim"), &input_bytes)?;
 
         let result = (|| -> Result<CompactionExecutionReport, DbError> {
             let rechecked = self.preflight_compaction_inputs(table, input)?;
@@ -512,11 +514,17 @@ impl Database {
         input.validate()?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
-        let input_fingerprint = input.fingerprint()?;
         let weave_root = self.root.join("data").join(table).join("weaves");
         let directory = weave_root.join(format!("weave-{weave_id:020}-g{generation:020}"));
         require_directory(&weave_root)?;
         require_directory(&directory)?;
+        let persisted_input = read_regular_file(&directory.join("input.cim"))?;
+        let decoded_input = CompactionInputManifest::decode(&persisted_input)?;
+        if decoded_input != *input {
+            return Err(DbError::CompactionPreflight("candidate persisted CIM1 differs from caller input manifest"));
+        }
+        self.preflight_compaction_inputs(table, input)?;
+        let input_fingerprint = input.fingerprint()?;
         let bytes = read_regular_file(&directory.join("manifest.owm"))?;
         let output = CompactionOutputManifest::decode(&bytes)
             .map_err(|e| DbError::CompactionExecution(e.to_string()))?;
