@@ -903,6 +903,71 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_consistency_reports_missing_current_snapshot() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+
+        let report = db.check_schema_snapshot_consistency().unwrap();
+        assert_eq!(report.missing_current, vec![(db.table_id("telemetry").unwrap(), 1)]);
+        assert!(report.invalid_files.is_empty());
+        assert!(report.orphaned_files.is_empty());
+        assert!(!report.is_clean());
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_consistency_is_clean_after_current_snapshot_is_written() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        db.write_schema_snapshot("telemetry").unwrap();
+
+        let report = db.check_schema_snapshot_consistency().unwrap();
+        assert!(report.is_clean(), "{report:?}");
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_consistency_reports_orphaned_snapshot_and_temp_file() {
+        let path = temp_path();
+        let db = Database::open(&path).unwrap();
+        let schema = Schema::new(vec![
+            Column::new("value", DataType::Int32, false),
+        ]).unwrap();
+        let orphan = SchemaSnapshot::new(ObjectId(999), 1, &schema, &[ObjectId(1000)]).unwrap();
+        let orphan_path = orphan.write_to(&path).unwrap();
+        let temp_path = orphan_path.with_extension("ans.tmp");
+        fs::write(&temp_path, b"unfinished snapshot").unwrap();
+
+        let report = db.check_schema_snapshot_consistency().unwrap();
+        assert!(report.orphaned_files.contains(&orphan_path));
+        assert!(report.orphaned_files.contains(&temp_path));
+        assert!(report.invalid_files.is_empty());
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_consistency_reports_corrupt_snapshot_file() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let table_id = db.table_id("telemetry").unwrap();
+        let snapshot_path = SchemaSnapshot::path(&path, table_id, 1).unwrap();
+        fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
+        fs::write(&snapshot_path, b"broken snapshot").unwrap();
+
+        let report = db.check_schema_snapshot_consistency().unwrap();
+        assert!(report.invalid_files.contains(&snapshot_path));
+        assert_eq!(report.missing_current, vec![(table_id, 1)]);
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn database_survives_close_and_reopen_with_stable_object_ids() {
         let path = temp_path();
         let rows = vec![
