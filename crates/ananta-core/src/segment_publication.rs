@@ -249,13 +249,14 @@ mod tests {
             assert!(!root.join(".segment-00000000000000000001.tmp").exists());
         }
 
-        for failing_stage in [
+        for (index, failing_stage) in [
             PublicationStage::FinalNamePublished,
             PublicationStage::DirectorySyncedAfterPublish,
             PublicationStage::TemporaryNameRemoved,
             PublicationStage::DirectorySyncedAfterCleanup,
-        ] {
-            let result = publish_segment_with_hook(&root, 2, bytes, |stage| {
+        ].into_iter().enumerate() {
+            let segment_id = 2 + index as u64;
+            let result = publish_segment_with_hook(&root, segment_id, bytes, |stage| {
                 if stage == failing_stage {
                     Err(io::Error::new(io::ErrorKind::Other, "injected interruption"))
                 } else {
@@ -263,7 +264,7 @@ mod tests {
                 }
             });
             assert!(matches!(result, Err(DbError::SegmentPublicationUncertain { .. })));
-            let final_path = root.join("segment-00000000000000000002.anf");
+            let final_path = root.join(format!("segment-{segment_id:020}.anf"));
             assert_eq!(fs::read(final_path).unwrap(), bytes);
             // Cleanup is safe after an uncertain post-link error whether or not
             // the temp name survived the injected checkpoint.
