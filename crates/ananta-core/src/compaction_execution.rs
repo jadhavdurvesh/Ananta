@@ -491,9 +491,8 @@ impl Database {
             sync_directory(&weave_root)?;
             append_state(&mut journal, &journal_path, CompactionJobState::Completed, progress)?;
 
+            let read_measurement = self.measure_compaction_candidate_read(table, weave_id, generation)?;
             let elapsed_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-            let amplification = if preflight.total_source_bytes == 0 { 0 }
-                else { artifact_bytes_total.saturating_mul(1000) / preflight.total_source_bytes };
             Ok(CompactionExecutionReport {
                 output_manifest,
                 candidate_directory: final_dir.clone(),
@@ -505,7 +504,7 @@ impl Database {
                 cpu_time_micros: process_cpu_time_micros().zip(cpu_started)
                     .and_then(|(end, start)| end.checked_sub(start)),
                 final_storage_bytes: temporary_bytes,
-                read_latency_micros: None,
+                read_latency_micros: Some(read_measurement.read_latency_micros),
                 temporary_disk_amplification_milli: if preflight.total_source_bytes == 0 { 0 }
                     else { temporary_bytes.saturating_mul(1000) / preflight.total_source_bytes },
             })
