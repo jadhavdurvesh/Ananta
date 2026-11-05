@@ -88,12 +88,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         if independent_verification != report.output_manifest {
             return Err(format!("{name}: candidate verification mismatch").into());
         }
-        let read = database.measure_compaction_candidate_read(TABLE, weave_id, 1)?;
-        if read.rows_read != (BATCHES * ROWS_PER_BATCH) as u64 {
-            return Err(format!("{name}: incorrect candidate row count").into());
+        let mut read_latency_samples = Vec::new();
+        let mut read_cpu_samples = Vec::new();
+        let mut read_data_bytes = 0_u64;
+        for _ in 0..5 {
+            let read = database.measure_compaction_candidate_read(TABLE, weave_id, 1)?;
+            if read.rows_read != (BATCHES * ROWS_PER_BATCH) as u64 {
+                return Err(format!("{name}: incorrect candidate row count").into());
+            }
+            read_latency_samples.push(read.read_latency_micros.to_string());
+            read_cpu_samples.push(read.cpu_time_micros.map_or("null".to_owned(), |v| v.to_string()));
+            read_data_bytes = read.data_bytes_read;
         }
         json_records.push(format!(
-            "{{\"layout\":\"{name}\",\"rows\":{},\"input_bytes\":{},\"output_bytes\":{},\"temporary_bytes\":{},\"final_storage_bytes\":{},\"temporary_disk_amplification_milli\":{},\"build_wall_micros\":{},\"build_process_cpu_micros\":{},\"read_latency_micros\":{},\"read_process_cpu_micros\":{},\"read_data_bytes\":{},\"artifact_count\":{}}}",
+            "{{\"layout\":\"{name}\",\"rows\":{},\"input_bytes\":{},\"output_bytes\":{},\"temporary_bytes\":{},\"final_storage_bytes\":{},\"temporary_disk_amplification_milli\":{},\"build_wall_micros\":{},\"build_process_cpu_micros\":{},\"warm_read_latency_samples_micros\":[{}],\"warm_read_process_cpu_samples_micros\":[{}],\"read_data_bytes\":{},\"artifact_count\":{}}}",
             report.rows_processed,
             report.input_bytes,
             report.output_bytes,
@@ -102,9 +110,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             report.temporary_disk_amplification_milli,
             report.elapsed_micros,
             report.cpu_time_micros.map_or("null".to_owned(), |v| v.to_string()),
-            read.read_latency_micros,
-            read.cpu_time_micros.map_or("null".to_owned(), |v| v.to_string()),
-            read.data_bytes_read,
+            read_latency_samples.join(","),
+            read_cpu_samples.join(","),
+            read_data_bytes,
             report.output_manifest.artifacts.len(),
         ));
     }
