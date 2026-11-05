@@ -28,7 +28,7 @@ This is an experimental first vertical slice, not a complete or production-ready
 
 ## Master execution roadmap
 
-The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M1 — native storage correctness and streaming.** M0 passed its exit gate on 2026-11-05.
+The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M2 — ingestion and the first ChronoWeave concepts.** M1 (native storage correctness and bounded reads) passed its exit gate on 2026-11-05. M2.1 is the accepted ingestion design contract; durable ingestion behavior is scheduled for M2.2.
 
 ## Native design documents
 
@@ -44,6 +44,8 @@ The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source
 - [ANS1 v1 schema snapshot format](docs/specifications/schema-snapshot-ans1-v1.md)
 - [ANF v0.2 segment identity format](docs/specifications/anf-v0.2-prototype.md)
 - [Bounded read batch contract](docs/specifications/bounded-read-batches-v0.1.md)
+- [Ingestion contract v0.1](docs/specifications/ingestion-contract-v0.1.md)
+- [ADR 0007: idempotent commit-ordered ingestion](docs/decisions/0007-idempotent-commit-ordered-ingestion.md)
 - [Segment publication and recovery contract](docs/specifications/segment-publication-recovery-v0.1.md)
 - [ADR 0006: atomic segment publication and exclusive local writer](docs/decisions/0006-atomic-segment-publication-and-writer-lock.md)
 - [Nullable-column DDL specification](docs/specifications/nullable-column-ddl-v0.1.md)
@@ -101,3 +103,7 @@ rm -rf /tmp/ananta-memory
 ```
 
 Generation and scanning are separate process invocations. The scanner reports rows consumed, maximum decoded payload bytes in one batch, peak RSS from Linux `/proc/self/status` and elapsed time. The CI workflow runs the dataset-size and batch-size comparisons defined in the [benchmark specification](docs/specifications/bounded-scan-memory-benchmark-v0.1.md). In the initial Ubuntu CI measurement, a 10× increase in rows (5k to 50k) at 512-row batches changed peak RSS from 4,824 to 5,144 KiB; increasing the batch from 256 to 1,024 to 4,096 rows on 50k rows changed peak RSS from 3,992 to 7,240 to 20,036 KiB. These are workload-specific CI measurements, not universal memory guarantees.
+
+## Ingestion contract status
+
+M2.1 defines the planned idempotent ingestion API: caller-supplied 128-bit BatchIds scoped to stable TableIds, SHA-256 payload fingerprints, whole-batch validation, per-table commit-order sequences, duplicate retry resolution, event-time neutrality and explicit result counters. **This is a design contract, not a runtime feature yet.** Durable receipts, sequence allocation, `IngestResult` and counter implementation are part of M2.2 Chronicle work. See the [contract](docs/specifications/ingestion-contract-v0.1.md) and [ADR 0007](docs/decisions/0007-idempotent-commit-ordered-ingestion.md).
