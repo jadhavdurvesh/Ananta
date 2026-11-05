@@ -4373,7 +4373,7 @@ mod tests {
         db.build_capsule("telemetry", 11, 1, 3, 3, None).unwrap();
 
         let table_id = db.table_id("telemetry").unwrap();
-        let index = db.chronicle_indices.get(&ObjectId(table_id)).unwrap();
+        let index = db.chronicle_indices.get(&table_id).unwrap();
         let mut receipts = Vec::new();
         for sequence in 1_u8..=3 {
             let batch_id = BatchId::from_bytes([sequence; 16]).unwrap();
@@ -4408,7 +4408,7 @@ mod tests {
         }
 
         let manifest = crate::compaction_manifest::CompactionInputManifest {
-            table_id,
+            table_id: table_id.0,
             job_id: CompactionJobId::from_bytes([77; 16]).unwrap(),
             attempt: 1,
             target_schema_revision: 1,
@@ -4419,7 +4419,7 @@ mod tests {
             receipts,
         };
         let report = db.preflight_compaction_inputs("telemetry", &manifest).unwrap();
-        assert_eq!(report.table_id, table_id);
+        assert_eq!(report.table_id, table_id.0);
         assert_eq!(report.capsules_verified, 2);
         assert_eq!(report.chronicle_records_verified, 3);
         assert_eq!(report.total_row_count, 3);
@@ -4445,7 +4445,7 @@ mod tests {
         db.build_capsule("telemetry", 21, 1, 1, 1, None).unwrap();
 
         let table_id = db.table_id("telemetry").unwrap();
-        let receipt = db.chronicle_indices.get(&ObjectId(table_id)).unwrap()
+        let receipt = db.chronicle_indices.get(&table_id).unwrap()
             .by_batch_id.get(&batch_id).unwrap();
         let receipt_bytes = fs::read(&receipt.path).unwrap();
         let metadata = db.validate_capsule("telemetry", 21, 1).unwrap();
@@ -4453,7 +4453,7 @@ mod tests {
             .join(format!("capsule-{:020}-g{:020}.cap", 21, 1));
         let capsule_bytes = fs::read(&capsule_path).unwrap();
         let manifest = crate::compaction_manifest::CompactionInputManifest {
-            table_id,
+            table_id: table_id.0,
             job_id: CompactionJobId::from_bytes([78; 16]).unwrap(),
             attempt: 1,
             target_schema_revision: 1,
