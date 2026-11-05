@@ -17,12 +17,14 @@ ANANTA is not a SQL wrapper, PostgreSQL extension or ClickHouse backend. Its nat
 
 The initial Rust implementation currently includes:
 - Typed values and schema validation.
-- Experimental ANF columnar segment encoder/decoder, including projected-column decoding, a golden binary fixture and defensive input-size limits.
-- Native local catalog file with persisted schemas.
-- Embedded database API for open, create-table, nullable-column evolution, column rename/reorder, insert-batch (ANF v0.2), dual-version full scan and projected scan.
+- Experimental ANF v0.1/v0.2 columnar segment encoder/decoder, golden binary fixtures, projected decoding and defensive input-size limits.
+- Native local catalog with persisted schemas, stable table/column IDs and immutable schema snapshots.
+- Embedded database APIs for table creation, nullable-column evolution, column rename/reorder, ANF v0.2 batch insertion, dual-version scans and bounded projected columnar scan batches.
+- File-backed batch decoding with incremental whole-segment checksum verification, row/cell output limits and early-stop support.
+- Exclusive local writer locking, no-overwrite segment publication, directory syncing on Unix, and startup cleanup of orphan temporary segment files.
 - A basic telemetry example and unit/integration tests.
 
-This is an experimental first vertical slice, not a complete or production-ready DBMS. It currently reads complete segment files and materialises scan results in memory; projected scans skip decoding unselected column values but do not yet provide physical column-range I/O. It assumes one exclusive writer. Cross-process/multiple-handle locking is not implemented. AQL, query planning, analytics operators, bounded streaming scans, compression, indexes, compaction, WAL, transactions, MVCC and crash recovery are not yet implemented.
+This is an experimental first vertical slice, not a complete or production-ready DBMS. The legacy `scan` APIs still materialise their complete result; the additive batch APIs bound decoded output per batch but do not yet provide predicates or physical column-range I/O. Only one local database handle/process may own a database at a time. A crash can leave a stale `.ananta.lock` file; after verifying no writer remains, an operator must remove it before reopening. Non-Unix targets do not have portable directory-entry flushing in this implementation. AQL, query planning, analytics operators, compression, indexes, compaction, WAL, transactions, MVCC and a complete crash-recovery protocol remain unimplemented.
 
 ## Master execution roadmap
 
@@ -42,6 +44,8 @@ The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source
 - [ANS1 v1 schema snapshot format](docs/specifications/schema-snapshot-ans1-v1.md)
 - [ANF v0.2 segment identity format](docs/specifications/anf-v0.2-prototype.md)
 - [Bounded read batch contract](docs/specifications/bounded-read-batches-v0.1.md)
+- [Segment publication and recovery contract](docs/specifications/segment-publication-recovery-v0.1.md)
+- [ADR 0006: atomic segment publication and exclusive local writer](docs/decisions/0006-atomic-segment-publication-and-writer-lock.md)
 - [Nullable-column DDL specification](docs/specifications/nullable-column-ddl-v0.1.md)
 - [Column rename and reorder specification](docs/specifications/column-rename-reorder-v0.1.md)
 - [ADR 0004: stable catalog object identity](docs/decisions/0004-stable-catalog-object-identity.md)
@@ -79,3 +83,7 @@ The embedded Rust API provides bounded columnar reads:
 - `Database::scan_columns_batches_with_limit(table, columns, batch_rows, row_limit)` combines projection and early stop.
 
 Each call returns a `ScanBatchIter` yielding owned `RecordBatch` values. The file-backed decoder verifies each whole-segment checksum in fixed-size chunks, then decodes only selected column values for the next batch. Batch size is limited by the requested row bound, a 65,536-row maximum and a 1,000,000-cell output cap. ANF v0.1 and v0.2 segments are resolved against their historical schema snapshots; newly added nullable columns are emitted as NULL for older segments. This remains an experimental single-writer scan API, not a transactionally isolated query engine.
+
+## Segment publication and recovery
+
+New segment writes use a same-directory temporary file, flush and sync its contents, then atomically publish the final `.anf` name with a no-overwrite hard link. On Unix the containing directory is synced after publication and temp-name removal. Opening a database acquires `.ananta.lock` and removes only canonical orphan temporary segment files. A stale lock left by a crash is not broken automatically: verify that no writer process remains, then remove `.ananta.lock` before reopening. A post-publication error is reported as `SegmentPublicationUncertain`; inspect the final segment path before retrying rather than risking a duplicate insert.
