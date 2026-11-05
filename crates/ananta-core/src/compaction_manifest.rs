@@ -371,7 +371,8 @@ mod tests {
         let mut bytes = sample().encode().unwrap();
         bytes[87] = 1;
         let end = bytes.len() - TRAILER;
-        bytes[end..end + 32].copy_from_slice(&sha256(&bytes[..end]));
+        let digest = sha256(&bytes[..end]);
+        bytes[end..end + 32].copy_from_slice(&digest);
         assert!(matches!(CompactionInputManifest::decode(&bytes), Err(ManifestError::Corrupt(_))));
         let mut invalid = sample();
         invalid.receipts[2].row_count = u64::MAX;
