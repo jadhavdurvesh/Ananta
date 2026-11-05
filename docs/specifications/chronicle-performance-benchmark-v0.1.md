@@ -2,6 +2,7 @@
 
 **Status:** Reproducible benchmark harness  
 **Platform:** Linux GitHub Actions runner  
+**Build profile:** Rust release (optimized)  
 **Implementation under test:** native Database::ingest_batch and Database::open
 
 ## Purpose
@@ -36,7 +37,7 @@ The CI comparison contains 100 batches (12,800 rows) for both modes. A separate 
 
 ## Process isolation
 
-Generation and open measurements are separate process invocations. The generator exits after closing the database. The open process starts with a fresh address space, calls Database::open, and reports the time around that call. This includes lock acquisition, catalog/schema loading, orphan-temp cleanup, Chronicle checksum/fingerprint verification and in-memory receipt-index reconstruction.
+The benchmark binary is built with Rust's release profile so elapsed-time comparisons use optimized code. Generation and open measurements are separate process invocations. The generator exits after closing the database. The open process starts with a fresh address space, calls Database::open, and reports the time around that call. This includes lock acquisition, catalog/schema loading, orphan-temp cleanup, Chronicle checksum/fingerprint verification and in-memory receipt-index reconstruction.
 
 ## Reported metrics
 
