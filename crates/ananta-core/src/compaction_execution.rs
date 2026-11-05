@@ -858,6 +858,24 @@ mod tests {
             assert_eq!(verified.artifacts.iter().map(|a| a.row_count).sum::<u64>(), 4);
             assert_eq!(verified.artifacts.len(), 2);
 
+            if offset == 0 {
+                let pointer = db.promote_compaction_candidate(
+                    "telemetry", &input, 100, 1,
+                ).unwrap();
+                assert_eq!(pointer.active.weave_id, 100);
+                assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
+            }
+            if offset == 1 {
+                let pointer = db.promote_compaction_candidate(
+                    "telemetry", &input, 101, 1,
+                ).unwrap();
+                assert_eq!(pointer.active.weave_id, 101);
+                assert_eq!(db.scan("telemetry").unwrap()[0][0], Value::TimestampMicros(100));
+                let rolled_back = db.rollback_active_weave("telemetry").unwrap();
+                assert_eq!(rolled_back.active.weave_id, 100);
+                assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
+            }
+
             let first_artifact = &verified.artifacts[0];
             let data = fs::read(report.candidate_directory.join(first_artifact.data_relative_path())).unwrap();
             let column_ids = db.catalog.tables.get("telemetry").unwrap()
@@ -873,7 +891,39 @@ mod tests {
         assert_eq!(first_timestamps[1], Value::TimestampMicros(100));
         assert_eq!(first_entities[2], Value::Utf8("a".into()));
 
+        // Simulate a crash after the candidate directory rename but before the
+        // final CJE1 Completed event; open must reconcile it from CIM1/OWM1/PVM1.
+        let mut third_job = [0_u8; 16];
+        third_job[0] = 62;
+        let third_job_hex = hex(&third_job);
+        let journal_path = root.join("data").join("telemetry").join("compaction")
+            .join("jobs").join(third_job_hex).join("attempt-00000000000000000001.cje");
+        let journal_file = OpenOptions::new().write(true).open(&journal_path).unwrap();
+        let journal_len = journal_file.metadata().unwrap().len();
+        journal_file.set_len(journal_len - 160).unwrap();
+        journal_file.sync_all().unwrap();
+        drop(journal_file);
+
+        // Damage the active generation: startup must fall back to the retained
+        // previous candidate rather than exposing a partial active view.
+        let active = db.active_weave_pointer("telemetry").unwrap().unwrap();
+        let active_dir = root.join("data").join("telemetry").join("weaves")
+            .join(format!("weave-{:020}-g{:020}", active.active.weave_id, active.active.generation));
+        let active_owm = CompactionOutputManifest::decode(
+            &fs::read(active_dir.join("manifest.owm")).unwrap()
+        ).unwrap();
+        let first = &active_owm.artifacts[0];
+        fs::remove_file(active_dir.join(first.data_relative_path())).unwrap();
+
         drop(db);
+        let reopened = Database::open(&root).unwrap();
+        let recovered_events = crate::compaction::read_compaction_journal(&journal_path).unwrap();
+        assert_eq!(recovered_events.last().unwrap().state, CompactionJobState::Completed);
+        let recovered_pointer = reopened.active_weave_pointer("telemetry").unwrap().unwrap();
+        assert_eq!(recovered_pointer.active.weave_id, 101);
+        assert_eq!(reopened.scan("telemetry").unwrap()[0][0], Value::TimestampMicros(100));
+
+        drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
 
