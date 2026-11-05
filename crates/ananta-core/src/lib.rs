@@ -148,7 +148,7 @@ impl Database {
 
         let table_dir = self.root.join("data").join(&name);
         fs::create_dir_all(&table_dir)?;
-        candidate.tables.insert(name, TableDefinition {
+        candidate.tables.insert(name.clone(), TableDefinition {
             id: table_id,
             schema_revision: 1,
             column_ids,
