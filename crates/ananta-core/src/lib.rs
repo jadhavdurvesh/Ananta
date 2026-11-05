@@ -12,12 +12,15 @@ mod column_rename_reorder;
 mod segment_publication;
 mod chronicle;
 mod capsule;
+mod navigation_map;
 pub use chronicle::{BatchId, IngestOutcome, IngestResult, IngestionStats};
 pub use capsule::{CapsuleColumnStats, CapsuleMetadata};
+pub use navigation_map::{CapsuleScanDiagnostics, CapsuleScanRequest, CapsuleScanResult, ColumnRangePredicate};
 use schema_snapshot::{SchemaSnapshot, SchemaSnapshotConsistencyReport};
-use segment_publication::{cleanup_orphan_segment_temps, publish_segment, publish_chronicle, publish_capsule, DatabaseLock};
+use segment_publication::{cleanup_orphan_segment_temps, publish_segment, publish_chronicle, publish_capsule, publish_navigation_map, DatabaseLock};
 use chronicle::{encode_record, extract_payload, inspect_file as inspect_chronicle_file, scan_table_index, BatchReceipt, PayloadReader, TableChronicleIndex};
 use capsule::{decode_capsule, derive_column_stats, derive_temporal_bounds, encode_capsule};
+use navigation_map::{file_sha256, map_filename, range_may_match, value_matches, NavigationMap, NavigationMapEntry};
 
 const CATALOG_MAGIC: &[u8; 4] = b"ANC1";
 const CATALOG_END: &[u8; 4] = b"CEND";
@@ -64,6 +67,9 @@ pub enum DbError {
     ChronicleCorrupt(&'static str),
     IngestRowValidation { row_index: usize, message: String },
     CapsuleCorrupt(&'static str),
+    NavigationMapCorrupt(&'static str),
+    NavigationMapStale(&'static str),
+    InvalidRange(String),
 }
 
 impl fmt::Display for DbError {
@@ -91,6 +97,9 @@ impl fmt::Display for DbError {
             Self::ChronicleCorrupt(message) => write!(f, "corrupt Chronicle record: {message}"),
             Self::IngestRowValidation { row_index, message } => write!(f, "ingestion row {row_index} failed validation: {message}"),
             Self::CapsuleCorrupt(message) => write!(f, "corrupt Capsule: {message}"),
+            Self::NavigationMapCorrupt(message) => write!(f, "corrupt Navigation Map: {message}"),
+            Self::NavigationMapStale(message) => write!(f, "stale Navigation Map: {message}"),
+            Self::InvalidRange(message) => write!(f, "invalid Capsule scan range: {message}"),
         }
     }
 }
@@ -829,6 +838,211 @@ impl Database {
         publish_capsule(&capsule_directory, capsule_id, generation, &capsule_bytes)
     }
 
+    /// Read all rows from one independently validated Capsule.
+    ///
+    /// This convenience API materialises the selected Capsule's full row set. Use
+    /// bounded Chronicle scan APIs for large logical tables; this is primarily useful
+    /// for Capsule validation and offline benchmark tooling.
+    pub fn scan_capsule(
+        &self,
+        table: &str,
+        capsule_id: u64,
+        generation: u64,
+    ) -> Result<Vec<Vec<Value>>, DbError> {
+        self.validate_capsule(table, capsule_id, generation)?;
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        let path = self.root.join("data").join(table).join("capsules")
+            .join(format!("capsule-{capsule_id:020}-g{generation:020}.cap"));
+        let bytes = fs::read(path)?;
+        let (_, payload) = decode_capsule(&bytes)?;
+        // Resolve the historical Capsule schema into the current logical schema,
+        // synthesising NULL for nullable columns added after this Capsule was built.
+        self.decode_and_resolve_segment(table, definition, &payload)
+    }
+
+    /// Build an immutable Navigation Map generation from all verified Capsules for a table.
+    ///
+    /// A new generation is published as a separate .nvm file and never overwrites a
+    /// previous map generation. The map is an index only; Capsule files remain authoritative.
+    pub fn build_navigation_map(
+        &self,
+        table: &str,
+        map_generation: u64,
+    ) -> Result<PathBuf, DbError> {
+        if map_generation == 0 {
+            return Err(DbError::NavigationMapCorrupt("map generation must be nonzero"));
+        }
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        let capsule_directory = self.root.join("data").join(table).join("capsules");
+        fs::create_dir_all(&capsule_directory)?;
+        let capsule_paths = list_capsule_paths(&capsule_directory)?;
+        let mut entries = Vec::with_capacity(capsule_paths.len());
+        for (capsule_id, generation, path) in capsule_paths {
+            let metadata = self.validate_capsule(table, capsule_id, generation)?;
+            if metadata.table_id != definition.id.0 {
+                return Err(DbError::CapsuleCorrupt("Capsule table identity mismatch while building map"));
+            }
+            let bytes = fs::read(&path)?;
+            let file_len = u64::try_from(bytes.len()).map_err(|_| DbError::LengthOverflow)?;
+            entries.push(NavigationMapEntry {
+                metadata,
+                file_len,
+                capsule_sha256: file_sha256(&bytes),
+            });
+        }
+        entries.sort_by_key(|entry| (entry.metadata.capsule_id, entry.metadata.generation));
+        let map = NavigationMap {
+            table_id: definition.id.0,
+            generation: map_generation,
+            entries,
+        };
+        let bytes = map.encode()?;
+        publish_navigation_map(&capsule_directory, map_generation, &bytes)
+    }
+
+    /// Scan derived Capsules with exact row predicates and optional safe Navigation Map pruning.
+    ///
+    /// Pass Some(map_generation) to use a previously built map or None for the unpruned
+    /// reference path. Both paths use the same row predicates and logical projection.
+    pub fn scan_capsules(
+        &self,
+        table: &str,
+        request: &CapsuleScanRequest,
+        map_generation: Option<u64>,
+    ) -> Result<CapsuleScanResult, DbError> {
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        let mut resolved_ranges = Vec::with_capacity(request.ranges.len());
+        for predicate in &request.ranges {
+            let column_index = definition.schema.columns().iter()
+                .position(|column| column.name == predicate.column)
+                .ok_or_else(|| DbError::ColumnNotFound(predicate.column.clone()))?;
+            let data_type = definition.schema.columns()[column_index].data_type;
+            for bound in [predicate.lower.as_ref(), predicate.upper.as_ref()].into_iter().flatten() {
+                if bound.data_type() != Some(data_type) {
+                    return Err(DbError::InvalidRange(format!(
+                        "column '{}' expects {}; range bound has a different type",
+                        predicate.column, data_type
+                    )));
+                }
+            }
+            if predicate.lower.is_none() && predicate.upper.is_none() {
+                return Err(DbError::InvalidRange(format!(
+                    "column '{}' range requires at least one bound",
+                    predicate.column
+                )));
+            }
+            if let (Some(lower), Some(upper)) = (&predicate.lower, &predicate.upper) {
+                if capsule::compare_values(lower, upper).is_gt() {
+                    return Err(DbError::InvalidRange(format!(
+                        "lower bound exceeds upper bound for column '{}'",
+                        predicate.column
+                    )));
+                }
+            }
+            resolved_ranges.push((column_index, definition.column_ids[column_index].0, predicate));
+        }
+
+        let projection = match request.projection.as_ref() {
+            Some(names) => {
+                let mut indices = Vec::with_capacity(names.len());
+                for name in names {
+                    let index = definition.schema.columns().iter()
+                        .position(|column| column.name == *name)
+                        .ok_or_else(|| DbError::ColumnNotFound(name.clone()))?;
+                    indices.push(index);
+                }
+                indices
+            }
+            None => (0..definition.schema.len()).collect(),
+        };
+
+        let capsule_directory = self.root.join("data").join(table).join("capsules");
+        let paths = list_capsule_paths(&capsule_directory)?;
+        let mut diagnostics = CapsuleScanDiagnostics::default();
+        let work: Vec<(u64, u64, Option<NavigationMapEntry>)> = if let Some(map_generation) = map_generation {
+            let map_path = capsule_directory.join(map_filename(map_generation));
+            let map_bytes = fs::read(&map_path)?;
+            let map = NavigationMap::decode(&map_bytes, definition.id.0, map_generation)?;
+            let actual_identities = paths.iter().map(|(id, generation, _)| (*id, *generation)).collect::<BTreeSet<_>>();
+            let map_identities = map.entries.iter().map(|entry| {
+                (entry.metadata.capsule_id, entry.metadata.generation)
+            }).collect::<BTreeSet<_>>();
+            if actual_identities != map_identities {
+                return Err(DbError::NavigationMapStale("Capsule set changed since this map generation was built"));
+            }
+            let path_lookup = paths.iter().map(|(id, generation, path)| ((*id, *generation), path.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let mut selected = Vec::with_capacity(map.entries.len());
+            for entry in map.entries {
+                let identity = (entry.metadata.capsule_id, entry.metadata.generation);
+                let path = path_lookup.get(&identity)
+                    .ok_or(DbError::NavigationMapStale("mapped Capsule path is missing"))?;
+                let bytes = fs::read(path)?;
+                diagnostics.bytes_verified = diagnostics.bytes_verified
+                    .checked_add(u64::try_from(bytes.len()).map_err(|_| DbError::LengthOverflow)?)
+                    .ok_or(DbError::LengthOverflow)?;
+                if bytes.len() as u64 != entry.file_len || file_sha256(&bytes) != entry.capsule_sha256 {
+                    return Err(DbError::NavigationMapStale("Capsule bytes changed after map publication"));
+                }
+                selected.push((identity.0, identity.1, Some(entry)));
+            }
+            selected
+        } else {
+            paths.into_iter().map(|(id, generation, _)| (id, generation, None)).collect()
+        };
+
+        let mut rows = Vec::new();
+        for (capsule_id, generation, map_entry) in work {
+            diagnostics.capsules_considered = diagnostics.capsules_considered.checked_add(1).ok_or(DbError::LengthOverflow)?;
+            if let Some(entry) = map_entry.as_ref() {
+                let may_match = resolved_ranges.iter().all(|(_, column_id, predicate)| {
+                    let Some(stats) = entry.metadata.columns.iter().find(|stats| stats.column_id == *column_id) else {
+                        return true;
+                    };
+                    let (minimum, maximum) = if entry.metadata.event_time_column_id == Some(*column_id) {
+                        match (entry.metadata.temporal_min, entry.metadata.temporal_max) {
+                            (Some(min), Some(max)) => (Some(Value::TimestampMicros(min)), Some(Value::TimestampMicros(max))),
+                            _ => (None, None),
+                        }
+                    } else {
+                        (stats.minimum.clone(), stats.maximum.clone())
+                    };
+                    range_may_match(minimum.as_ref(), maximum.as_ref(), predicate)
+                });
+                if !may_match {
+                    diagnostics.capsules_skipped = diagnostics.capsules_skipped.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                    continue;
+                }
+            }
+
+            let capsule_rows = self.scan_capsule(table, capsule_id, generation)?;
+            diagnostics.capsules_read = diagnostics.capsules_read.checked_add(1).ok_or(DbError::LengthOverflow)?;
+            if let Some(entry) = map_entry.as_ref() {
+                diagnostics.payload_bytes_decoded = diagnostics.payload_bytes_decoded
+                    .checked_add(entry.metadata.payload_len).ok_or(DbError::LengthOverflow)?;
+            } else {
+                let metadata = self.validate_capsule(table, capsule_id, generation)?;
+                diagnostics.payload_bytes_decoded = diagnostics.payload_bytes_decoded
+                    .checked_add(metadata.payload_len).ok_or(DbError::LengthOverflow)?;
+            }
+            for row in capsule_rows {
+                diagnostics.rows_examined = diagnostics.rows_examined.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                let matches = resolved_ranges.iter().all(|(index, _, predicate)| {
+                    row.get(*index).is_some_and(|value| value_matches(value, predicate))
+                });
+                if matches {
+                    diagnostics.rows_returned = diagnostics.rows_returned.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                    rows.push(projection.iter().map(|index| row[*index].clone()).collect());
+                }
+            }
+        }
+
+        Ok(CapsuleScanResult { rows, diagnostics })
+    }
+
     /// Independently validate a Capsule file and recompute every statistic from its ANF payload.
     pub fn validate_capsule(
         &self,
@@ -1201,6 +1415,47 @@ fn resolve_rows_by_column_id(
     Ok(logical_rows)
 }
 
+
+fn list_capsule_paths(directory: &Path) -> Result<Vec<(u64, u64, PathBuf)>, DbError> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(DbError::Io(error)),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("cap") {
+            continue;
+        }
+        let filename = path.file_name().and_then(|value| value.to_str())
+            .ok_or(DbError::CapsuleCorrupt("Capsule filename is not UTF-8"))?;
+        let stem = filename.strip_prefix("capsule-").and_then(|value| value.strip_suffix(".cap"))
+            .ok_or(DbError::CapsuleCorrupt("noncanonical Capsule filename"))?;
+        let (id_text, generation_text) = stem.split_once("-g")
+            .ok_or(DbError::CapsuleCorrupt("noncanonical Capsule filename"))?;
+        let parse_component = |value: &str| -> Result<u64, DbError> {
+            if value.len() != 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(DbError::CapsuleCorrupt("noncanonical Capsule filename"));
+            }
+            let parsed = value.parse::<u64>().map_err(|_| DbError::CapsuleCorrupt("invalid Capsule filename number"))?;
+            if parsed == 0 || format!("{parsed:020}") != value {
+                return Err(DbError::CapsuleCorrupt("noncanonical Capsule filename"));
+            }
+            Ok(parsed)
+        };
+        paths.push((parse_component(id_text)?, parse_component(generation_text)?, path));
+    }
+    paths.sort_by_key(|(id, generation, _)| (*id, *generation));
+    if paths.windows(2).any(|pair| (pair[0].0, pair[0].1) == (pair[1].0, pair[1].1)) {
+        return Err(DbError::CapsuleCorrupt("duplicate Capsule identity"));
+    }
+    Ok(paths)
+}
 
 fn capsule_values_equal(left: &Option<Value>, right: &Option<Value>) -> bool {
     match (left, right) {
@@ -3672,6 +3927,220 @@ mod tests {
             Err(DbError::CapsuleCorrupt("Capsule checksum mismatch"))
         ));
         assert_eq!(reopened.scan("telemetry").unwrap(), rows);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+
+    #[test]
+    fn navigation_map_prunes_without_changing_query_results_and_reports_diagnostics() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+
+        for capsule_index in 0..4_i64 {
+            let start = capsule_index * 10;
+            let rows = (0..10_i64).map(|offset| {
+                let timestamp = start + offset;
+                vec![
+                    Value::TimestampMicros(timestamp),
+                    Value::Utf8(format!("device-{}", capsule_index)),
+                    Value::Float64((timestamp + 10) as f64),
+                ]
+            }).collect::<Vec<_>>();
+            let sequence = capsule_index as u8 + 1;
+            db.ingest_batch(
+                "telemetry",
+                BatchId::from_bytes([sequence; 16]).unwrap(),
+                &rows,
+            ).unwrap();
+            db.build_capsule(
+                "telemetry",
+                sequence as u64,
+                1,
+                sequence as u64,
+                sequence as u64,
+                Some("timestamp"),
+            ).unwrap();
+        }
+
+        let map_path = db.build_navigation_map("telemetry", 1).unwrap();
+        assert!(map_path.is_file());
+
+        let request = CapsuleScanRequest {
+            ranges: vec![
+                ColumnRangePredicate::new(
+                    "timestamp",
+                    Some(Value::TimestampMicros(15)),
+                    true,
+                    Some(Value::TimestampMicros(25)),
+                    true,
+                ),
+                ColumnRangePredicate::new(
+                    "temperature",
+                    Some(Value::Float64(25.0)),
+                    true,
+                    Some(Value::Float64(45.0)),
+                    true,
+                ),
+            ],
+            projection: Some(vec!["device".into(), "temperature".into()]),
+        };
+        let reference = db.scan_capsules("telemetry", &request, None).unwrap();
+        let pruned = db.scan_capsules("telemetry", &request, Some(1)).unwrap();
+        assert_eq!(pruned.rows, reference.rows);
+        assert_eq!(pruned.rows.len(), 11);
+        assert_eq!(reference.diagnostics.capsules_read, 4);
+        assert_eq!(reference.diagnostics.rows_examined, 40);
+        assert_eq!(pruned.diagnostics.capsules_considered, 4);
+        assert_eq!(pruned.diagnostics.capsules_skipped, 2);
+        assert_eq!(pruned.diagnostics.capsules_read, 2);
+        assert_eq!(pruned.diagnostics.rows_examined, 20);
+        assert_eq!(pruned.diagnostics.rows_returned, 11);
+        assert!(pruned.diagnostics.bytes_verified > 0);
+        assert!(pruned.diagnostics.payload_bytes_decoded < reference.diagnostics.payload_bytes_decoded);
+
+        // Inclusive endpoints must retain Capsules whose min/max only touches a bound.
+        let inclusive_edges = CapsuleScanRequest {
+            ranges: vec![ColumnRangePredicate::new(
+                "timestamp",
+                Some(Value::TimestampMicros(19)),
+                true,
+                Some(Value::TimestampMicros(20)),
+                true,
+            )],
+            projection: None,
+        };
+        let edge_reference = db.scan_capsules("telemetry", &inclusive_edges, None).unwrap();
+        let edge_pruned = db.scan_capsules("telemetry", &inclusive_edges, Some(1)).unwrap();
+        assert_eq!(edge_pruned.rows, edge_reference.rows);
+        assert_eq!(edge_pruned.rows.len(), 2);
+        assert_eq!(edge_pruned.diagnostics.capsules_skipped, 2);
+
+        // Exclusive touching endpoints have no matches and may prune both touching Capsules.
+        let exclusive_edges = CapsuleScanRequest {
+            ranges: vec![ColumnRangePredicate::new(
+                "timestamp",
+                Some(Value::TimestampMicros(19)),
+                false,
+                Some(Value::TimestampMicros(20)),
+                false,
+            )],
+            projection: None,
+        };
+        let exclusive_reference = db.scan_capsules("telemetry", &exclusive_edges, None).unwrap();
+        let exclusive_pruned = db.scan_capsules("telemetry", &exclusive_edges, Some(1)).unwrap();
+        assert_eq!(exclusive_pruned.rows, exclusive_reference.rows);
+        assert!(exclusive_pruned.rows.is_empty());
+        assert_eq!(exclusive_pruned.diagnostics.capsules_skipped, 4);
+        assert_eq!(exclusive_pruned.diagnostics.capsules_read, 0);
+
+        // UTF8 has no min/max in Capsule v0.1; missing stats conservatively keep all Capsules.
+        let string_filter = CapsuleScanRequest {
+            ranges: vec![ColumnRangePredicate::new(
+                "device",
+                Some(Value::Utf8("device-2".into())),
+                true,
+                Some(Value::Utf8("device-2".into())),
+                true,
+            )],
+            projection: Some(vec!["timestamp".into()]),
+        };
+        let string_reference = db.scan_capsules("telemetry", &string_filter, None).unwrap();
+        let string_pruned = db.scan_capsules("telemetry", &string_filter, Some(1)).unwrap();
+        assert_eq!(string_pruned.rows, string_reference.rows);
+        assert_eq!(string_pruned.rows.len(), 10);
+        assert_eq!(string_pruned.diagnostics.capsules_skipped, 0);
+        assert_eq!(string_pruned.diagnostics.capsules_read, 4);
+
+        assert!(matches!(
+            db.scan_capsules("telemetry", &CapsuleScanRequest {
+                ranges: vec![ColumnRangePredicate::new("temperature", Some(Value::Int64(1)), true, None, true)],
+                projection: None,
+            }, Some(1)),
+            Err(DbError::InvalidRange(_))
+        ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn navigation_map_detects_capsule_set_and_file_changes() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let make_rows = |time: i64| vec![vec![
+            Value::TimestampMicros(time),
+            Value::Utf8("sensor".into()),
+            Value::Float64(time as f64),
+        ]];
+        db.ingest_batch("telemetry", BatchId::from_bytes([40; 16]).unwrap(), &make_rows(10)).unwrap();
+        let first_capsule = db.build_capsule("telemetry", 1, 1, 1, 1, Some("timestamp")).unwrap();
+        db.build_navigation_map("telemetry", 1).unwrap();
+
+        db.ingest_batch("telemetry", BatchId::from_bytes([41; 16]).unwrap(), &make_rows(20)).unwrap();
+        db.build_capsule("telemetry", 2, 1, 2, 2, Some("timestamp")).unwrap();
+        let all_range = CapsuleScanRequest {
+            ranges: vec![ColumnRangePredicate::new(
+                "timestamp", Some(Value::TimestampMicros(0)), true,
+                Some(Value::TimestampMicros(100)), true,
+            )],
+            projection: None,
+        };
+        assert!(matches!(
+            db.scan_capsules("telemetry", &all_range, Some(1)),
+            Err(DbError::NavigationMapStale("Capsule set changed since this map generation was built"))
+        ));
+
+        // A new map records both files; any subsequent byte mutation is rejected before pruning.
+        db.build_navigation_map("telemetry", 2).unwrap();
+        let mut bytes = fs::read(&first_capsule).unwrap();
+        bytes[144] ^= 1;
+        fs::write(&first_capsule, bytes).unwrap();
+        assert!(matches!(
+            db.scan_capsules("telemetry", &all_range, Some(2)),
+            Err(DbError::NavigationMapStale("Capsule bytes changed after map publication"))
+        ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn navigation_map_pruning_survives_nullable_schema_evolution() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let first = vec![vec![
+            Value::TimestampMicros(10),
+            Value::Utf8("old".into()),
+            Value::Float64(1.0),
+        ]];
+        db.ingest_batch("telemetry", BatchId::from_bytes([42; 16]).unwrap(), &first).unwrap();
+        db.build_capsule("telemetry", 1, 1, 1, 1, Some("timestamp")).unwrap();
+
+        db.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
+        let second = vec![vec![
+            Value::TimestampMicros(20),
+            Value::Utf8("new".into()),
+            Value::Float64(2.0),
+            Value::Float64(50.0),
+        ]];
+        db.ingest_batch("telemetry", BatchId::from_bytes([43; 16]).unwrap(), &second).unwrap();
+        db.build_capsule("telemetry", 2, 1, 2, 2, Some("timestamp")).unwrap();
+        db.build_navigation_map("telemetry", 1).unwrap();
+
+        let request = CapsuleScanRequest {
+            ranges: vec![ColumnRangePredicate::new(
+                "humidity", Some(Value::Float64(40.0)), true,
+                Some(Value::Float64(60.0)), true,
+            )],
+            projection: None,
+        };
+        let reference = db.scan_capsules("telemetry", &request, None).unwrap();
+        let pruned = db.scan_capsules("telemetry", &request, Some(1)).unwrap();
+        assert_eq!(pruned.rows, reference.rows);
+        assert_eq!(pruned.rows.len(), 1);
+        // Older Capsule has no ColumnId/stat for humidity, so the map must retain it.
+        assert_eq!(pruned.diagnostics.capsules_skipped, 0);
+        assert_eq!(pruned.diagnostics.capsules_read, 2);
+        assert_eq!(pruned.rows[0][3], Value::Float64(50.0));
         fs::remove_dir_all(path).unwrap();
     }
 

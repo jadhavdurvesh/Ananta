@@ -70,3 +70,17 @@ jobs:
           "$BENCH" open "$CHR_SMALL"
           "$BENCH" open "$CHR_LARGE"
           rm -rf "$ROOT"
+      - name: Benchmark Capsule sizes and Navigation Map scans
+        run: |
+          set -euo pipefail
+          cargo build --release -p ananta-core --example capsule_benchmark
+          BENCH=target/release/examples/capsule_benchmark
+          ROOT=/tmp/ananta-capsule-bench
+          mkdir -p "$ROOT"
+          echo "=== Capsule size 512 rows (8 Chronicle batches) ==="
+          "$BENCH" "$ROOT/small" 8 512
+          echo "=== Capsule size 2,048 rows (32 Chronicle batches) ==="
+          "$BENCH" "$ROOT/medium" 32 512
+          echo "=== Capsule size 8,192 rows (128 Chronicle batches) ==="
+          "$BENCH" "$ROOT/large" 128 512
+          rm -rf "$ROOT"
