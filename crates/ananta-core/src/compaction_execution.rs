@@ -749,7 +749,7 @@ mod tests {
             Column::new("entity", DataType::Utf8, false),
             Column::new("value", DataType::Int64, false),
         ]).unwrap();
-        db.create_table("telemetry", schema).unwrap();
+        db.create_table("telemetry", schema.clone()).unwrap();
 
         let batch_one = BatchId::from_bytes([41; 16]).unwrap();
         let batch_two = BatchId::from_bytes([42; 16]).unwrap();
