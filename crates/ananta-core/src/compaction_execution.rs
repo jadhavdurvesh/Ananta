@@ -1,6 +1,6 @@
 use crate::chronicle::sha256;
 use crate::compaction::{
-    append_compaction_journal_event, CompactionJobJournal, CompactionJobState,
+    append_compaction_journal_event, CompactionJobId, CompactionJobJournal, CompactionJobState,
     CompactionProgress, CompactionResourceLimits,
 };
 use crate::compaction_manifest::{CompactionInputManifest, ManifestError};
@@ -24,6 +24,7 @@ const PVM_ENTRY: usize = 48;
 const PVM_TRAILER: usize = 36;
 const MAX_PVM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ARTIFACT_ROWS: usize = 65_536;
+const MAX_VERIFY_ROWS: u64 = 5_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RowOrigin {
@@ -42,7 +43,17 @@ pub struct CompactionExecutionReport {
     pub rows_processed: u64,
     pub elapsed_micros: u64,
     pub cpu_time_micros: Option<u64>,
+    pub final_storage_bytes: u64,
+    pub read_latency_micros: Option<u64>,
     pub temporary_disk_amplification_milli: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionReadMeasurement {
+    pub rows_read: u64,
+    pub data_bytes_read: u64,
+    pub read_latency_micros: u64,
+    pub cpu_time_micros: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +206,7 @@ impl Database {
         cancel: Option<&AtomicBool>,
     ) -> Result<CompactionExecutionReport, DbError> {
         let started = Instant::now();
+        let cpu_started = process_cpu_time_micros();
         limits.validate().map_err(|e| DbError::CompactionExecution(e.to_string()))?;
         input.validate()?;
         if weave_id == 0 || generation == 0 {
@@ -214,8 +226,20 @@ impl Database {
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         let schema = &definition.schema;
         let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        if input.expected_row_count > MAX_VERIFY_ROWS {
+            return Err(DbError::CompactionExecution(format!(
+                "manifest row count {} exceeds the prototype's hard verification bound {}",
+                input.expected_row_count, MAX_VERIFY_ROWS
+            )));
+        }
+        if input.expected_row_count > limits.max_rows {
+            return Err(DbError::CompactionExecution(format!(
+                "row budget {} is below the manifest row count {}",
+                limits.max_rows, input.expected_row_count
+            )));
+        }
         let estimated_memory = preflight.total_source_bytes.checked_mul(4)
-            .and_then(|n| n.checked_add(input.expected_row_count.checked_mul(160)?))
+            .and_then(|n| n.checked_add(input.expected_row_count.checked_mul(256)?))
             .ok_or(DbError::LengthOverflow)?;
         if estimated_memory > limits.max_working_memory_bytes {
             return Err(DbError::CompactionExecution(format!(
@@ -258,13 +282,27 @@ impl Database {
         let input_fingerprint = input.fingerprint()?;
         let mut journal = CompactionJobJournal::new(input.job_id, input.attempt, input_fingerprint)
             .map_err(|e| DbError::CompactionExecution(e.to_string()))?;
-        let mut progress = CompactionProgress::default();
+        let mut progress = CompactionProgress {
+            input_bytes: preflight.total_source_bytes,
+            working_memory_bytes: estimated_memory,
+            open_files: 2,
+            ..CompactionProgress::default()
+        };
         append_state(&mut journal, &journal_path, CompactionJobState::Planned, progress)?;
         append_state(&mut journal, &journal_path, CompactionJobState::ValidatingInputs, progress)?;
         if is_cancelled(cancel) {
             return finish_cancelled(&mut journal, &journal_path, progress);
         }
         fs::create_dir(&stage_dir)?;
+        let input_manifest_bytes = input.encode()?;
+        progress.temporary_bytes = u64::try_from(input_manifest_bytes.len()).map_err(|_| DbError::LengthOverflow)?;
+        limits.check(&CompactionProgress {
+            input_bytes: preflight.total_source_bytes,
+            temporary_bytes: progress.temporary_bytes,
+            open_files: 1,
+            ..CompactionProgress::default()
+        }).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+        write_new_synced(&stage_dir.join("input.cim"), &input_manifest_bytes)?;
 
         let result = (|| -> Result<CompactionExecutionReport, DbError> {
             let rechecked = self.preflight_compaction_inputs(table, input)?;
@@ -278,6 +316,7 @@ impl Database {
             let mut rows = Vec::with_capacity(usize::try_from(input.expected_row_count)
                 .map_err(|_| DbError::LengthOverflow)?);
             let mut expected = Vec::with_capacity(rows.capacity());
+            let mut rows_since_boundary = 0_u64;
             for capsule in &input.capsules {
                 check_cancel(cancel)?;
                 let capsule_rows = self.scan_capsule(table, capsule.capsule_id, capsule.generation)?;
@@ -301,8 +340,16 @@ impl Database {
                         rows.push(ExecutionRow { values: row.clone(), origin });
                         capsule_index = capsule_index.checked_add(1).ok_or(DbError::LengthOverflow)?;
                         progress.rows_processed = progress.rows_processed.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                        rows_since_boundary = rows_since_boundary.checked_add(1).ok_or(DbError::LengthOverflow)?;
                         if progress.rows_processed > limits.max_rows {
                             return Err(DbError::CompactionExecution("row budget exceeded while reading inputs".into()));
+                        }
+                        if rows_since_boundary >= limits.max_work_unit_rows {
+                            check_cancel(cancel)?;
+                            progress.working_memory_bytes = estimated_memory;
+                            progress.current_work_unit_rows = rows_since_boundary;
+                            limits.check(&progress).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+                            rows_since_boundary = 0;
                         }
                     }
                 }
@@ -310,9 +357,9 @@ impl Database {
                     return Err(DbError::CompactionPreflight("Capsule has rows outside its source receipt interval"));
                 }
                 progress.working_memory_bytes = estimated_memory;
-                progress.current_work_unit_rows = u64::try_from(capsule_index)
-                    .map_err(|_| DbError::LengthOverflow)?.min(limits.max_work_unit_rows);
+                progress.current_work_unit_rows = rows_since_boundary;
                 limits.check(&progress).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+                rows_since_boundary = 0;
             }
             if rows.len() as u64 != input.expected_row_count {
                 return Err(DbError::CompactionPreflight("materialised row count differs from CIM1"));
@@ -347,19 +394,27 @@ impl Database {
                     schema_revision: definition.schema_revision,
                     entries: chunk.iter().map(|row| row.origin).collect(),
                 }.encode().map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+                let data_len = u64::try_from(data.len()).map_err(|_| DbError::LengthOverflow)?;
+                let pvm_len = u64::try_from(pvm.len()).map_err(|_| DbError::LengthOverflow)?;
+                let next_artifact_bytes = artifact_bytes_total.checked_add(data_len)
+                    .and_then(|n| n.checked_add(pvm_len)).ok_or(DbError::LengthOverflow)?;
+                let input_manifest_len = u64::try_from(input_manifest_bytes.len())
+                    .map_err(|_| DbError::LengthOverflow)?;
+                let mut next_progress = progress;
+                next_progress.output_bytes = next_artifact_bytes;
+                next_progress.temporary_bytes = input_manifest_len.checked_add(next_artifact_bytes)
+                    .ok_or(DbError::LengthOverflow)?;
+                next_progress.current_work_unit_rows =
+                    u64::try_from(chunk.len()).map_err(|_| DbError::LengthOverflow)?;
+                next_progress.open_files = 2;
+                limits.check(&next_progress).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+
                 let data_path = stage_dir.join(format!("data-{artifact_ordinal:08}.wvf"));
                 let pvm_path = stage_dir.join(format!("provenance-{artifact_ordinal:08}.pvm"));
                 write_new_synced(&data_path, &data)?;
                 write_new_synced(&pvm_path, &pvm)?;
-                let data_len = u64::try_from(data.len()).map_err(|_| DbError::LengthOverflow)?;
-                let pvm_len = u64::try_from(pvm.len()).map_err(|_| DbError::LengthOverflow)?;
-                artifact_bytes_total = artifact_bytes_total.checked_add(data_len)
-                    .and_then(|n| n.checked_add(pvm_len)).ok_or(DbError::LengthOverflow)?;
-                progress.output_bytes = artifact_bytes_total;
-                progress.temporary_bytes = artifact_bytes_total;
-                progress.current_work_unit_rows = u64::try_from(chunk.len()).map_err(|_| DbError::LengthOverflow)?;
-                progress.open_files = 2;
-                limits.check(&progress).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+                artifact_bytes_total = next_artifact_bytes;
+                progress = next_progress;
                 artifact_refs.push(WeaveArtifactReference {
                     ordinal: artifact_ordinal,
                     data_file_len: data_len,
@@ -446,8 +501,17 @@ impl Database {
             };
             let manifest_bytes = output_manifest.encode()
                 .map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+            let output_bytes = artifact_bytes_total.checked_add(
+                u64::try_from(manifest_bytes.len()).map_err(|_| DbError::LengthOverflow)?
+            ).ok_or(DbError::LengthOverflow)?;
+            let temporary_bytes = output_bytes.checked_add(
+                u64::try_from(input_manifest_bytes.len()).map_err(|_| DbError::LengthOverflow)?
+            ).ok_or(DbError::LengthOverflow)?;
+            progress.output_bytes = output_bytes;
+            progress.temporary_bytes = temporary_bytes;
+            limits.check(&progress).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
             verify_candidate_directory(&stage_dir, &output_manifest, schema, definition.id.0,
-                definition.schema_revision, &column_ids, &expected)?;
+                definition.schema_revision, &column_ids, &expected, cancel)?;
 
             append_state(&mut journal, &journal_path, CompactionJobState::Publishing, progress)?;
             write_new_synced(&stage_dir.join("manifest.owm"), &manifest_bytes)?;
@@ -459,19 +523,22 @@ impl Database {
             sync_directory(&weave_root)?;
             append_state(&mut journal, &journal_path, CompactionJobState::Completed, progress)?;
 
+            let read_measurement = self.measure_compaction_candidate_read(table, weave_id, generation)?;
             let elapsed_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-            let amplification = if preflight.total_source_bytes == 0 { 0 }
-                else { artifact_bytes_total.saturating_mul(1000) / preflight.total_source_bytes };
             Ok(CompactionExecutionReport {
                 output_manifest,
                 candidate_directory: final_dir.clone(),
                 input_bytes: preflight.total_source_bytes,
-                output_bytes: artifact_bytes_total,
-                temporary_bytes: artifact_bytes_total,
+                output_bytes,
+                temporary_bytes,
                 rows_processed: progress.rows_processed,
                 elapsed_micros,
-                cpu_time_micros: None,
-                temporary_disk_amplification_milli: amplification,
+                cpu_time_micros: process_cpu_time_micros().zip(cpu_started)
+                    .and_then(|(end, start)| end.checked_sub(start)),
+                final_storage_bytes: temporary_bytes,
+                read_latency_micros: Some(read_measurement.read_latency_micros),
+                temporary_disk_amplification_milli: if preflight.total_source_bytes == 0 { 0 }
+                    else { temporary_bytes.saturating_mul(1000) / preflight.total_source_bytes },
             })
         })();
 
@@ -500,6 +567,56 @@ impl Database {
         result
     }
 
+
+    /// Measure the storage read/decode path for one immutable candidate generation.
+    /// This records wall latency and, on Linux, process CPU time from procfs.
+    pub fn measure_compaction_candidate_read(
+        &self,
+        table: &str,
+        weave_id: u64,
+        generation: u64,
+    ) -> Result<CompactionReadMeasurement, DbError> {
+        let started = Instant::now();
+        let cpu_started = process_cpu_time_micros();
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        let root = self.root.join("data").join(table).join("weaves");
+        let dir = root.join(format!("weave-{weave_id:020}-g{generation:020}"));
+        let manifest_bytes = read_regular_file(&dir.join("manifest.owm"))?;
+        let manifest = CompactionOutputManifest::decode(&manifest_bytes)
+            .map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+        let ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let mut rows_read = 0_u64;
+        let mut data_bytes_read = 0_u64;
+        for artifact in &manifest.artifacts {
+            let bytes = read_verified_artifact(
+                &dir.join(artifact.data_relative_path()),
+                artifact.data_file_len,
+                artifact.data_file_sha256,
+            )?;
+            data_bytes_read = data_bytes_read.checked_add(
+                u64::try_from(bytes.len()).map_err(|_| DbError::LengthOverflow)?
+            ).ok_or(DbError::LengthOverflow)?;
+            let rows = crate::decode_segment_v2(
+                &bytes, &definition.schema, definition.id.0,
+                definition.schema_revision, &ids,
+            )?;
+            rows_read = rows_read.checked_add(
+                u64::try_from(rows.len()).map_err(|_| DbError::LengthOverflow)?
+            ).ok_or(DbError::LengthOverflow)?;
+        }
+        if rows_read != manifest.expected_row_count {
+            return Err(DbError::CompactionPreflight("candidate read measurement row total differs from OWM1"));
+        }
+        Ok(CompactionReadMeasurement {
+            rows_read,
+            data_bytes_read,
+            read_latency_micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            cpu_time_micros: process_cpu_time_micros().zip(cpu_started)
+                .and_then(|(end, start)| end.checked_sub(start)),
+        })
+    }
+
     /// Re-open a candidate by identity and independently verify its OWM1,
     /// data artifacts, provenance sidecars, typed-row hashes and origin set.
     pub fn verify_compaction_candidate(
@@ -512,11 +629,17 @@ impl Database {
         input.validate()?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
-        let input_fingerprint = input.fingerprint()?;
         let weave_root = self.root.join("data").join(table).join("weaves");
         let directory = weave_root.join(format!("weave-{weave_id:020}-g{generation:020}"));
         require_directory(&weave_root)?;
         require_directory(&directory)?;
+        let persisted_input = read_regular_file(&directory.join("input.cim"))?;
+        let decoded_input = CompactionInputManifest::decode(&persisted_input)?;
+        if decoded_input != *input {
+            return Err(DbError::CompactionPreflight("candidate persisted CIM1 differs from caller input manifest"));
+        }
+        self.preflight_compaction_inputs(table, input)?;
+        let input_fingerprint = input.fingerprint()?;
         let bytes = read_regular_file(&directory.join("manifest.owm"))?;
         let output = CompactionOutputManifest::decode(&bytes)
             .map_err(|e| DbError::CompactionExecution(e.to_string()))?;
@@ -528,6 +651,12 @@ impl Database {
             || output.expected_row_count != input.expected_row_count
         {
             return Err(DbError::CompactionPreflight("candidate manifest identity differs from pinned attempt"));
+        }
+        if input.expected_row_count > MAX_VERIFY_ROWS {
+            return Err(DbError::CompactionExecution(format!(
+                "candidate verification row count {} exceeds hard verification bound {}",
+                input.expected_row_count, MAX_VERIFY_ROWS
+            )));
         }
         let mut expected = Vec::with_capacity(usize::try_from(input.expected_row_count).map_err(|_| DbError::LengthOverflow)?);
         for capsule in &input.capsules {
@@ -608,11 +737,35 @@ fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire))
 }
 
+
 fn check_cancel(cancel: Option<&AtomicBool>) -> Result<(), DbError> {
     if cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
         Err(DbError::CompactionExecution("compaction cancelled at a bounded work-unit boundary".into()))
     } else { Ok(()) }
 }
+
+fn process_cpu_time_micros() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string("/proc/self/stat").ok()?;
+        let fields = stat.rsplit_once(") ")?.1.split_whitespace().collect::<Vec<_>>();
+        let user_ticks = fields.get(11)?.parse::<u64>().ok()?;
+        let system_ticks = fields.get(12)?.parse::<u64>().ok()?;
+        let ticks_per_second = std::process::Command::new("getconf")
+            .arg("CLK_TCK").output().ok()?;
+        let ticks_per_second = std::str::from_utf8(&ticks_per_second.stdout)
+            .ok()?.trim().parse::<u64>().ok()?;
+        if ticks_per_second == 0 { return None; }
+        user_ticks.checked_add(system_ticks)?
+            .checked_mul(1_000_000)?
+            .checked_div(ticks_per_second)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 fn compare_value(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
@@ -664,9 +817,11 @@ fn sync_directory(_path: &Path) -> Result<(), DbError> { Ok(()) }
 fn verify_candidate_directory(
     candidate: &Path, manifest: &CompactionOutputManifest, schema: &crate::Schema,
     table_id: u64, schema_revision: u64, column_ids: &[u64], expected: &[RowOrigin],
+    cancel: Option<&AtomicBool>,
 ) -> Result<(), DbError> {
     let mut actual = Vec::with_capacity(expected.len());
     for artifact in &manifest.artifacts {
+        check_cancel(cancel)?;
         let data = read_regular_file(&candidate.join(artifact.data_relative_path()))?;
         let pvm_bytes = read_regular_file(&candidate.join(artifact.provenance_relative_path()))?;
         if data.len() as u64 != artifact.data_file_len || sha256(&data) != artifact.data_file_sha256
@@ -694,6 +849,7 @@ fn verify_candidate_directory(
             }
             actual.push(*origin);
         }
+        check_cancel(cancel)?;
     }
     actual.sort();
     if actual != expected {
@@ -843,8 +999,67 @@ mod tests {
             assert_eq!(verified, report.output_manifest);
             assert_eq!(verified.layout, layout);
             assert_eq!(verified.expected_row_count, 4);
+            assert!(report.read_latency_micros.is_some());
+            assert!(report.final_storage_bytes >= report.output_bytes);
+            let measured = db.measure_compaction_candidate_read(
+                "telemetry", 100 + offset as u64, 1,
+            ).unwrap();
+            assert_eq!(measured.rows_read, 4);
+            assert!(measured.read_latency_micros > 0);
+
+            if offset == 0 {
+                // Output tampering is detected before a candidate can be promoted.
+                let artifact_path = report.candidate_directory.join(
+                    verified.artifacts[0].data_relative_path()
+                );
+                let original = fs::read(&artifact_path).unwrap();
+                let mut corrupted = original.clone();
+                corrupted[100] ^= 1;
+                fs::write(&artifact_path, &corrupted).unwrap();
+                assert!(db.verify_compaction_candidate("telemetry", &input, 100, 1).is_err());
+                fs::write(&artifact_path, &original).unwrap();
+            }
             assert_eq!(verified.artifacts.iter().map(|a| a.row_count).sum::<u64>(), 4);
             assert_eq!(verified.artifacts.len(), 2);
+
+            if offset == 0 {
+                let pointer = db.promote_compaction_candidate(
+                    "telemetry", &input, 100, 1,
+                ).unwrap();
+                assert_eq!(pointer.active.weave_id, 100);
+                assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
+
+                // A cancellation request at the first checkpoint must leave the
+                // active read pointer and its candidate data unchanged.
+                let cancelled_input = CompactionInputManifest {
+                    table_id: table_id.0,
+                    job_id: crate::CompactionJobId::from_bytes([88; 16]).unwrap(),
+                    attempt: 1,
+                    target_schema_revision: 1,
+                    first_sequence: 1,
+                    last_sequence: 2,
+                    expected_row_count: 4,
+                    capsules: capsules.clone(),
+                    receipts: receipts.clone(),
+                };
+                let cancel = std::sync::atomic::AtomicBool::new(true);
+                assert!(db.execute_compaction(
+                    "telemetry", &cancelled_input, 999, 1,
+                    WeaveLayoutProfile::AppendOnly, limits, Some(&cancel),
+                ).is_err());
+                assert_eq!(db.active_weave_pointer("telemetry").unwrap().unwrap().active.weave_id, 100);
+                assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
+            }
+            if offset == 1 {
+                let pointer = db.promote_compaction_candidate(
+                    "telemetry", &input, 101, 1,
+                ).unwrap();
+                assert_eq!(pointer.active.weave_id, 101);
+                assert_eq!(db.scan("telemetry").unwrap()[0][0], Value::TimestampMicros(100));
+                let rolled_back = db.rollback_active_weave("telemetry").unwrap();
+                assert_eq!(rolled_back.active.weave_id, 100);
+                assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
+            }
 
             let first_artifact = &verified.artifacts[0];
             let data = fs::read(report.candidate_directory.join(first_artifact.data_relative_path())).unwrap();
@@ -861,9 +1076,193 @@ mod tests {
         assert_eq!(first_timestamps[1], Value::TimestampMicros(100));
         assert_eq!(first_entities[2], Value::Utf8("a".into()));
 
+        // Simulate a crash after the candidate directory rename but before the
+        // final CJE1 Completed event; open must reconcile it from CIM1/OWM1/PVM1.
+        let mut third_job = [0_u8; 16];
+        third_job[0] = 62;
+        let third_job_hex = hex(&third_job);
+        let journal_path = root.join("data").join("telemetry").join("compaction")
+            .join("jobs").join(third_job_hex).join("attempt-00000000000000000001.cje");
+        let journal_file = OpenOptions::new().write(true).open(&journal_path).unwrap();
+        let journal_len = journal_file.metadata().unwrap().len();
+        journal_file.set_len(journal_len - 160).unwrap();
+        journal_file.sync_all().unwrap();
+        drop(journal_file);
+
+        // Damage the active generation: startup must fall back to the retained
+        // previous candidate rather than exposing a partial active view.
+        let active = db.active_weave_pointer("telemetry").unwrap().unwrap();
+        let active_dir = root.join("data").join("telemetry").join("weaves")
+            .join(format!("weave-{:020}-g{:020}", active.active.weave_id, active.active.generation));
+        let active_owm = CompactionOutputManifest::decode(
+            &fs::read(active_dir.join("manifest.owm")).unwrap()
+        ).unwrap();
+        let first = &active_owm.artifacts[0];
+        fs::remove_file(active_dir.join(first.data_relative_path())).unwrap();
+
         drop(db);
+        let reopened = Database::open(&root).unwrap();
+        let recovered_events = crate::compaction::read_compaction_journal(&journal_path).unwrap();
+        assert_eq!(recovered_events.last().unwrap().state, CompactionJobState::Completed);
+        let recovered_pointer = reopened.active_weave_pointer("telemetry").unwrap().unwrap();
+        assert_eq!(recovered_pointer.active.weave_id, 101);
+        assert_eq!(reopened.scan("telemetry").unwrap()[0][0], Value::TimestampMicros(100));
+
+        drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
 
 
+}
+
+
+
+impl Database {
+    /// Reconcile candidate publication after a process interruption. A durable,
+    /// independently verifiable final candidate completes a journal stopped at
+    /// Publishing; all other unfinished attempts become Interrupted. Damaged
+    /// journals are preserved and cause open to fail closed.
+    pub(crate) fn recover_compaction_jobs(&self) -> Result<(), DbError> {
+        for (table, definition) in &self.catalog.tables {
+            let table_dir = self.root.join("data").join(table);
+            let jobs_root = table_dir.join("compaction").join("jobs");
+            let jobs_metadata = match fs::symlink_metadata(&jobs_root) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(DbError::Io(error)),
+            };
+            if !jobs_metadata.file_type().is_dir() {
+                return Err(DbError::CompactionPreflight("compaction jobs path is not a real directory"));
+            }
+            for job_entry in fs::read_dir(&jobs_root)? {
+                let job_entry = job_entry?;
+                if !job_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let job_dir = job_entry.path();
+                for attempt_entry in fs::read_dir(&job_dir)? {
+                    let attempt_entry = attempt_entry?;
+                    if !attempt_entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let journal_path = attempt_entry.path();
+                    if journal_path.extension().and_then(|v| v.to_str()) != Some("cje") {
+                        continue;
+                    }
+                    let events = crate::compaction::read_compaction_journal(&journal_path)
+                        .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
+                    let Some(last) = events.last() else {
+                        return Err(DbError::CompactionPreflight("compaction journal is empty during recovery"));
+                    };
+                    let stage = table_dir.join("weaves").join(format!(
+                        ".stage-{}-a{:020}",
+                        hex(last.job_id.as_bytes()),
+                        last.attempt,
+                    ));
+                    if last.state.is_terminal() {
+                        remove_attempt_stage_if_safe(&stage)?;
+                        continue;
+                    }
+
+                    let completed_candidate = if last.state == CompactionJobState::Publishing {
+                        self.find_verified_attempt_candidate(table, last.job_id, last.attempt, last.input_manifest_sha256)?
+                    } else {
+                        None
+                    };
+                    let mut journal = CompactionJobJournal::replay(&events)
+                        .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
+                    let (next_state, progress) = if completed_candidate.is_some() {
+                        (CompactionJobState::Completed, last.progress)
+                    } else {
+                        (CompactionJobState::Interrupted, last.progress)
+                    };
+                    let event = journal.append(next_state, progress)
+                        .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
+                    append_compaction_journal_event(&journal_path, &event)
+                        .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
+                    remove_attempt_stage_if_safe(&stage)?;
+                }
+            }
+            let _ = definition;
+        }
+        Ok(())
+    }
+
+    fn find_verified_attempt_candidate(
+        &self,
+        table: &str,
+        job_id: CompactionJobId,
+        attempt: u64,
+        input_fingerprint: [u8; 32],
+    ) -> Result<Option<(u64, u64)>, DbError> {
+        let weave_root = self.root.join("data").join(table).join("weaves");
+        let root_metadata = match fs::symlink_metadata(&weave_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(DbError::Io(error)),
+        };
+        if !root_metadata.file_type().is_dir() {
+            return Err(DbError::CompactionPreflight("Weave directory is not a real directory"));
+        }
+        let mut found = None;
+        for entry in fs::read_dir(&weave_root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let directory = entry.path();
+            if !entry.file_name().to_string_lossy().starts_with("weave-") {
+                continue;
+            }
+            let manifest_path = directory.join("manifest.owm");
+            let manifest_bytes = match read_regular_file(&manifest_path) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            let output = match CompactionOutputManifest::decode(&manifest_bytes) {
+                Ok(output) => output,
+                Err(_) => continue,
+            };
+            if output.job_id != job_id || output.attempt != attempt
+                || output.input_manifest_sha256 != input_fingerprint
+            {
+                continue;
+            }
+            if found.is_some() {
+                return Err(DbError::CompactionPreflight("multiple final candidates claim the same compaction attempt"));
+            }
+            let input_bytes = read_regular_file(&directory.join("input.cim"))?;
+            let input = CompactionInputManifest::decode(&input_bytes)?;
+            self.verify_compaction_candidate(table, &input, output.weave_id, output.generation)?;
+            found = Some((output.weave_id, output.generation));
+        }
+        Ok(found)
+    }
+}
+
+fn remove_attempt_stage_if_safe(path: &Path) -> Result<(), DbError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(DbError::Io(error)),
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(DbError::CompactionPreflight("attempt staging path is not a real directory"));
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            // Preserve unknown directories and symlinks as forensic evidence.
+            return Ok(());
+        }
+        files.push(entry.path());
+    }
+    for file in files {
+        fs::remove_file(file)?;
+    }
+    let parent = path.parent().ok_or(DbError::CompactionPreflight("attempt staging path has no parent"))?;
+    fs::remove_dir(path)?;
+    sync_directory(parent)?;
+    Ok(())
 }

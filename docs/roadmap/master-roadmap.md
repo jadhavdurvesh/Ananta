@@ -463,10 +463,16 @@ Specification: docs/specifications/navigation-map-v0.1.md.
 - [x] Verify candidate output files and PVM1 provenance sidecars against OWM1 before publication; require exact row-origin and typed-fingerprint set equality.
 - [x] Add budget-checked candidate execution with attempt-owned staging, chunked ANF-v2 output artifacts, work-unit cancellation and CJE1 progress.
 - [x] Implement append-only, time-first and entity-first candidate ordering with deterministic origin tie-breaking.
-- [ ] Measure candidate read latency, process CPU time and repeatable workload benefit; mixed layout remains conditional on evidence.
-- [ ] Add crash-safe active-generation promotion, rollback and recovery.
-- [ ] Add bounded compaction execution, attempt-owned staging and crash-safe candidate publication.
-- [ ] Add database-level compaction correctness and fault-injection tests.
+- [x] Record compaction wall/process CPU time, temporary disk amplification, final storage size and five warm read/decode samples for each layout in the CI benchmark artifact; document the current full-scan experiment as not beneficial because the reader does not exploit physical order.
+- [x] Evaluate mixed layout; not justified by the current query/read workload, so it is intentionally not implemented.
+- [x] Define AWP1 active-generation pointer retaining the previous immutable generation.
+- [x] Verify full logical table equivalence before atomic promotion.
+- [x] Publish active pointer with same-directory atomic replacement and directory sync.
+- [x] Implement rollback by pointer swap while retaining both generations.
+- [x] Recover invalid active candidate to retained previous generation on database open.
+- [x] Test interruption at each active-pointer publication boundary and recovery from a missing/corrupt active candidate using the retained previous generation.
+- [x] Add bounded compaction execution, attempt-owned staging and crash-safe candidate publication.
+- [x] Add database-level compaction correctness and fault-injection tests for output tampering, row-lineage mismatch, cancellation isolation, publication interruption and restart recovery.
 
 Specification: docs/specifications/compaction-manifest-v0.1.md.
 Decision: docs/decisions/0010-compaction-input-snapshots-and-candidate-outputs.md.
@@ -475,29 +481,29 @@ Decision: docs/decisions/0010-compaction-input-snapshots-and-candidate-outputs.m
 - [x] Implement baseline append-only layout.
 - [x] Implement time-first candidate.
 - [x] Implement entity-first candidate.
-- [ ] Implement mixed candidate only if workloads justify it.
+- [x] Evaluate mixed candidate; not justified by the current measured full-scan workload, so it is intentionally deferred.
 - [x] Preserve logical row equivalence across all layouts with one-to-one provenance and canonical typed-row fingerprints.
-- [ ] Record compaction duration and CPU.
-- [ ] Record temporary disk amplification.
-- [ ] Record final storage size.
-- [ ] Record read latency for each workload.
+- [x] Record compaction wall duration and Linux process CPU time (or null when unavailable) in the benchmark output.
+- [x] Record staged temporary bytes and disk amplification relative to source bytes.
+- [x] Record total final candidate storage bytes, including OWM1 and CIM1.
+- [x] Record five warm artifact read/decode latency and process CPU samples for each layout.
 
 ## M3.3 Generation promotion
-- [ ] Define active generation pointer.
-- [ ] Build candidate generation off the active path.
-- [ ] Verify row counts and checksums.
-- [ ] Run reference query equivalence checks.
-- [ ] Publish the new manifest safely.
-- [ ] Retain previous generation until verification completes.
-- [ ] Implement rollback to previous generation.
-- [ ] Test interruption during promotion.
-- [ ] Test recovery from missing/incomplete candidate generation.
+- [x] Define active generation pointer.
+- [x] Build candidate generation off the active path.
+- [x] Verify row counts and checksums.
+- [x] Run reference query equivalence checks.
+- [x] Publish the new pointer safely after candidate verification.
+- [x] Retain previous generation until verification completes.
+- [x] Implement rollback to previous generation.
+- [x] Test interruption before and after atomic pointer replacement; after replacement the complete new pointer is visible and recovery revalidates it.
+- [x] Test recovery when the current active candidate is missing an artifact; startup selects the retained verified previous generation.
 
 ## M3 exit gate
-- [ ] Multiple Weave candidates produce identical logical results.
-- [ ] Failed compaction cannot corrupt the active generation.
-- [ ] Promotion and rollback are tested under injected failures.
-- [ ] At least one workload shows a repeatable measurable benefit, or the experiment is documented as not beneficial.
+- [x] Multiple Weave candidates (append-only, time-first, entity-first) produce identical logical row fingerprints and exact provenance inventories.
+- [x] Cancellation and output-tampering tests prove the active pointer and previous candidate remain unchanged until a verified promotion.
+- [x] Promotion/rollback and each active-pointer publication failure boundary are tested; restart recovery validates the selected candidate.
+- [x] The current full-table reader does not use physical ordering for pruning; the 10k-row three-layout experiment is documented as not beneficial for current read operations, with raw measurements uploaded by CI.
 
 **Deliverable:** ChronoWeave compaction research report and prototype.
 

@@ -1,8 +1,8 @@
 # Compaction Manifest and Job Contract — v0.1
 
-**Status:** M3.1 design contract  
+**Status:** M3 prototype implementation contract  
 **Scope:** Immutable compaction inputs, candidate outputs, job lifecycle and safety invariants  
-**Runtime status:** Design only; runtime implementation and fault-injection tests remain future M3.1 work
+**Runtime status:** CIM1/OWM1/PVM1 codecs, source preflight, bounded candidate execution, three layout strategies, AWP1 generation promotion/rollback and startup reconciliation are implemented. See the M3 research report and per-run CI benchmark artifact for measurement methodology and evidence.
 
 ## 1. Purpose and boundary
 
@@ -117,7 +117,7 @@ The first runtime event codec uses a fixed 160-byte little-endian record:
 
 State codes are Planned=0, ValidatingInputs=1, Running=2, Verifying=3, Publishing=4, CancellationRequested=5, Completed=6, Cancelled=7, Failed=8 and Interrupted=9. Unknown state codes, nonzero reserved bytes, zero identity fields, wrong lengths and checksum mismatches are rejected.
 
-The current Rust implementation provides the event encoder/decoder, in-memory state reducer, durable append-only CJE1 journal file operations, full-file replay validation, and recovery that appends one Interrupted event for an unfinished attempt. Each per-attempt journal is capped at 64 MiB (419,430 complete events). Appends sync the journal file; first creation also syncs its parent directory on Unix. Partial tails, checksum damage, non-regular files and journals above 64 MiB are rejected without truncation. Recovery of a partial tail requires preserving the damaged attempt and creating a fresh attempt. Candidate-output reconciliation after publishing remains future work because output manifests are not yet implemented.
+The current Rust implementation provides the event encoder/decoder, in-memory state reducer, durable append-only CJE1 journal file operations and full-file replay validation. Each per-attempt journal is capped at 64 MiB (419,430 complete events). Appends sync the journal file; first creation also syncs its parent directory on Unix. Partial tails, checksum damage, non-regular files and journals above 64 MiB are rejected without truncation. Startup recovery preserves corrupt/partial journals; for valid unfinished attempts it verifies any final candidate against its persisted CIM1/OWM1/PVM1 and appends Completed only if verification succeeds. Otherwise it appends Interrupted and removes only regular files in that attempt's canonical staging directory. Retries require a fresh Attempt.
 
 Recovery rules:
 
@@ -268,7 +268,7 @@ The database source-preflight API accepts a decoded CIM1 manifest and checks tha
 
 Before a source is accepted, the preflight checks each parent directory is a real directory (not a symlink), each source is a regular non-symlink file, the exact byte length and complete-file SHA-256 match CIM1, and the embedded format validator accepts the Chronicle or Capsule record. Capsule validation also recomputes ANF column statistics and temporal bounds and verifies ColumnId-based resolution into the target schema. No source is modified, renamed or deleted.
 
-The preflight report returns verified Capsule and Chronicle-record counts, aggregate source bytes, total rows and the exact CIM1 body fingerprint. This is a read-only preflight primitive; it does not yet run compaction or publish candidate outputs.
+The preflight report returns verified Capsule and Chronicle-record counts, aggregate source bytes, total rows and the exact CIM1 body fingerprint. The bounded execution API consumes this report, rechecks the source snapshot immediately before reading rows, and writes a candidate without changing source files or normal scan visibility.
 
 
 
@@ -280,6 +280,28 @@ Append-only preserves source sequence and row ordinal. Time-first sorts by the f
 
 Each artifact has an ANF-v2 data object and a PVM1 sidecar. PVM1 stores IngestionSequence, RowOrdinal and TypedRowSHA256 per physical row. Candidate verification reopens every staged file, verifies its OWM1 length/hash, decodes the data and PVM1, and proves exact equality with the input origin/fingerprint inventory. OWM1 is written last; the complete staging directory is atomically renamed into the immutable candidate generation path. It remains inactive.
 
-The executor journals Planned, ValidatingInputs, Running, Verifying, Publishing and Completed transitions in CJE1. Cancellation is checked between source Capsules, bounded sort runs and output merge work units; once Publishing is journalled, cancellation is too late. Progress tracks input/output/temp bytes, estimated working memory, rows and open files. Wall duration is recorded. Process CPU time is currently reported as unavailable by the portable prototype and remains an M3.2 measurement task.
+The executor journals Planned, ValidatingInputs, Running, Verifying, Publishing and Completed transitions in CJE1. Cancellation is checked at bounded row, sort-run and output-merge work-unit boundaries; once Publishing is journalled, cancellation is too late. Progress tracks input/output/temp bytes, estimated working memory, rows and open files. Execution reports record wall duration, Linux process CPU time when available, final candidate storage bytes, temporary disk amplification and candidate read/decode latency.
 
-execute_compaction and verify_compaction_candidate do not modify source Chronicle/Capsule files or normal scan visibility. They create only an immutable candidate directory and per-attempt journal. Active-generation promotion remains M3.3.
+execute_compaction and verify_compaction_candidate do not modify source Chronicle/Capsule files or normal scan visibility. Each immutable candidate stores the exact input CIM1, OWM1 and data/provenance artifacts. AWP1 promotion is a separate operation that verifies the candidate and reference logical scan before changing active visibility.
+
+
+## 16. Active generation pointer — AWP1
+
+AWP1 is the atomic read-path selector stored in data/table/weaves/active.awp. It is a fixed 128-byte little-endian header followed by SHA-256 and AEND. It stores TableId, monotonic pointer revision, current WeaveId/generation and complete OWM1 SHA-256, plus the retained previous generation identity and OWM1 SHA-256. A previous generation is either entirely absent (all zero fields) or entirely present.
+
+Promotion is allowed only when the candidate covers the complete Chronicle sequence range beginning at one and there are no legacy ANF segments outside the pinned inventory. The candidate is independently verified against CIM1 and PVM1, and its typed-row fingerprint multiset is compared with the current logical table scan before the pointer is switched. The pointer temp file is created exclusively in the same directory, fully written and synced, then renamed over active.awp; the directory is synced. No candidate data file is overwritten or deleted.
+
+Normal row scans read the current active OWM1 and substitute its Weave data artifacts for the Chronicle records whose sequences are covered by that manifest. Chronicle records outside the active interval remain visible. The old generation is retained as the rollback target. Rollback is a new pointer revision that swaps current and previous identities; it never rewrites source data or deletes either generation.
+
+On open, an active pointer is decoded and its current candidate is fully reverified from persisted CIM1, OWM1, data artifacts and PVM1 provenance. If the active candidate is missing or invalid and the retained previous generation verifies, recovery publishes a new pointer selecting the previous generation. If neither generation verifies, opening fails closed.
+
+The atomic replace guarantee is validated on Unix filesystems with same-directory rename and directory sync. Platforms without equivalent atomic replacement must not claim crash-safe promotion until a platform-specific primitive is supplied.
+
+
+## 17. M3.2 measurement methodology and conclusion
+
+The reproducible CI example creates 10,000 telemetry rows in ten Chronicle batches, builds one Capsule per batch, and produces append-only, time-first and entity-first candidates from the same full-coverage CIM1 inventory. It records build wall time, Linux process CPU time when available, source/output/temp/final bytes, temporary disk amplification, artifact count and five warm candidate read/decode samples per layout. The workflow uploads the raw JSON as the chrono-weave-m3-benchmark artifact for each run.
+
+The initial performance conclusion is intentionally conservative: the current full-table scan decodes every selected Weave artifact and does not exploit physical ordering for range pruning or query planning. Time-first/entity-first therefore do not reduce rows decoded in the current workload and add sorting/merge work. No performance benefit is claimed; append-only remains the default. This negative result is documented in docs/research/chrono-weave-m3-report.md. The mixed layout was evaluated against this workload and is not justified; it remains unimplemented.
+
+Linux process CPU time is sampled from procfs and the system clock-tick rate. Non-Linux platforms return null; wall time is not presented as CPU time. The benchmark is a synthetic single-node prototype workload, not a production performance claim.

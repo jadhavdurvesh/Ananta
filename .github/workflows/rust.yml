@@ -70,6 +70,19 @@ jobs:
           "$BENCH" open "$CHR_SMALL"
           "$BENCH" open "$CHR_LARGE"
           rm -rf "$ROOT"
+      - name: Benchmark ChronoWeave compaction layouts
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/ananta-chrono-weave-m3 chrono-weave-m3-results.json
+          cargo run --release -p ananta-core --example chrono_weave_m3 -- /tmp/ananta-chrono-weave-m3
+          test -s chrono-weave-m3-results.json
+          cat chrono-weave-m3-results.json
+      - name: Upload ChronoWeave benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrono-weave-m3-benchmark
+          path: chrono-weave-m3-results.json
+          if-no-files-found: error
       - name: Benchmark Capsule sizes and Navigation Map scans
         run: |
           set -euo pipefail
