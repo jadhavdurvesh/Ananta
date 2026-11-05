@@ -883,8 +883,11 @@ impl Database {
         }
         let index = self.chronicle_indices.get(&definition.id)
             .ok_or(DbError::CapsuleCorrupt("table Chronicle index is missing"))?;
+        let available_sequences = index.by_batch_id.values()
+            .map(|receipt| receipt.metadata.sequence)
+            .collect::<BTreeSet<_>>();
         for sequence in metadata.first_ingestion_sequence..=metadata.last_ingestion_sequence {
-            if !index.by_batch_id.values().any(|receipt| receipt.metadata.sequence == sequence) {
+            if !available_sequences.contains(&sequence) {
                 return Err(DbError::CapsuleCorrupt("Capsule source Chronicle sequence is no longer available"));
             }
         }
