@@ -181,7 +181,7 @@ impl Database {
         read_pointer(&self.root.join("data").join(table).join("weaves"), definition.id.0)
     }
 
-    pub(crate) fn recover_active_weaves(&self) -> Result<(), DbError> {
+    pub(super) fn recover_active_weaves(&self) -> Result<(), DbError> {
         for (table, definition) in &self.catalog.tables {
             let root = self.root.join("data").join(table).join("weaves");
             let Some(pointer) = read_pointer(&root, definition.id.0)? else { continue; };
@@ -201,7 +201,7 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn list_table_scan_paths(
+    pub(super) fn list_table_scan_paths(
         &self, table: &str, definition: &TableDefinition,
     ) -> Result<Vec<PathBuf>, DbError> {
         let table_dir = self.root.join("data").join(table);
