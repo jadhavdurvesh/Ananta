@@ -381,8 +381,10 @@ fn save_catalog(path: &Path, catalog: &Catalog) -> Result<(), DbError> {
     validate_catalog(&decoded)?;
 
     let temp = path.with_extension("anc.tmp");
+    // Acquire the temporary path before entering the cleanup scope. If it
+    // already exists, create_new fails and the pre-existing file is untouched.
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)?;
     let write_result = (|| -> Result<(), DbError> {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
@@ -392,13 +394,7 @@ fn save_catalog(path: &Path, catalog: &Catalog) -> Result<(), DbError> {
         Ok(())
     })();
     if write_result.is_err() {
-        // Do not remove a pre-existing temp file that we did not create.
-        // The create_new failure case is handled separately below.
-        if temp.exists() {
-            // A failed write may have created this temp during this call.
-            // The original catalog path is never removed here.
-            let _ = fs::remove_file(&temp);
-        }
+        let _ = fs::remove_file(&temp);
     }
     write_result
 }
@@ -581,11 +577,6 @@ fn read_string(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<String, D
     if length > MAX_NAME_BYTES { return Err(DbError::CorruptCatalog("name length exceeds limit")); }
     let raw = take(bytes, cursor, end, length)?;
     String::from_utf8(raw.to_vec()).map_err(|_| DbError::CorruptCatalog("name is not valid UTF-8"))
-}
-
-fn read_u16(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<u16, DbError> {
-    let data = take(bytes, cursor, end, 2)?;
-    Ok(u16::from_le_bytes(data.try_into().map_err(|_| DbError::CorruptCatalog("truncated integer"))?))
 }
 
 fn read_u32(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<u32, DbError> {
