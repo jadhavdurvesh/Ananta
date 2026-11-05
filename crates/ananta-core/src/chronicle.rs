@@ -352,7 +352,12 @@ pub(crate) fn scan_table_index(
     table_id: u64,
 ) -> Result<TableChronicleIndex, DbError> {
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(directory)? {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(TableChronicleIndex::default()),
+        Err(error) => return Err(DbError::Io(error)),
+    };
+    for entry in entries {
         let entry = entry?;
         if entry.file_type()?.is_file()
             && entry.path().extension().and_then(|value| value.to_str()) == Some("chr")
