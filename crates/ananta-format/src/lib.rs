@@ -6,6 +6,7 @@ use std::fmt;
 
 mod batch_reader;
 pub use batch_reader::{SegmentBatchReader, MAX_BATCH_ROWS};
+pub const MAX_BATCH_CELLS: usize = 1_000_000;
 
 const MAGIC: &[u8; 4] = b"ANF1";
 const END_MAGIC: &[u8; 4] = b"AEND";
