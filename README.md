@@ -19,7 +19,7 @@ The initial Rust implementation currently includes:
 - Typed values and schema validation.
 - Experimental ANF columnar segment encoder/decoder, including projected-column decoding, a golden binary fixture and defensive input-size limits.
 - Native local catalog file with persisted schemas.
-- Embedded database API for open, create-table, insert-batch (ANF v0.2), dual-version full scan and projected scan.
+- Embedded database API for open, create-table, nullable-column schema evolution, insert-batch (ANF v0.2), dual-version full scan and projected scan.
 - A basic telemetry example and unit/integration tests.
 
 This is an experimental first vertical slice, not a complete or production-ready DBMS. It currently reads complete segment files and materialises scan results in memory; projected scans skip decoding unselected column values but do not yet provide physical column-range I/O. It assumes one exclusive writer. Cross-process/multiple-handle locking is not implemented. AQL, query planning, analytics operators, bounded streaming scans, compression, indexes, compaction, WAL, transactions, MVCC and crash recovery are not yet implemented.
@@ -41,6 +41,7 @@ The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source
 - [ADR 0005: immutable schema snapshots](docs/decisions/0005-schema-evolution-needs-immutable-snapshots.md)
 - [ANS1 v1 schema snapshot format](docs/specifications/schema-snapshot-ans1-v1.md)
 - [ANF v0.2 segment identity format](docs/specifications/anf-v0.2-prototype.md)
+- [Nullable-column DDL specification](docs/specifications/nullable-column-ddl-v0.1.md)
 - [ADR 0004: stable catalog object identity](docs/decisions/0004-stable-catalog-object-identity.md)
 - [ChronoWeave storage research proposal](docs/specifications/chronoweave-storage-research.md)
 - [ANANTA Studio and developer platform roadmap](docs/roadmap/studio-and-platform.md)

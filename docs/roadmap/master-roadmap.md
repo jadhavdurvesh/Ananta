@@ -236,7 +236,7 @@ ADR: `docs/decisions/0005-schema-evolution-needs-immutable-snapshots.md`.
 Specification: `docs/specifications/schema-snapshot-ans1-v1.md`.
 **Completed:** [PR #9 merged](https://github.com/jadhavdurvesh/Ananta/pull/9); [CI passed](https://github.com/jadhavdurvesh/Ananta/actions/runs/41993765088).
 
-#### M1.2.3.3 Implement ANF v0.2 and segment schema resolver — in progress
+#### M1.2.3.3 Implement ANF v0.2 and segment schema resolver — complete
 - [x] Specify ANF v0.2 header and directory with TableId, schema revision and ColumnIds.
 - [x] Add ANF v0.2 writer for new inserts.
 - [x] Preserve the ANF v0.1 decoder for legacy segments.
@@ -248,19 +248,42 @@ Specification: `docs/specifications/schema-snapshot-ans1-v1.md`.
 - [x] Reject wrong table IDs, future revisions, identity mismatches and incompatible type/nullability.
 - [x] Add ANF v0.2 golden fixture and malformed identity tests.
 - [x] Add mixed v0.1/v0.2 test including a newly added nullable column and close/reopen.
-- [ ] Run and pass PR CI, then merge.
+- [x] Pass formatting, workspace tests, Clippy and example CI.
+- [x] Merge implementation into main.
 
-Implementation branch: `feat/m1-anf-v2-segment-identity`.
+**Completed:** [PR #10 merged](https://github.com/jadhavdurvesh/Ananta/pull/10). [CI passed](https://github.com/jadhavdurvesh/Ananta/actions/runs/41995096651).
+
 Specification: `docs/specifications/anf-v0.2-prototype.md`.
 
-#### M1.2.3.4 Enable the first safe schema changes — not started
-- [ ] Add nullable column API with old-segment NULL synthesis.
-- [ ] Rename column while preserving ColumnId.
-- [ ] Reorder columns while preserving ColumnIds.
-- [ ] Add failure-injection tests for snapshot/catalog publication order.
-- [ ] Verify current logical results across mixed segment revisions.
+### M1.2.3.4 Enable the first safe schema changes — active
 
-Table rename/drop, type changes and non-null additions remain deferred until path identity, tombstones, backfill and compaction protocols are designed.
+#### M1.2.3.4.1 Add nullable column — implementation and CI complete
+- [x] Specify `Database::add_nullable_column(table, name, data_type)`.
+- [x] Require the current immutable schema snapshot to match the catalog before a change.
+- [x] Allocate one new stable ColumnId without changing existing IDs.
+- [x] Increment table schema revision and catalog revision with checked arithmetic.
+- [x] Publish the new immutable schema snapshot before the catalog pointer.
+- [x] Keep the old catalog/in-memory schema active if publication fails.
+- [x] Preserve orphan snapshots, permit identical retry and reject conflicting revisions.
+- [x] Implement the nullable-column API.
+- [x] Test mixed v0.1/v0.2 historical segments with NULL synthesis.
+- [x] Test new v0.2 writes at the new schema revision.
+- [x] Test close/reopen, full/projected scans, stable IDs and revision counters.
+- [x] Test duplicate names, empty names, missing/corrupt/mismatched snapshots, publication failure and counter overflow.
+- [x] Pass formatting, workspace tests, Clippy and the native example.
+
+**Validated in [PR #11](https://github.com/jadhavdurvesh/Ananta/pull/11); [latest CI run passed](https://github.com/jadhavdurvesh/Ananta/actions/runs/42017366696).**
+
+Specification: `docs/specifications/nullable-column-ddl-v0.1.md`.
+
+#### M1.2.3.4.2 Rename and reorder columns — next
+- [ ] Define rename/reorder snapshot transition and compatibility rules.
+- [ ] Implement column rename while preserving ColumnId.
+- [ ] Implement column reorder while preserving ColumnIds.
+- [ ] Verify historical segment mapping by ColumnId after rename/reorder.
+- [ ] Add failure-injection tests for snapshot/catalog publication.
+
+Table rename/drop, column drop, type changes and non-null additions remain deferred until path identity, tombstones, backfill and compaction protocols are designed.
 
 ## M1.3 Implement bounded read batches
 - [ ] Define a column-vector/batch representation.
@@ -811,4 +834,4 @@ Do these in order. Do not skip ahead.
 10. [ ] Mark M0 complete only after all exit criteria pass.
 11. [ ] Start M1 with exactly one small PR: the ANF format/golden-fixture and safety work package.
 
-**Current focus: M1.2.3.3 — validate ANF v0.2 golden bytes and mixed-revision reads. Keep schema-changing DDL disabled until the PR passes CI and is merged.**
+**Current focus: M1.2.3.4.2 — define safe column rename/reorder semantics while preserving stable ColumnIds. Table/column drops, type changes and non-null additions remain disabled.**
