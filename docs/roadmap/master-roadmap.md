@@ -383,7 +383,7 @@ Decision: `docs/decisions/0007-idempotent-commit-ordered-ingestion.md`.
 - [x] Test conflicting BatchId reuse and TableId scoping.
 - [x] Test out-of-order timestamps, source row-order preservation and mixed legacy/Chronicle scans.
 - [x] Test pre-commit publication failures and post-commit uncertain outcomes at the Chronicle publication primitive.
-- [ ] Test schema changes between calls and sequence overflow.
+- [x] Test schema changes between calls and sequence overflow.
 - [ ] Benchmark Chronicle startup/index rebuild and ingestion overhead.
 
 Specification: `docs/specifications/chronicle-record-v0.1.md`.
