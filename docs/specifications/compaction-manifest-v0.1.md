@@ -260,3 +260,12 @@ The artifact ordinal derives the canonical relative paths beneath the candidate 
 - Candidate output remains invisible until M3.3 implements active-generation promotion and rollback.
 
 The OWM1 codec validates the immutable output inventory, not the physical Weave data format. Data and provenance codecs are implemented with M3.2 layout strategies.
+
+
+## 14. Database Source Preflight
+
+The database source-preflight API accepts a decoded CIM1 manifest and checks that its TableId and target schema revision still match the open database. It resolves Chronicle receipt references through the table's reconstructed receipt index and requires canonical table-local segment record filenames. Capsule paths are derived from the numeric CapsuleId and generation under the table capsules directory.
+
+Before a source is accepted, the preflight checks each parent directory is a real directory (not a symlink), each source is a regular non-symlink file, the exact byte length and complete-file SHA-256 match CIM1, and the embedded format validator accepts the Chronicle or Capsule record. Capsule validation also recomputes ANF column statistics and temporal bounds and verifies ColumnId-based resolution into the target schema. No source is modified, renamed or deleted.
+
+The preflight report returns verified Capsule and Chronicle-record counts, aggregate source bytes, total rows and the exact CIM1 body fingerprint. This is a read-only preflight primitive; it does not yet run compaction or publish candidate outputs.
