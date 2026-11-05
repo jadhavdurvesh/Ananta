@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 pub mod schema_snapshot;
 mod nullable_ddl;
 mod column_rename_reorder;
+mod segment_publication;
 use schema_snapshot::{SchemaSnapshot, SchemaSnapshotConsistencyReport};
+use segment_publication::{cleanup_orphan_segment_temps, publish_segment, DatabaseLock};
 
 const CATALOG_MAGIC: &[u8; 4] = b"ANC1";
 const CATALOG_END: &[u8; 4] = b"CEND";
@@ -48,6 +50,8 @@ pub enum DbError {
     UnsupportedCatalogVersion(u16),
     ChecksumMismatch,
     LengthOverflow,
+    DatabaseLocked(PathBuf),
+    SegmentPublicationUncertain { path: PathBuf, reason: String },
 }
 
 impl fmt::Display for DbError {
@@ -67,6 +71,8 @@ impl fmt::Display for DbError {
             Self::UnsupportedCatalogVersion(v) => write!(f, "unsupported catalog version: {v}"),
             Self::ChecksumMismatch => f.write_str("catalog checksum mismatch"),
             Self::LengthOverflow => f.write_str("catalog field exceeds supported limits"),
+            Self::DatabaseLocked(path) => write!(f, "database is locked by another writer: {} (verify no process owns it before removing a stale lock)", path.display()),
+            Self::SegmentPublicationUncertain { path, reason } => write!(f, "segment publication durability is uncertain for {}: {reason}; inspect the final path before retrying", path.display()),
         }
     }
 }
@@ -303,6 +309,7 @@ fn increment_catalog_revision(catalog: &mut Catalog) -> Result<(), DbError> {
 pub struct Database {
     root: PathBuf,
     catalog: Catalog,
+    _writer_lock: DatabaseLock,
 }
 
 impl Database {
@@ -310,6 +317,8 @@ impl Database {
         let root = path.as_ref().to_path_buf();
         fs::create_dir_all(root.join("catalog"))?;
         fs::create_dir_all(root.join("data"))?;
+        // A handle owns the exclusive local writer lock for its entire lifetime.
+        let writer_lock = DatabaseLock::acquire(&root)?;
         let catalog_path = root.join("catalog").join("catalog.anc");
         let catalog = match fs::metadata(&catalog_path) {
             Ok(_) => load_catalog(&catalog_path)?,
@@ -317,7 +326,8 @@ impl Database {
             Err(error) => return Err(DbError::Io(error)),
         };
         ensure_initial_schema_snapshots(&root, &catalog)?;
-        Ok(Self { root, catalog })
+        cleanup_orphan_segment_temps(&root.join("data"))?;
+        Ok(Self { root, catalog, _writer_lock: writer_lock })
     }
 
     pub fn create_table(&mut self, name: impl Into<String>, schema: Schema) -> Result<(), DbError> {
@@ -541,18 +551,7 @@ impl Database {
         let table_dir = self.root.join("data").join(table);
         fs::create_dir_all(&table_dir)?;
         let segment_id = next_segment_id(&table_dir)?;
-        let final_path = table_dir.join(format!("segment-{segment_id:020}.anf"));
-        let temp_path = table_dir.join(format!(".segment-{segment_id:020}.tmp"));
-
-        let write_result = (|| -> Result<(), DbError> {
-            let mut file = OpenOptions::new().write(true).create_new(true).open(&temp_path)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temp_path, &final_path)?;
-            Ok(())
-        })();
-        if write_result.is_err() { let _ = fs::remove_file(&temp_path); }
-        write_result?;
+        let final_path = publish_segment(&table_dir, segment_id, &bytes)?;
         Ok(Some(final_path))
     }
 
