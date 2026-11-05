@@ -1,4 +1,4 @@
-use ananta_format::{decode_projected_segment, decode_segment_v2, encode_segment, encode_segment_v2, inspect_segment_v2, segment_version, FormatError, MAX_SEGMENT_BYTES};
+use ananta_format::{decode_projected_segment, decode_segment_v2, encode_segment_v2, inspect_segment_v2, segment_version, FormatError, MAX_SEGMENT_BYTES};
 use ananta_types::{Column, DataType, Schema, TypeError, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -892,6 +892,7 @@ fn checksum64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ananta_format::encode_segment;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path() -> PathBuf {
@@ -1054,6 +1055,8 @@ mod tests {
         let mut db = Database::open(&path).unwrap();
         db.create_table("telemetry", sample_schema()).unwrap();
 
+        let snapshot_path = SchemaSnapshot::path(&path, db.table_id("telemetry").unwrap(), 1).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
         let report = db.check_schema_snapshot_consistency().unwrap();
         assert_eq!(report.missing_current, vec![(db.table_id("telemetry").unwrap(), 1)]);
         assert!(report.invalid_files.is_empty());
@@ -1110,6 +1113,82 @@ mod tests {
         assert!(report.invalid_files.contains(&snapshot_path));
         assert_eq!(report.missing_current, vec![(table_id, 1)]);
 
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn new_inserts_use_anf_v0_2_and_existing_v0_1_segments_remain_readable() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        let schema_v1 = sample_schema();
+        db.create_table("telemetry", schema_v1.clone()).unwrap();
+
+        let old_rows = vec![vec![
+            Value::TimestampMicros(10),
+            Value::Utf8("old-sensor".into()),
+            Value::Float64(20.0),
+        ]];
+        let legacy_bytes = encode_segment(&schema_v1, &old_rows).unwrap();
+        let table_dir = path.join("data").join("telemetry");
+        fs::write(table_dir.join("segment-00000000000000000001.anf"), legacy_bytes).unwrap();
+
+        let mut candidate = db.catalog.clone();
+        // Allocate in the candidate, not in the live catalog, then publish
+        // the revised snapshot before updating the catalog pointer.
+        let new_column_id = allocate_object_id(&mut candidate).unwrap();
+        let definition = candidate.tables.get_mut("telemetry").unwrap();
+        let schema_v2 = Schema::new(vec![
+            Column::new("timestamp", DataType::TimestampMicros, false),
+            Column::new("device", DataType::Utf8, false),
+            Column::new("temperature", DataType::Float64, true),
+            Column::new("humidity", DataType::Float64, true),
+        ]).unwrap();
+        definition.schema = schema_v2;
+        definition.column_ids.push(new_column_id);
+        definition.schema_revision = 2;
+        increment_catalog_revision(&mut candidate).unwrap();
+
+        let revised = candidate.tables.get("telemetry").unwrap();
+        SchemaSnapshot::new(
+            revised.id,
+            revised.schema_revision,
+            &revised.schema,
+            &revised.column_ids,
+        ).unwrap().write_to(&path).unwrap();
+        save_catalog(&path.join("catalog").join("catalog.anc"), &candidate).unwrap();
+        db.catalog = candidate;
+
+        let new_rows = vec![vec![
+            Value::TimestampMicros(20),
+            Value::Utf8("new-sensor".into()),
+            Value::Float64(22.5),
+            Value::Float64(55.0),
+        ]];
+        let new_segment = db.insert_batch("telemetry", &new_rows).unwrap().unwrap();
+        let bytes = fs::read(&new_segment).unwrap();
+        assert_eq!(segment_version(&bytes).unwrap(), 2);
+
+        let expected = vec![
+            vec![
+                Value::TimestampMicros(10),
+                Value::Utf8("old-sensor".into()),
+                Value::Float64(20.0),
+                Value::Null,
+            ],
+            new_rows[0].clone(),
+        ];
+        assert_eq!(db.scan("telemetry").unwrap(), expected);
+        assert_eq!(
+            db.scan_columns("telemetry", &["humidity", "device"]).unwrap(),
+            vec![
+                vec![Value::Null, Value::Utf8("old-sensor".into())],
+                vec![Value::Float64(55.0), Value::Utf8("new-sensor".into())],
+            ]
+        );
+
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap(), expected);
         fs::remove_dir_all(path).unwrap();
     }
 
