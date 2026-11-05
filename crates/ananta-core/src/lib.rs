@@ -409,7 +409,9 @@ impl Database {
             let directory = root.join("data").join(name);
             chronicle_indices.insert(definition.id, scan_table_index(&directory, definition.id.0)?);
         }
-        Ok(Self { root, catalog, chronicle_indices, _writer_lock: writer_lock })
+        let database = Self { root, catalog, chronicle_indices, _writer_lock: writer_lock };
+        database.recover_active_weaves()?;
+        Ok(database)
     }
 
     pub fn create_table(&mut self, name: impl Into<String>, schema: Schema) -> Result<(), DbError> {
@@ -1432,20 +1434,11 @@ impl Database {
         }
 
         let effective_batch_rows = batch_rows.min((MAX_BATCH_CELLS / projection.len()).max(1));
-        let mut segments = Vec::new();
-        if row_limit != Some(0) {
-            let table_dir = self.root.join("data").join(table);
-            for entry in fs::read_dir(&table_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if entry.file_type()?.is_file()
-                    && matches!(path.extension().and_then(|extension| extension.to_str()), Some("anf" | "chr"))
-                {
-                    segments.push(path);
-                }
-            }
-            segments.sort();
-        }
+        let segments = if row_limit == Some(0) {
+            Vec::new()
+        } else {
+            self.list_table_scan_paths(table, definition)?
+        };
         Ok(ScanBatchIter {
             root: self.root.clone(),
             current: definition.clone(),
@@ -1470,16 +1463,7 @@ impl Database {
             return Err(DbError::Format(FormatError::InvalidProjection(*index)));
         }
 
-        let table_dir = self.root.join("data").join(table);
-        let mut segments = Vec::new();
-        for entry in fs::read_dir(&table_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if matches!(path.extension().and_then(|s| s.to_str()), Some("anf" | "chr")) {
-                segments.push(path);
-            }
-        }
-        segments.sort();
+        let segments = self.list_table_scan_paths(table, definition)?;
 
         let mut rows = Vec::new();
         for segment in segments {
