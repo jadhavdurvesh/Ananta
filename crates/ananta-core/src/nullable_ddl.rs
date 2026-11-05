@@ -1,0 +1,85 @@
+//! Snapshot-first publication for the first supported schema change.
+
+use super::{
+    allocate_object_id, increment_catalog_revision, save_catalog, validate_name, Database,
+    DbError, ObjectId,
+};
+use crate::schema_snapshot::SchemaSnapshot;
+use ananta_types::{Column, DataType, Schema};
+
+impl Database {
+    /// Add one nullable column without rewriting existing data segments.
+    ///
+    /// The current immutable snapshot is verified against the catalog first.
+    /// The new snapshot is then published before the catalog pointer. If the
+    /// catalog write fails, the live handle retains its old catalog and the
+    /// future-revision snapshot remains an orphan for explicit inspection.
+    pub fn add_nullable_column(
+        &mut self,
+        table: &str,
+        name: impl Into<String>,
+        data_type: DataType,
+    ) -> Result<ObjectId, DbError> {
+        let name = name.into();
+        validate_name(&name)?;
+
+        let current = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+
+        let current_snapshot = SchemaSnapshot::read_from(
+            &self.root,
+            current.id,
+            current.schema_revision,
+        ).map_err(|_| DbError::SchemaCompatibility(
+            "current schema snapshot is missing or invalid",
+        ))?;
+
+        if current_snapshot.table_id() != current.id
+            || current_snapshot.revision() != current.schema_revision
+            || current_snapshot.schema()? != current.schema
+            || current_snapshot.column_ids().collect::<Vec<_>>() != current.column_ids
+        {
+            return Err(DbError::SchemaCompatibility(
+                "current schema snapshot does not match the catalog definition",
+            ));
+        }
+
+        let normalized_name = name.to_lowercase();
+        if current.schema.columns().iter()
+            .any(|column| column.name.to_lowercase() == normalized_name)
+        {
+            return Err(DbError::ColumnExists(name));
+        }
+
+        let mut candidate = self.catalog.clone();
+        let new_column_id = allocate_object_id(&mut candidate)?;
+        let definition = candidate.tables.get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+
+        definition.schema_revision = definition.schema_revision
+            .checked_add(1)
+            .ok_or(DbError::LengthOverflow)?;
+
+        let mut columns = definition.schema.columns().to_vec();
+        columns.push(Column::new(name, data_type, true));
+        definition.schema = Schema::new(columns)?;
+        definition.column_ids.push(new_column_id);
+        increment_catalog_revision(&mut candidate)?;
+
+        let revised = candidate.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        SchemaSnapshot::new(
+            revised.id,
+            revised.schema_revision,
+            &revised.schema,
+            &revised.column_ids,
+        )?.write_to(&self.root)?;
+
+        save_catalog(
+            &self.root.join("catalog").join("catalog.anc"),
+            &candidate,
+        )?;
+        self.catalog = candidate;
+        Ok(new_column_id)
+    }
+}
