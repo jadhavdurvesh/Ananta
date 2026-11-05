@@ -482,5 +482,17 @@ mod tests {
         let mut corrupt = bytes;
         corrupt[HEADER_LEN] ^= 1;
         assert!(NavigationMap::decode(&corrupt, 1, 5).is_err());
+
+        let mut overlapping = decoded.clone();
+        let mut duplicate_range = overlapping.entries[0].clone();
+        duplicate_range.metadata.capsule_id = 3;
+        duplicate_range.metadata.first_ingestion_sequence = 2;
+        duplicate_range.metadata.last_ingestion_sequence = 4;
+        overlapping.entries.push(duplicate_range);
+        overlapping.entries.sort_by_key(|entry| (entry.metadata.capsule_id, entry.metadata.generation));
+        assert!(matches!(
+            overlapping.encode(),
+            Err(DbError::NavigationMapCorrupt("Capsule source sequence ranges overlap"))
+        ));
     }
 }
