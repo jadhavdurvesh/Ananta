@@ -453,8 +453,11 @@ Specification: docs/specifications/navigation-map-v0.1.md.
 - [x] Define compaction memory and disk limits.
 - [x] Define compaction cancellation boundaries.
 - [x] Define safely discardable attempts and fresh-attempt retry semantics.
-- [ ] Implement manifests, job journal, bounded execution and staging publication.
-- [ ] Add compaction correctness and fault-injection tests.
+- [x] Implement deterministic compaction job transitions, a fixed-width checksummed event codec and strict journal replay validation.
+- [x] Implement finite resource-budget validation for input/output/temp bytes, working memory, rows, open files and work-unit size.
+- [ ] Implement canonical input/output manifest codecs and fingerprint validation.
+- [ ] Persist the append-only job journal and add crash recovery, bounded execution and staging publication.
+- [ ] Add database-level compaction correctness and fault-injection tests.
 
 Specification: docs/specifications/compaction-manifest-v0.1.md.
 Decision: docs/decisions/0010-compaction-input-snapshots-and-candidate-outputs.md.
