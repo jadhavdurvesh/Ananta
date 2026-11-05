@@ -365,14 +365,22 @@ pub(crate) fn scan_table_index(
             files.push(entry.path());
         }
     }
-    files.sort();
-    let mut index = TableChronicleIndex::default();
+    let mut records = Vec::with_capacity(files.len());
     for path in files {
+        let filename = path.file_name().and_then(|value| value.to_str())
+            .ok_or(DbError::ChronicleCorrupt("Chronicle filename is not UTF-8"))?;
+        let file_id = filename.strip_prefix("segment-")
+            .and_then(|value| value.strip_suffix(".chr"))
+            .filter(|value| value.len() == 20 && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value != 0)
+            .ok_or(DbError::ChronicleCorrupt("noncanonical Chronicle filename"))?;
         let (metadata, _) = inspect_file(&path, table_id)?;
-        let expected_name = format!("segment-{:020}.chr", metadata.sequence);
-        if path.file_name().and_then(|value| value.to_str()) != Some(expected_name.as_str()) {
-            return Err(DbError::ChronicleCorrupt("filename does not match ingestion sequence"));
-        }
+        records.push((metadata.sequence, file_id, metadata, path));
+    }
+    records.sort_by_key(|(sequence, _, _, _)| *sequence);
+    let mut index = TableChronicleIndex::default();
+    for (_, _, metadata, path) in records {
         index.record(BatchReceipt { metadata, path })?;
     }
     Ok(index)
