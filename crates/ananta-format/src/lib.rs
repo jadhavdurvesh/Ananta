@@ -11,7 +11,7 @@ const HEADER_LEN: usize = 20;
 const DIRECTORY_ENTRY_LEN: usize = 17;
 const TRAILER_LEN: usize = 12;
 const MAX_FIELD_BYTES: usize = 64 * 1024 * 1024;
-const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_ROWS: usize = 1_000_000;
 const MAX_COLUMNS: usize = 4_096;
 const MAX_DECODED_CELLS: usize = 1_000_000;
@@ -517,7 +517,7 @@ mod tests {
             Err(FormatError::LimitExceeded("column count"))
         );
         assert_eq!(
-            validate_counts(MAX_DECODED_CELLS + 1, 1, true),
+            validate_counts(500_001, 2, true),
             Err(FormatError::LimitExceeded("decoded cells"))
         );
     }
