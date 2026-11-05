@@ -24,6 +24,7 @@ const PVM_ENTRY: usize = 48;
 const PVM_TRAILER: usize = 36;
 const MAX_PVM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ARTIFACT_ROWS: usize = 65_536;
+const MAX_VERIFY_ROWS: u64 = 5_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RowOrigin {
@@ -275,7 +276,12 @@ impl Database {
         let input_fingerprint = input.fingerprint()?;
         let mut journal = CompactionJobJournal::new(input.job_id, input.attempt, input_fingerprint)
             .map_err(|e| DbError::CompactionExecution(e.to_string()))?;
-        let mut progress = CompactionProgress::default();
+        let mut progress = CompactionProgress {
+            input_bytes: preflight.total_source_bytes,
+            working_memory_bytes: estimated_memory,
+            open_files: 2,
+            ..CompactionProgress::default()
+        };
         append_state(&mut journal, &journal_path, CompactionJobState::Planned, progress)?;
         append_state(&mut journal, &journal_path, CompactionJobState::ValidatingInputs, progress)?;
         if is_cancelled(cancel) {
@@ -382,22 +388,27 @@ impl Database {
                     schema_revision: definition.schema_revision,
                     entries: chunk.iter().map(|row| row.origin).collect(),
                 }.encode().map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+                let data_len = u64::try_from(data.len()).map_err(|_| DbError::LengthOverflow)?;
+                let pvm_len = u64::try_from(pvm.len()).map_err(|_| DbError::LengthOverflow)?;
+                let next_artifact_bytes = artifact_bytes_total.checked_add(data_len)
+                    .and_then(|n| n.checked_add(pvm_len)).ok_or(DbError::LengthOverflow)?;
+                let input_manifest_len = u64::try_from(input_manifest_bytes.len())
+                    .map_err(|_| DbError::LengthOverflow)?;
+                let mut next_progress = progress;
+                next_progress.output_bytes = next_artifact_bytes;
+                next_progress.temporary_bytes = input_manifest_len.checked_add(next_artifact_bytes)
+                    .ok_or(DbError::LengthOverflow)?;
+                next_progress.current_work_unit_rows =
+                    u64::try_from(chunk.len()).map_err(|_| DbError::LengthOverflow)?;
+                next_progress.open_files = 2;
+                limits.check(&next_progress).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+
                 let data_path = stage_dir.join(format!("data-{artifact_ordinal:08}.wvf"));
                 let pvm_path = stage_dir.join(format!("provenance-{artifact_ordinal:08}.pvm"));
                 write_new_synced(&data_path, &data)?;
                 write_new_synced(&pvm_path, &pvm)?;
-                let data_len = u64::try_from(data.len()).map_err(|_| DbError::LengthOverflow)?;
-                let pvm_len = u64::try_from(pvm.len()).map_err(|_| DbError::LengthOverflow)?;
-                artifact_bytes_total = artifact_bytes_total.checked_add(data_len)
-                    .and_then(|n| n.checked_add(pvm_len)).ok_or(DbError::LengthOverflow)?;
-                progress.output_bytes = artifact_bytes_total;
-                progress.temporary_bytes = u64::try_from(input_manifest_bytes.len())
-                    .map_err(|_| DbError::LengthOverflow)?
-                    .checked_add(artifact_bytes_total)
-                    .ok_or(DbError::LengthOverflow)?;
-                progress.current_work_unit_rows = u64::try_from(chunk.len()).map_err(|_| DbError::LengthOverflow)?;
-                progress.open_files = 2;
-                limits.check(&progress).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+                artifact_bytes_total = next_artifact_bytes;
+                progress = next_progress;
                 artifact_refs.push(WeaveArtifactReference {
                     ordinal: artifact_ordinal,
                     data_file_len: data_len,
@@ -634,6 +645,12 @@ impl Database {
             || output.expected_row_count != input.expected_row_count
         {
             return Err(DbError::CompactionPreflight("candidate manifest identity differs from pinned attempt"));
+        }
+        if input.expected_row_count > MAX_VERIFY_ROWS {
+            return Err(DbError::CompactionExecution(format!(
+                "candidate verification row count {} exceeds hard verification bound {}",
+                input.expected_row_count, MAX_VERIFY_ROWS
+            )));
         }
         let mut expected = Vec::with_capacity(usize::try_from(input.expected_row_count).map_err(|_| DbError::LengthOverflow)?);
         for capsule in &input.capsules {
