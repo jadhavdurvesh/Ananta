@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Instant;
 
 const TABLE: &str = "memory_benchmark";
-const GENERATION_CHUNK_ROWS: usize = 2_000;
+const GENERATION_CHUNK_ROWS: usize = 10_000;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
