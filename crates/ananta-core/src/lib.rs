@@ -879,7 +879,7 @@ impl Database {
         for segment in segments {
             let mut file = File::open(&segment)?;
             let file_len = file.metadata()?.len();
-            if file_len > MAX_SEGMENT_BYTES as u64 {
+            if file_len > (MAX_SEGMENT_BYTES as u64 + 108) {
                 return Err(DbError::Format(FormatError::LimitExceeded("segment bytes")));
             }
             let capacity = usize::try_from(file_len).map_err(|_| DbError::LengthOverflow)?;
@@ -2964,6 +2964,239 @@ mod tests {
             .join(".segment-00000000000000000001.tmp").exists());
         assert_eq!(db.scan("telemetry").unwrap(), rows);
         drop(db);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+
+    #[test]
+    fn chronicle_ingestion_accepts_once_and_resolves_duplicate_retry_after_restart() {
+        let path = temp_path();
+        let rows = vec![vec![
+            Value::TimestampMicros(100),
+            Value::Utf8("sensor-1".into()),
+            Value::Float64(21.5),
+        ]];
+        let batch_id = BatchId::from_bytes([1; 16]).unwrap();
+        let first_result;
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.create_table("telemetry", sample_schema()).unwrap();
+            first_result = db.ingest_batch("telemetry", batch_id, &rows).unwrap();
+            assert_eq!(first_result.outcome, IngestOutcome::Accepted);
+            assert_eq!(first_result.ingestion_sequence, 1);
+            assert_eq!(first_result.row_count, 1);
+            assert!(first_result.chronicle_path.extension().is_some_and(|ext| ext == "chr"));
+
+            let retry = db.ingest_batch("telemetry", batch_id, &rows).unwrap();
+            assert_eq!(retry.outcome, IngestOutcome::Duplicate);
+            assert_eq!(retry.ingestion_sequence, first_result.ingestion_sequence);
+            assert_eq!(retry.chronicle_path, first_result.chronicle_path);
+            assert_eq!(db.scan("telemetry").unwrap(), rows);
+            let stats = db.ingestion_stats("telemetry").unwrap();
+            assert_eq!(stats.accepted_batches, 1);
+            assert_eq!(stats.accepted_rows, 1);
+            assert_eq!(stats.duplicate_requests, 1);
+        }
+
+        {
+            let mut db = Database::open(&path).unwrap();
+            let retry = db.ingest_batch("telemetry", batch_id, &rows).unwrap();
+            assert_eq!(retry.outcome, IngestOutcome::Duplicate);
+            assert_eq!(retry.ingestion_sequence, 1);
+            assert_eq!(db.scan("telemetry").unwrap(), rows);
+            // Durable accepted counters are reconstructed; request counters are process-local.
+            let stats = db.ingestion_stats("telemetry").unwrap();
+            assert_eq!(stats.accepted_batches, 1);
+            assert_eq!(stats.accepted_rows, 1);
+            assert_eq!(stats.duplicate_requests, 1);
+        }
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_rejects_conflicting_batch_id_and_does_not_consume_sequence() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let first = vec![vec![
+            Value::TimestampMicros(10),
+            Value::Utf8("sensor-a".into()),
+            Value::Float64(10.0),
+        ]];
+        let different = vec![vec![
+            Value::TimestampMicros(11),
+            Value::Utf8("sensor-b".into()),
+            Value::Float64(11.0),
+        ]];
+        let id = BatchId::from_bytes([2; 16]).unwrap();
+
+        let accepted = db.ingest_batch("telemetry", id, &first).unwrap();
+        assert_eq!(accepted.ingestion_sequence, 1);
+        assert!(matches!(
+            db.ingest_batch("telemetry", id, &different),
+            Err(DbError::BatchIdConflict(found)) if found == id
+        ));
+        let next = db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([3; 16]).unwrap(),
+            &different,
+        ).unwrap();
+        assert_eq!(next.ingestion_sequence, 2);
+        assert_eq!(db.scan("telemetry").unwrap(), vec![first[0].clone(), different[0].clone()]);
+        let stats = db.ingestion_stats("telemetry").unwrap();
+        assert_eq!(stats.accepted_batches, 2);
+        assert_eq!(stats.rejected_requests, 1);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_batch_id_scope_uses_stable_table_identity() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("alpha", sample_schema()).unwrap();
+        db.create_table("beta", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("same-id-different-table".into()),
+            Value::Float64(1.0),
+        ]];
+        let id = BatchId::from_bytes([4; 16]).unwrap();
+
+        let alpha = db.ingest_batch("alpha", id, &rows).unwrap();
+        let beta = db.ingest_batch("beta", id, &rows).unwrap();
+        assert_eq!(alpha.ingestion_sequence, 1);
+        assert_eq!(beta.ingestion_sequence, 1);
+        assert_ne!(alpha.table_id, beta.table_id);
+        assert_eq!(db.ingestion_stats("alpha").unwrap().accepted_batches, 1);
+        assert_eq!(db.ingestion_stats("beta").unwrap().accepted_batches, 1);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_rejects_empty_and_invalid_batches_without_sequence_gaps() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let id1 = BatchId::from_bytes([5; 16]).unwrap();
+        assert!(matches!(db.ingest_batch("telemetry", id1, &[]), Err(DbError::EmptyBatch)));
+
+        let invalid = vec![vec![
+            Value::Utf8("not-a-timestamp".into()),
+            Value::Utf8("sensor".into()),
+            Value::Float64(1.0),
+        ]];
+        assert!(matches!(
+            db.ingest_batch("telemetry", BatchId::from_bytes([6; 16]).unwrap(), &invalid),
+            Err(DbError::Type(_))
+        ));
+        assert_eq!(db.scan("telemetry").unwrap(), Vec::<Vec<Value>>::new());
+        assert_eq!(db.ingestion_stats("telemetry").unwrap().accepted_batches, 0);
+        assert_eq!(db.ingestion_stats("telemetry").unwrap().rejected_requests, 2);
+
+        let valid = vec![vec![
+            Value::TimestampMicros(2),
+            Value::Utf8("sensor".into()),
+            Value::Float64(2.0),
+        ]];
+        let result = db.ingest_batch("telemetry", BatchId::from_bytes([7; 16]).unwrap(), &valid).unwrap();
+        assert_eq!(result.ingestion_sequence, 1);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_keeps_commit_order_and_preserves_late_event_timestamps() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let later_event = vec![vec![
+            Value::TimestampMicros(900),
+            Value::Utf8("later".into()),
+            Value::Float64(9.0),
+        ]];
+        let late_event = vec![vec![
+            Value::TimestampMicros(100),
+            Value::Utf8("late".into()),
+            Value::Float64(1.0),
+        ]];
+        let first = db.ingest_batch("telemetry", BatchId::from_bytes([8; 16]).unwrap(), &later_event).unwrap();
+        let second = db.ingest_batch("telemetry", BatchId::from_bytes([9; 16]).unwrap(), &late_event).unwrap();
+        assert_eq!((first.ingestion_sequence, second.ingestion_sequence), (1, 2));
+        assert_eq!(db.scan("telemetry").unwrap(), vec![later_event[0].clone(), late_event[0].clone()]);
+        let batches = db.scan_batches("telemetry", 1).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches.iter().map(|batch| batch.row_count).collect::<Vec<_>>(), vec![1, 1]);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_coexists_with_legacy_segments_and_legacy_insert_keeps_physical_order() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let legacy_before = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("legacy-before".into()),
+            Value::Float64(1.0),
+        ]];
+        db.insert_batch("telemetry", &legacy_before).unwrap();
+
+        let chronicle_rows = vec![vec![
+            Value::TimestampMicros(2),
+            Value::Utf8("chronicle".into()),
+            Value::Float64(2.0),
+        ]];
+        db.ingest_batch("telemetry", BatchId::from_bytes([10; 16]).unwrap(), &chronicle_rows).unwrap();
+
+        let legacy_after = vec![vec![
+            Value::TimestampMicros(3),
+            Value::Utf8("legacy-after".into()),
+            Value::Float64(3.0),
+        ]];
+        db.insert_batch("telemetry", &legacy_after).unwrap();
+        let next_chronicle = vec![vec![
+            Value::TimestampMicros(4),
+            Value::Utf8("chronicle-next".into()),
+            Value::Float64(4.0),
+        ]];
+        let second = db.ingest_batch("telemetry", BatchId::from_bytes([11; 16]).unwrap(), &next_chronicle).unwrap();
+        assert_eq!(second.ingestion_sequence, 2);
+        assert_eq!(
+            db.scan("telemetry").unwrap(),
+            vec![
+                legacy_before[0].clone(),
+                chronicle_rows[0].clone(),
+                legacy_after[0].clone(),
+                next_chronicle[0].clone(),
+            ]
+        );
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap().len(), 4);
+        assert_eq!(reopened.ingestion_stats("telemetry").unwrap().accepted_batches, 2);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_corruption_is_detected_during_database_open() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(5),
+            Value::Utf8("integrity".into()),
+            Value::Float64(5.0),
+        ]];
+        let result = db.ingest_batch("telemetry", BatchId::from_bytes([12; 16]).unwrap(), &rows).unwrap();
+        drop(db);
+
+        let mut bytes = fs::read(&result.chronicle_path).unwrap();
+        let position = 96 + 36 + 3;
+        bytes[position] ^= 0x01;
+        fs::write(&result.chronicle_path, bytes).unwrap();
+        assert!(matches!(
+            Database::open(&path),
+            Err(DbError::ChronicleCorrupt("record checksum mismatch"))
+        ));
         fs::remove_dir_all(path).unwrap();
     }
 
