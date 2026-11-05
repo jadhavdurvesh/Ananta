@@ -39,10 +39,7 @@ impl<R: Read + Seek> SegmentBatchReader<R> {
         projection: &[usize],
         expected_v2_identity: Option<(u64, u64, Vec<u64>)>,
     ) -> Result<Self, FormatError> {
-        if projection.is_empty() {
-            return Err(FormatError::InvalidValue("projection cannot be empty"));
-        }
-        if let Some(index) = projection.iter().find(|index| **index >= schema.len()) {
+                if let Some(index) = projection.iter().find(|index| **index >= schema.len()) {
             return Err(FormatError::InvalidProjection(*index));
         }
 
@@ -95,7 +92,7 @@ impl<R: Read + Seek> SegmentBatchReader<R> {
                 if table_id == 0 || revision == 0 {
                     return Err(FormatError::InvalidValue("table ID and schema revision must be nonzero"));
                 }
-                if expected_v2_identity.as_ref().is_none_or(|(expected_table, expected_revision, _)| {
+                if expected_v2_identity.as_ref().map_or(true, |(expected_table, expected_revision, _)| {
                     *expected_table != table_id || *expected_revision != revision
                 }) {
                     return Err(FormatError::SchemaMismatch);
