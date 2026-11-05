@@ -194,15 +194,20 @@ Design proposal: `docs/specifications/catalog-v0.2-identity-proposal.md`.
 ADR: `docs/decisions/0004-stable-catalog-object-identity.md`.
 These items are documented but await review/merge.
 
-### M1.2.2 Implement catalog v2 — not started
-- [ ] Add typed ObjectId and catalog object models.
-- [ ] Implement catalog v2 header, feature flags and revisions.
-- [ ] Persist table IDs, column IDs and schema revisions.
-- [ ] Reject zero and duplicate IDs.
-- [ ] Reject unsupported mandatory feature flags and versions.
-- [ ] Add v2 byte fixtures and corruption tests.
-- [ ] Decide and implement a safe v1 migration tool.
-- [ ] Verify failed migration leaves the original catalog intact.
+### M1.2.2 Implement catalog v2 — in progress
+- [x] Add typed ObjectId and catalog object models.
+- [x] Implement catalog v2 header, feature flags and revisions.
+- [x] Persist table IDs, column IDs and schema revisions.
+- [x] Reject zero and duplicate IDs.
+- [x] Reject unsupported mandatory feature flags and versions.
+- [x] Add v2 golden-byte fixture and corruption tests.
+- [x] Implement deterministic v1-to-v2 migration on open.
+- [x] Verify failed migration preserves the original catalog and pre-existing temp files.
+- [x] Ensure failed catalog writes do not advance in-memory state.
+
+Implementation branch: `feat/m1-catalog-v2`. These items remain implemented-but-unverified until the PR CI passes and the change is merged.
+
+Binary specification: `docs/specifications/catalog-v2-binary-format.md`.
 
 ### M1.2.3 Schema evolution — not started
 - [ ] Implement table rename while preserving table ID.
@@ -763,4 +768,4 @@ Do these in order. Do not skip ahead.
 10. [ ] Mark M0 complete only after all exit criteria pass.
 11. [ ] Start M1 with exactly one small PR: the ANF format/golden-fixture and safety work package.
 
-**Current focus: M1.2.1 — define stable catalog object identity and schema revision semantics. Do not implement catalog v2 until this design is reviewed.**
+**Current focus: M1.2.2 — validate native catalog v2 implementation and safe v1 migration. Do not start schema evolution until this PR passes.**
