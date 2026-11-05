@@ -422,6 +422,27 @@ mod tests {
     }
 
     #[test]
+    fn oversized_segment_is_rejected_before_reading_into_memory() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+
+        let segment_path = path
+            .join("data")
+            .join("telemetry")
+            .join("segment-00000000000000000001.anf");
+        let file = OpenOptions::new().write(true).create_new(true).open(&segment_path).unwrap();
+        file.set_len((MAX_SEGMENT_BYTES as u64) + 1).unwrap();
+
+        assert!(matches!(
+            db.scan("telemetry"),
+            Err(DbError::Format(FormatError::LimitExceeded("segment bytes")))
+        ));
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn multiple_batches_are_read_in_segment_order() {
         let path = temp_path();
         let mut db = Database::open(&path).unwrap();
