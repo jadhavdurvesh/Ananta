@@ -2590,9 +2590,11 @@ mod tests {
             ]
         );
 
-        let exact = db.scan_batches_with_limit("telemetry", 2, 4).unwrap()
+        db.create_table("exact", sample_schema()).unwrap();
+        db.insert_batch("exact", &first_rows[..2]).unwrap();
+        let exact = db.scan_batches("exact", 2).unwrap()
             .collect::<Result<Vec<_>, _>>().unwrap();
-        assert_eq!(exact.iter().map(|batch| batch.row_count).collect::<Vec<_>>(), vec![2, 2]);
+        assert_eq!(exact.iter().map(|batch| batch.row_count).collect::<Vec<_>>(), vec![2]);
 
         let limited = db.scan_columns_batches_with_limit(
             "telemetry",
