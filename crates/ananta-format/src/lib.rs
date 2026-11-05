@@ -338,6 +338,59 @@ pub fn inspect_segment_v2(bytes: &[u8]) -> Result<SegmentIdentityV2, FormatError
     Ok(SegmentIdentityV2 { table_id, schema_revision, column_ids })
 }
 
+/// Physical information for one validated ANF v0.2 column payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentColumnInspection {
+    pub column_id: u64,
+    pub data_type: DataType,
+    pub offset: u64,
+    pub encoded_bytes: u64,
+}
+
+/// Validated ANF v0.2 segment identity, row count and column byte ranges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentInspectionV2 {
+    pub identity: SegmentIdentityV2,
+    pub row_count: u64,
+    pub columns: Vec<SegmentColumnInspection>,
+}
+
+/// Validate a v0.2 segment and expose its exact per-column encoded byte lengths.
+pub fn inspect_segment_v2_details(bytes: &[u8]) -> Result<SegmentInspectionV2, FormatError> {
+    const HEADER_V2_LEN: usize = 36;
+    const DIRECTORY_V2_ENTRY_LEN: usize = 25;
+
+    let identity = inspect_segment_v2(bytes)?;
+    let row_count = read_u64(bytes, 8)?;
+    let column_count = usize::try_from(read_u32(bytes, 16)?)
+        .map_err(|_| FormatError::LengthOverflow)?;
+    if column_count != identity.column_ids.len() {
+        return Err(FormatError::InvalidDirectory);
+    }
+
+    let mut columns = Vec::with_capacity(column_count);
+    let mut cursor = HEADER_V2_LEN;
+    for column_id in &identity.column_ids {
+        let data_type = DataType::from_code(bytes[cursor])
+            .ok_or(FormatError::InvalidDirectory)?;
+        let stored_id = read_u64(bytes, cursor + 1)?;
+        let offset = read_u64(bytes, cursor + 9)?;
+        let encoded_bytes = read_u64(bytes, cursor + 17)?;
+        cursor += DIRECTORY_V2_ENTRY_LEN;
+        if stored_id != *column_id {
+            return Err(FormatError::InvalidDirectory);
+        }
+        columns.push(SegmentColumnInspection {
+            column_id: *column_id,
+            data_type,
+            offset,
+            encoded_bytes,
+        });
+    }
+
+    Ok(SegmentInspectionV2 { identity, row_count, columns })
+}
+
 /// Encode an ANF v0.2 segment with stable table, schema and column identities.
 pub fn encode_segment_v2(
     schema: &Schema,
@@ -953,4 +1006,30 @@ mod tests {
         let encoded = encode_segment(&schema, &[]).unwrap();
         assert_eq!(decode_segment(&encoded[..encoded.len() - 2], &schema), Err(FormatError::Truncated));
     }
+    #[test]
+    fn v2_segment_details_report_exact_column_payload_lengths() {
+        let schema = Schema::new(vec![
+            Column::new("time", DataType::TimestampMicros, false),
+            Column::new("device", DataType::Utf8, false),
+            Column::new("reading", DataType::Float64, true),
+        ]).unwrap();
+        let rows = vec![
+            vec![Value::TimestampMicros(10), Value::Utf8("a".into()), Value::Float64(1.5)],
+            vec![Value::TimestampMicros(20), Value::Utf8("bb".into()), Value::Null],
+        ];
+        let ids = vec![11, 12, 13];
+        let encoded = encode_segment_v2(&schema, &rows, 7, 3, &ids).unwrap();
+        let inspection = inspect_segment_v2_details(&encoded).unwrap();
+        assert_eq!(inspection.identity.table_id, 7);
+        assert_eq!(inspection.identity.schema_revision, 3);
+        assert_eq!(inspection.identity.column_ids, ids);
+        assert_eq!(inspection.row_count, rows.len() as u64);
+        assert_eq!(inspection.columns.iter().map(|column| column.column_id).collect::<Vec<_>>(), vec![11, 12, 13]);
+        assert_eq!(inspection.columns.iter().map(|column| column.data_type).collect::<Vec<_>>(), vec![
+            DataType::TimestampMicros, DataType::Utf8, DataType::Float64
+        ]);
+        assert!(inspection.columns.iter().all(|column| column.encoded_bytes > 0));
+    }
+
+
 }

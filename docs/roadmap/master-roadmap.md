@@ -5,7 +5,7 @@
 **Owner:** DMJ  
 **Current release target:** 0.1.0 — Native Storage Prototype  
 **Roadmap status:** Active; review this file before starting work outside the current milestone
-**Current focus:** M2.3 Capsule prototype; M2.2 Chronicle implementation and performance gate are complete
+**Current focus:** M2.3 Capsule size and scan-behaviour evaluation; M2.2 Chronicle implementation and performance gate are complete
 
 ---
 
@@ -393,17 +393,24 @@ Decision: `docs/decisions/0008-chronicle-record-commit-point.md`.
 
 **Exit status:** M2.2 is complete. Identity, durable receipts, sequence allocation, retry/recovery, scan compatibility, schema-evolution and overflow tests pass; release-mode ingestion and startup-index costs are recorded. Capsule design and implementation are now the active M2.3 work.
 
-## M2.3 Capsule prototype
-- [ ] Define Capsule identity and generation.
-- [ ] Define row count and schema revision reference.
-- [ ] Add temporal min/max bounds.
-- [ ] Add per-column min/max where meaningful.
-- [ ] Add null counts.
-- [ ] Add column byte sizes.
-- [ ] Add capsule checksum.
-- [ ] Add capsule validation tool.
-- [ ] Compare multiple capsule sizes on identical datasets.
-- [ ] Record ingestion overhead and scan behaviour.
+## M2.3 Capsule prototype — first immutable format implemented
+- [x] Define immutable Capsule identity and explicit generation.
+- [x] Store row count, TableId, stable ColumnIds and schema revision reference.
+- [x] Add optional temporal min/max bounds using an explicitly selected TIMESTAMP_MICROS column.
+- [x] Add typed per-column min/max for BOOLEAN, INT32, INT64, TIMESTAMP_MICROS and FLOAT64.
+- [x] Add per-column null counts, including all-NULL columns.
+- [x] Record exact encoded byte lengths from the embedded ANF v0.2 column directory.
+- [x] Add SHA-256 payload fingerprint and whole-Capsule checksum.
+- [x] Add independent Capsule validator that verifies the wrapper, schema snapshot, embedded ANF and recomputed statistics.
+- [x] Build Capsules from contiguous, committed Chronicle sequence ranges while preserving historical ColumnId resolution.
+- [x] Publish Capsules immutably beside Chronicle data; keep source Chronicle files intact.
+- [ ] Compare multiple Capsule sizes on identical datasets.
+- [ ] Record Capsule build overhead, storage amplification and scan behaviour.
+
+Specification: docs/specifications/capsule-format-v0.1.md.
+Decision: docs/decisions/0009-immutable-capsules-as-derived-chronicle-units.md.
+
+**Scope boundary:** Capsules are derived, explicitly built files. There is no active-generation manifest, Chronicle reclamation, Navigation Map or query pruning in M2.3.
 
 ## M2.4 Navigation Map prototype
 - [ ] Define metadata structure separate from data payloads.

@@ -1,4 +1,4 @@
-use ananta_format::{decode_projected_segment, decode_segment_v2, encode_segment_v2, inspect_segment_v2, segment_version, FormatError, SegmentBatchReader, MAX_BATCH_CELLS, MAX_BATCH_COLUMNS, MAX_BATCH_ROWS, MAX_SEGMENT_BYTES};
+use ananta_format::{decode_projected_segment, decode_segment_v2, encode_segment_v2, inspect_segment_v2, inspect_segment_v2_details, segment_version, FormatError, SegmentBatchReader, MAX_BATCH_CELLS, MAX_BATCH_COLUMNS, MAX_BATCH_ROWS, MAX_SEGMENT_BYTES};
 use ananta_types::{Column, DataType, Schema, TypeError, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -11,10 +11,13 @@ mod nullable_ddl;
 mod column_rename_reorder;
 mod segment_publication;
 mod chronicle;
+mod capsule;
 pub use chronicle::{BatchId, IngestOutcome, IngestResult, IngestionStats};
+pub use capsule::{CapsuleColumnStats, CapsuleMetadata};
 use schema_snapshot::{SchemaSnapshot, SchemaSnapshotConsistencyReport};
-use segment_publication::{cleanup_orphan_segment_temps, publish_segment, publish_chronicle, DatabaseLock};
+use segment_publication::{cleanup_orphan_segment_temps, publish_segment, publish_chronicle, publish_capsule, DatabaseLock};
 use chronicle::{encode_record, extract_payload, inspect_file as inspect_chronicle_file, scan_table_index, BatchReceipt, PayloadReader, TableChronicleIndex};
+use capsule::{decode_capsule, derive_column_stats, derive_temporal_bounds, encode_capsule};
 
 const CATALOG_MAGIC: &[u8; 4] = b"ANC1";
 const CATALOG_END: &[u8; 4] = b"CEND";
@@ -60,6 +63,7 @@ pub enum DbError {
     BatchIdConflict(BatchId),
     ChronicleCorrupt(&'static str),
     IngestRowValidation { row_index: usize, message: String },
+    CapsuleCorrupt(&'static str),
 }
 
 impl fmt::Display for DbError {
@@ -86,6 +90,7 @@ impl fmt::Display for DbError {
             Self::BatchIdConflict(id) => write!(f, "BatchId {id} was already committed with a different payload"),
             Self::ChronicleCorrupt(message) => write!(f, "corrupt Chronicle record: {message}"),
             Self::IngestRowValidation { row_index, message } => write!(f, "ingestion row {row_index} failed validation: {message}"),
+            Self::CapsuleCorrupt(message) => write!(f, "corrupt Capsule: {message}"),
         }
     }
 }
@@ -721,6 +726,174 @@ impl Database {
         }
     }
 
+    /// Build one immutable Capsule from an inclusive contiguous range of committed Chronicle sequences.
+    ///
+    /// The current logical schema is used for the derived ANF payload. Historical source
+    /// batches are resolved by stable ColumnId. No Chronicle records are removed or hidden.
+    pub fn build_capsule(
+        &self,
+        table: &str,
+        capsule_id: u64,
+        generation: u64,
+        first_sequence: u64,
+        last_sequence: u64,
+        event_time_column: Option<&str>,
+    ) -> Result<PathBuf, DbError> {
+        if capsule_id == 0 || generation == 0 || first_sequence == 0 || last_sequence < first_sequence {
+            return Err(DbError::CapsuleCorrupt("Capsule identity, generation or source sequence range is invalid"));
+        }
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?
+            .clone();
+        let index = self.chronicle_indices.get(&definition.id)
+            .ok_or(DbError::CapsuleCorrupt("table has no Chronicle receipt index"))?;
+        let mut receipts = index.by_batch_id.values()
+            .filter(|receipt| receipt.metadata.sequence >= first_sequence
+                && receipt.metadata.sequence <= last_sequence)
+            .cloned()
+            .collect::<Vec<_>>();
+        receipts.sort_by_key(|receipt| receipt.metadata.sequence);
+        let expected_receipts = last_sequence.checked_sub(first_sequence)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(DbError::LengthOverflow)?;
+        if u64::try_from(receipts.len()).map_err(|_| DbError::LengthOverflow)? != expected_receipts {
+            return Err(DbError::CapsuleCorrupt("source sequence range is not fully committed and contiguous"));
+        }
+
+        let mut rows = Vec::new();
+        for (offset, receipt) in receipts.iter().enumerate() {
+            let expected_sequence = first_sequence.checked_add(offset as u64).ok_or(DbError::LengthOverflow)?;
+            if receipt.metadata.sequence != expected_sequence {
+                return Err(DbError::CapsuleCorrupt("source Chronicle sequences contain a gap"));
+            }
+            let record_bytes = fs::read(&receipt.path)?;
+            let (record_metadata, payload) = extract_payload(&record_bytes, definition.id.0)?;
+            if record_metadata.batch_id != receipt.metadata.batch_id
+                || record_metadata.sequence != receipt.metadata.sequence
+                || record_metadata.fingerprint != receipt.metadata.fingerprint
+            {
+                return Err(DbError::ChronicleCorrupt("receipt index differs from source Chronicle record"));
+            }
+            let mut batch_rows = self.decode_and_resolve_segment(table, &definition, &payload)?;
+            rows.append(&mut batch_rows);
+            let cells = rows.len().checked_mul(definition.schema.len()).ok_or(DbError::LengthOverflow)?;
+            if rows.len() > 1_000_000 || cells > 1_000_000 {
+                return Err(DbError::CapsuleCorrupt("Capsule exceeds ANF row or decoded-cell limits"));
+            }
+        }
+        if rows.is_empty() {
+            return Err(DbError::CapsuleCorrupt("Capsule cannot be empty"));
+        }
+
+        let event_time_index = match event_time_column {
+            Some(name) => {
+                let index = definition.schema.columns().iter().position(|column| column.name == name)
+                    .ok_or_else(|| DbError::ColumnNotFound(name.to_owned()))?;
+                if definition.schema.columns()[index].data_type != DataType::TimestampMicros {
+                    return Err(DbError::CapsuleCorrupt("event-time column must have type TIMESTAMP_MICROS"));
+                }
+                Some(index)
+            }
+            None => None,
+        };
+        let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let payload = encode_segment_v2(
+            &definition.schema,
+            &rows,
+            definition.id.0,
+            definition.schema_revision,
+            &column_ids,
+        )?;
+        let inspection = inspect_segment_v2_details(&payload)?;
+        let columns = derive_column_stats(&definition.schema, &column_ids, &rows, &inspection)?;
+        let event_time_column_id = event_time_index.map(|index| column_ids[index]);
+        let (temporal_min, temporal_max) = derive_temporal_bounds(&columns, event_time_column_id)?;
+        let metadata = CapsuleMetadata {
+            table_id: definition.id.0,
+            capsule_id,
+            generation,
+            schema_revision: definition.schema_revision,
+            row_count: u64::try_from(rows.len()).map_err(|_| DbError::LengthOverflow)?,
+            first_ingestion_sequence: first_sequence,
+            last_ingestion_sequence: last_sequence,
+            event_time_column_id,
+            temporal_min,
+            temporal_max,
+            payload_len: 0,
+            payload_sha256: [0; 32],
+            columns,
+        };
+        let capsule_bytes = encode_capsule(metadata, &payload)?;
+        let capsule_directory = self.root.join("data").join(table).join("capsules");
+        fs::create_dir_all(&capsule_directory)?;
+        publish_capsule(&capsule_directory, capsule_id, generation, &capsule_bytes)
+    }
+
+    /// Independently validate a Capsule file and recompute every statistic from its ANF payload.
+    pub fn validate_capsule(
+        &self,
+        table: &str,
+        capsule_id: u64,
+        generation: u64,
+    ) -> Result<CapsuleMetadata, DbError> {
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        if capsule_id == 0 || generation == 0 {
+            return Err(DbError::CapsuleCorrupt("Capsule identity and generation must be nonzero"));
+        }
+        let path = self.root.join("data").join(table).join("capsules")
+            .join(format!("capsule-{capsule_id:020}-g{generation:020}.cap"));
+        let file_len = fs::metadata(&path)?.len();
+        if file_len > capsule::MAX_CAPSULE_BYTES as u64 {
+            return Err(DbError::CapsuleCorrupt("Capsule file exceeds size limit"));
+        }
+        let bytes = fs::read(path)?;
+        let (metadata, payload) = decode_capsule(&bytes)?;
+        if metadata.table_id != definition.id.0
+            || metadata.capsule_id != capsule_id
+            || metadata.generation != generation
+        {
+            return Err(DbError::CapsuleCorrupt("Capsule identity does not match requested table/path"));
+        }
+        if metadata.schema_revision > definition.schema_revision {
+            return Err(DbError::CapsuleCorrupt("Capsule schema revision is newer than the current table"));
+        }
+        let snapshot = SchemaSnapshot::read_from(&self.root, definition.id, metadata.schema_revision)
+            .map_err(|_| DbError::CapsuleCorrupt("Capsule schema snapshot is missing or corrupt"))?;
+        let historical_schema = snapshot.schema()?;
+        let historical_ids = snapshot.column_ids().map(|id| id.0).collect::<Vec<_>>();
+        let rows = decode_segment_v2(
+            &payload,
+            &historical_schema,
+            definition.id.0,
+            metadata.schema_revision,
+            &historical_ids,
+        )?;
+        if rows.len() as u64 != metadata.row_count {
+            return Err(DbError::CapsuleCorrupt("Capsule row count differs from decoded payload"));
+        }
+        let inspection = inspect_segment_v2_details(&payload)?;
+        let recomputed = derive_column_stats(&historical_schema, &historical_ids, &rows, &inspection)?;
+        if !capsule_stats_equal(&metadata.columns, &recomputed) {
+            return Err(DbError::CapsuleCorrupt("Capsule column statistics do not match decoded payload"));
+        }
+        let (temporal_min, temporal_max) = derive_temporal_bounds(&recomputed, metadata.event_time_column_id)?;
+        if temporal_min != metadata.temporal_min || temporal_max != metadata.temporal_max {
+            return Err(DbError::CapsuleCorrupt("Capsule temporal bounds do not match decoded payload"));
+        }
+        let index = self.chronicle_indices.get(&definition.id)
+            .ok_or(DbError::CapsuleCorrupt("table Chronicle index is missing"))?;
+        let available_sequences = index.by_batch_id.values()
+            .map(|receipt| receipt.metadata.sequence)
+            .collect::<BTreeSet<_>>();
+        for sequence in metadata.first_ingestion_sequence..=metadata.last_ingestion_sequence {
+            if !available_sequences.contains(&sequence) {
+                return Err(DbError::CapsuleCorrupt("Capsule source Chronicle sequence is no longer available"));
+            }
+        }
+        Ok(metadata)
+    }
+
     /// Durable accepted counters are reconstructed from Chronicle receipts on open.
     /// Request/failure counters are process-local and reset after restart.
     pub fn ingestion_stats(&self, table: &str) -> Result<IngestionStats, DbError> {
@@ -1026,6 +1199,27 @@ fn resolve_rows_by_column_id(
         logical_rows.push(logical_row);
     }
     Ok(logical_rows)
+}
+
+
+fn capsule_values_equal(left: &Option<Value>, right: &Option<Value>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(Value::Float64(left)), Some(Value::Float64(right))) => left.to_bits() == right.to_bits(),
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn capsule_stats_equal(left: &[CapsuleColumnStats], right: &[CapsuleColumnStats]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|(left, right)| {
+        left.column_id == right.column_id
+            && left.data_type == right.data_type
+            && left.null_count == right.null_count
+            && left.encoded_bytes == right.encoded_bytes
+            && capsule_values_equal(&left.minimum, &right.minimum)
+            && capsule_values_equal(&left.maximum, &right.maximum)
+    })
 }
 
 fn validate_name(name: &str) -> Result<(), DbError> {
@@ -3321,6 +3515,163 @@ mod tests {
             Database::open(&path),
             Err(DbError::ChronicleCorrupt("record checksum mismatch"))
         ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+
+    #[test]
+    fn capsule_builds_from_contiguous_chronicle_range_and_validates_column_stats() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        let schema = Schema::new(vec![
+            Column::new("event_time", DataType::TimestampMicros, false),
+            Column::new("temperature", DataType::Float64, true),
+            Column::new("device", DataType::Utf8, false),
+            Column::new("all_null", DataType::Int64, true),
+        ]).unwrap();
+        db.create_table("telemetry", schema).unwrap();
+        let rows = vec![
+            vec![Value::TimestampMicros(100), Value::Float64(21.5), Value::Utf8("a".into()), Value::Null],
+            vec![Value::TimestampMicros(300), Value::Null, Value::Utf8("bb".into()), Value::Null],
+            vec![Value::TimestampMicros(200), Value::Float64(18.5), Value::Utf8("c".into()), Value::Null],
+        ];
+        for (index, row) in rows.iter().enumerate() {
+            db.ingest_batch(
+                "telemetry",
+                BatchId::from_bytes([20 + index as u8; 16]).unwrap(),
+                std::slice::from_ref(row),
+            ).unwrap();
+        }
+
+        let capsule_path = db.build_capsule("telemetry", 42, 1, 1, 3, Some("event_time")).unwrap();
+        assert!(capsule_path.is_file());
+        assert_eq!(
+            capsule_path.file_name().and_then(|name| name.to_str()),
+            Some("capsule-00000000000000000042-g00000000000000000001.cap")
+        );
+        let metadata = db.validate_capsule("telemetry", 42, 1).unwrap();
+        assert_eq!(metadata.row_count, 3);
+        assert_eq!((metadata.first_ingestion_sequence, metadata.last_ingestion_sequence), (1, 3));
+        assert_eq!(metadata.event_time_column_id, Some(db.column_id("telemetry", "event_time").unwrap().0));
+        assert_eq!((metadata.temporal_min, metadata.temporal_max), (Some(100), Some(300)));
+        assert_eq!(metadata.columns[1].null_count, 1);
+        assert_eq!(metadata.columns[1].minimum, Some(Value::Float64(18.5)));
+        assert_eq!(metadata.columns[1].maximum, Some(Value::Float64(21.5)));
+        assert_eq!(metadata.columns[2].minimum, None);
+        assert_eq!(metadata.columns[3].null_count, 3);
+        assert_eq!(metadata.columns[3].minimum, None);
+        assert_eq!(db.scan("telemetry").unwrap(), rows);
+
+        // Capsules are derived copies: all committed Chronicle records remain present.
+        let chronicle_count = fs::read_dir(path.join("data").join("telemetry")).unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("chr"))
+            .count();
+        assert_eq!(chronicle_count, 3);
+
+        // A new generation can coexist; the same identity/generation cannot overwrite.
+        let second_generation = db.build_capsule("telemetry", 42, 2, 1, 3, None).unwrap();
+        assert!(second_generation.is_file());
+        let second_metadata = db.validate_capsule("telemetry", 42, 2).unwrap();
+        assert_eq!(second_metadata.event_time_column_id, None);
+        assert_eq!(second_metadata.temporal_min, None);
+        assert!(matches!(
+            db.build_capsule("telemetry", 42, 1, 1, 3, Some("event_time")),
+            Err(DbError::Io(_))
+        ));
+        assert!(capsule_path.is_file());
+
+        assert!(matches!(
+            db.build_capsule("telemetry", 43, 1, 1, 4, Some("event_time")),
+            Err(DbError::CapsuleCorrupt("source sequence range is not fully committed and contiguous"))
+        ));
+        assert!(matches!(
+            db.build_capsule("telemetry", 44, 1, 1, 3, Some("device")),
+            Err(DbError::CapsuleCorrupt("event-time column must have type TIMESTAMP_MICROS"))
+        ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn capsule_build_resolves_historical_rows_into_current_schema_revision() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        let original = sample_schema();
+        db.create_table("telemetry", original).unwrap();
+        let old_rows = vec![vec![
+            Value::TimestampMicros(10),
+            Value::Utf8("old".into()),
+            Value::Float64(1.0),
+        ]];
+        db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([30; 16]).unwrap(),
+            &old_rows,
+        ).unwrap();
+
+        db.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
+        let new_rows = vec![vec![
+            Value::TimestampMicros(20),
+            Value::Utf8("new".into()),
+            Value::Float64(2.0),
+            Value::Float64(60.0),
+        ]];
+        db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([31; 16]).unwrap(),
+            &new_rows,
+        ).unwrap();
+
+        let path_to_capsule = db.build_capsule("telemetry", 5, 1, 1, 2, Some("timestamp")).unwrap();
+        let metadata = db.validate_capsule("telemetry", 5, 1).unwrap();
+        assert_eq!(metadata.schema_revision, 2);
+        assert_eq!(metadata.row_count, 2);
+        assert_eq!(metadata.columns.len(), 4);
+        assert_eq!(metadata.columns[3].null_count, 1);
+        assert_eq!(metadata.columns[3].minimum, Some(Value::Float64(60.0)));
+        assert_eq!(metadata.columns[3].maximum, Some(Value::Float64(60.0)));
+        assert!(path_to_capsule.is_file());
+        assert_eq!(db.scan("telemetry").unwrap(), vec![
+            vec![
+                Value::TimestampMicros(10),
+                Value::Utf8("old".into()),
+                Value::Float64(1.0),
+                Value::Null,
+            ],
+            new_rows[0].clone(),
+        ]);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn capsule_temp_files_are_cleaned_and_corruption_is_detected_by_validator() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(50),
+            Value::Utf8("capsule".into()),
+            Value::Float64(5.0),
+        ]];
+        db.ingest_batch("telemetry", BatchId::from_bytes([32; 16]).unwrap(), &rows).unwrap();
+        let capsule_path = db.build_capsule("telemetry", 9, 1, 1, 1, Some("timestamp")).unwrap();
+        drop(db);
+
+        let capsule_dir = path.join("data").join("telemetry").join("capsules");
+        let orphan_temp = capsule_dir.join(".capsule-00000000000000000010-g00000000000000000001.tmp");
+        fs::write(&orphan_temp, b"interrupted Capsule publication").unwrap();
+        let mut bytes = fs::read(&capsule_path).unwrap();
+        let payload_start = 144 + 3 * 48;
+        bytes[payload_start] ^= 1;
+        fs::write(&capsule_path, bytes).unwrap();
+
+        let reopened = Database::open(&path).unwrap();
+        assert!(!orphan_temp.exists());
+        assert!(matches!(
+            reopened.validate_capsule("telemetry", 9, 1),
+            Err(DbError::CapsuleCorrupt("Capsule checksum mismatch"))
+        ));
+        assert_eq!(reopened.scan("telemetry").unwrap(), rows);
         fs::remove_dir_all(path).unwrap();
     }
 
