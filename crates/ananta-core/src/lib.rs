@@ -2913,14 +2913,17 @@ mod tests {
 
         let table_dir = path.join("data").join("telemetry");
         let orphan_temp = table_dir.join(".segment-00000000000000000099.tmp");
+        let orphan_chronicle_temp = table_dir.join(".chronicle-00000000000000000100.tmp");
         let unrelated = table_dir.join(".segment-99.tmp");
         let unknown = table_dir.join("notes.txt");
         fs::write(&orphan_temp, b"interrupted segment write").unwrap();
+        fs::write(&orphan_chronicle_temp, b"interrupted Chronicle write").unwrap();
         fs::write(&unrelated, b"not a canonical temp segment").unwrap();
         fs::write(&unknown, b"leave untouched").unwrap();
 
         let reopened = Database::open(&path).unwrap();
         assert!(!orphan_temp.exists());
+        assert!(!orphan_chronicle_temp.exists());
         assert_eq!(fs::read(unrelated).unwrap(), b"not a canonical temp segment");
         assert_eq!(fs::read(unknown).unwrap(), b"leave untouched");
         assert_eq!(reopened.scan("telemetry").unwrap(), rows);
@@ -3174,6 +3177,91 @@ mod tests {
         let reopened = Database::open(&path).unwrap();
         assert_eq!(reopened.scan("telemetry").unwrap().len(), 4);
         assert_eq!(reopened.ingestion_stats("telemetry").unwrap().accepted_batches, 2);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_duplicate_retry_uses_the_original_schema_after_nullable_column_evolution() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let old_rows = vec![vec![
+            Value::TimestampMicros(100),
+            Value::Utf8("schema-v1".into()),
+            Value::Float64(10.0),
+        ]];
+        let id = BatchId::from_bytes([13; 16]).unwrap();
+        let accepted = db.ingest_batch("telemetry", id, &old_rows).unwrap();
+        assert_eq!(accepted.ingestion_sequence, 1);
+
+        db.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
+        let retry = db.ingest_batch("telemetry", id, &old_rows).unwrap();
+        assert_eq!(retry.outcome, IngestOutcome::Duplicate);
+        assert_eq!(retry.ingestion_sequence, 1);
+
+        let new_rows = vec![vec![
+            Value::TimestampMicros(200),
+            Value::Utf8("schema-v2".into()),
+            Value::Float64(20.0),
+            Value::Float64(30.0),
+        ]];
+        let next = db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([14; 16]).unwrap(),
+            &new_rows,
+        ).unwrap();
+        assert_eq!(next.ingestion_sequence, 2);
+        assert_eq!(db.scan("telemetry").unwrap(), vec![
+            vec![
+                Value::TimestampMicros(100),
+                Value::Utf8("schema-v1".into()),
+                Value::Float64(10.0),
+                Value::Null,
+            ],
+            new_rows[0].clone(),
+        ]);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_commit_file_recovers_an_uncertain_client_acknowledgement() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let table_id = db.table_id("telemetry").unwrap().0;
+        let schema_revision = db.table_schema_revision("telemetry").unwrap();
+        let column_ids = ["timestamp", "device", "temperature"]
+            .map(|name| db.column_id("telemetry", name).unwrap().0);
+        let rows = vec![vec![
+            Value::TimestampMicros(77),
+            Value::Utf8("ack-lost".into()),
+            Value::Float64(7.7),
+        ]];
+        let payload = encode_segment_v2(
+            db.schema("telemetry").unwrap(),
+            &rows,
+            table_id,
+            schema_revision,
+            &column_ids,
+        ).unwrap();
+        let batch_id = BatchId::from_bytes([15; 16]).unwrap();
+        let (record, _) = encode_record(table_id, batch_id, 1, schema_revision, 1, &payload).unwrap();
+        let directory = path.join("data").join("telemetry");
+        let final_path = publish_chronicle(&directory, 1, &record).unwrap();
+        assert!(final_path.exists());
+        drop(db);
+
+        let mut reopened = Database::open(&path).unwrap();
+        let retry = reopened.ingest_batch("telemetry", batch_id, &rows).unwrap();
+        assert_eq!(retry.outcome, IngestOutcome::Duplicate);
+        assert_eq!(retry.ingestion_sequence, 1);
+        let next = reopened.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([16; 16]).unwrap(),
+            &rows,
+        ).unwrap();
+        assert_eq!(next.ingestion_sequence, 2);
+        assert_eq!(reopened.scan("telemetry").unwrap(), vec![rows[0].clone(), rows[0].clone()]);
         fs::remove_dir_all(path).unwrap();
     }
 
