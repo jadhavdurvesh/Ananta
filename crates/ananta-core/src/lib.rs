@@ -13,6 +13,8 @@ mod segment_publication;
 mod chronicle;
 mod capsule;
 mod navigation_map;
+pub mod compaction;
+pub use compaction::{CompactionError, CompactionJobEvent, CompactionJobId, CompactionJobJournal, CompactionJobState, CompactionProgress, CompactionResourceLimits};
 pub use chronicle::{BatchId, IngestOutcome, IngestResult, IngestionStats};
 pub use capsule::{CapsuleColumnStats, CapsuleMetadata};
 pub use navigation_map::{CapsuleScanDiagnostics, CapsuleScanRequest, CapsuleScanResult, ColumnRangePredicate};
