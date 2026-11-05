@@ -195,3 +195,6 @@ The M3.1 exit gate also requires all existing workspace tests, formatting, Clipp
 ## 11. Explicit non-goals
 
 This contract does not implement a compaction scheduler, online ingestion during compaction, active-generation promotion, rollback, source reclamation, WAL, transactions, MVCC, AQL, query planning or production durability. It does not claim performance benefit. M3.2 must measure append-only, time-first and entity-first candidates on identical logical data; M3.3 owns generation promotion and rollback.
+
+
+**Implementation note (2026-11-05):** The Rust workspace now contains the CIM1 encoder/decoder, SHA-256 fingerprint calculation and structural validation for contiguous Capsule and Chronicle inventories. This does not verify on-disk files; exact file preflight, output-manifest encoding, provenance verification and compaction execution remain separate M3.1 tasks.
