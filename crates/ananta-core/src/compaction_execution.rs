@@ -236,7 +236,7 @@ impl Database {
         fs::create_dir_all(&weave_root)?;
         require_directory(&data_root)?;
         require_directory(&table_dir)?;
-        require_directory(&weave_root);
+        require_directory(&weave_root)?;
 
         let job_hex = hex(input.job_id.as_bytes());
         let compaction_root = table_dir.join("compaction");
@@ -424,6 +424,7 @@ impl Database {
                     emit(chunk)?;
                 }
             }
+            drop(emit);
             if artifact_refs.is_empty() {
                 return Err(DbError::CompactionPreflight("compaction produced no output artifacts"));
             }
@@ -476,9 +477,21 @@ impl Database {
 
         if let Err(error) = result {
             if let Some(state) = journal_state(&journal_path) {
-                if !state.is_terminal() && state != CompactionJobState::Publishing {
-                    if let Ok(event) = journal.append(CompactionJobState::Failed, progress) {
-                        let _ = append_compaction_journal_event(&journal_path, &event);
+                if !state.is_terminal() {
+                    if error.to_string().contains("cancelled")
+                        && matches!(state, CompactionJobState::ValidatingInputs | CompactionJobState::Running | CompactionJobState::Verifying)
+                    {
+                        if let Ok(requested) = journal.append(CompactionJobState::CancellationRequested, progress) {
+                            if append_compaction_journal_event(&journal_path, &requested).is_ok() {
+                                if let Ok(cancelled) = journal.append(CompactionJobState::Cancelled, progress) {
+                                    let _ = append_compaction_journal_event(&journal_path, &cancelled);
+                                }
+                            }
+                        }
+                    } else if state != CompactionJobState::Publishing || !final_dir.exists() {
+                        if let Ok(event) = journal.append(CompactionJobState::Failed, progress) {
+                            let _ = append_compaction_journal_event(&journal_path, &event);
+                        }
                     }
                 }
             }
