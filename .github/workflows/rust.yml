@@ -32,3 +32,20 @@ jobs:
           cargo run -p ananta-core --example basic
           test -s ananta-data/catalog/catalog.anc
           test -n "$(find ananta-data/data/telemetry -maxdepth 1 -type f -name '*.anf' -print -quit)"
+      - name: Benchmark bounded scan peak memory
+        run: |
+          set -euo pipefail
+          cargo build -p ananta-core --example memory_benchmark
+          BENCH=target/debug/examples/memory_benchmark
+          SMALL=/tmp/ananta-memory-small
+          LARGE=/tmp/ananta-memory-large
+          "$BENCH" generate "$SMALL" 5000 2048
+          "$BENCH" generate "$LARGE" 50000 2048
+          echo "=== Dataset growth check: 5k vs 50k rows, fixed 512-row batches ==="
+          "$BENCH" scan "$SMALL" 512
+          "$BENCH" scan "$LARGE" 512
+          echo "=== Batch growth check: 256 vs 1024 vs 4096 rows, fixed 50k-row dataset ==="
+          "$BENCH" scan "$LARGE" 256
+          "$BENCH" scan "$LARGE" 1024
+          "$BENCH" scan "$LARGE" 4096
+          rm -rf "$SMALL" "$LARGE"

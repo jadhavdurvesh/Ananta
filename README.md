@@ -87,3 +87,17 @@ Each call returns a `ScanBatchIter` yielding owned `RecordBatch` values. The fil
 ## Segment publication and recovery
 
 New segment writes use a same-directory temporary file, flush and sync its contents, then atomically publish the final `.anf` name with a no-overwrite hard link. On Unix the containing directory is synced after publication and temp-name removal. Opening a database acquires `.ananta.lock` and removes only canonical orphan temporary segment files. A stale lock left by a crash is not broken automatically: verify that no writer process remains, then remove `.ananta.lock` before reopening. A post-publication error is reported as `SegmentPublicationUncertain`; inspect the final segment path before retrying rather than risking a duplicate insert.
+
+## Bounded scan memory benchmark
+
+Run the isolated Linux memory benchmark with:
+
+```bash
+cargo build -p ananta-core --example memory_benchmark
+BENCH=target/debug/examples/memory_benchmark
+$BENCH generate /tmp/ananta-memory 50000 2048
+$BENCH scan /tmp/ananta-memory 512
+rm -rf /tmp/ananta-memory
+```
+
+Generation and scanning are separate process invocations. The scanner reports rows consumed, maximum decoded payload bytes in one batch, peak RSS from Linux `/proc/self/status` and elapsed time. The CI workflow runs the dataset-size and batch-size comparisons defined in the [benchmark specification](docs/specifications/bounded-scan-memory-benchmark-v0.1.md). In the initial Ubuntu CI measurement, a 10× increase in rows (5k to 50k) at 512-row batches changed peak RSS from 4,824 to 5,144 KiB; increasing the batch from 256 to 1,024 to 4,096 rows on 50k rows changed peak RSS from 3,992 to 7,240 to 20,036 KiB. These are workload-specific CI measurements, not universal memory guarantees.
