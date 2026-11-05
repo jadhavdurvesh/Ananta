@@ -98,6 +98,27 @@ A nonterminal state may transition to failed when an invariant or I/O operation 
 
 Progress is observational only. It is checkpointed at bounded work-unit boundaries and is never used as evidence that output is correct.
 
+### CJE1 journal event record
+
+The first runtime event codec uses a fixed 160-byte little-endian record:
+
+| Offset | Length | Field |
+|---:|---:|---|
+| 0 | 4 | Magic: `CJE1` |
+| 4 | 2 | Version: 1 |
+| 6 | 1 | State code |
+| 7 | 1 | Reserved zero |
+| 8 | 16 | JobId |
+| 24 | 8 | Attempt |
+| 32 | 8 | Monotonic event sequence |
+| 40 | 32 | Input-manifest SHA-256 |
+| 72 | 56 | Seven u64 counters: input bytes, output bytes, temporary bytes, working-memory bytes, rows processed, open files and current work-unit rows |
+| 128 | 32 | SHA-256 of bytes 0 through 127 |
+
+State codes are Planned=0, ValidatingInputs=1, Running=2, Verifying=3, Publishing=4, CancellationRequested=5, Completed=6, Cancelled=7, Failed=8 and Interrupted=9. Unknown state codes, nonzero reserved bytes, zero identity fields, wrong lengths and checksum mismatches are rejected.
+
+The current Rust implementation provides the event encoder/decoder and an in-memory state reducer with replay validation. Durable file append, fsync, crash-time journal recovery and filesystem-owned job staging are still unchecked M3.1 implementation work.
+
 Recovery rules:
 
 - If a valid output manifest is durably present and all referenced outputs pass independent verification, recovery may reconcile a missing final journal event to completed.
