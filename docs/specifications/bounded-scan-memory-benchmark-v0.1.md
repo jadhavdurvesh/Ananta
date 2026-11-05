@@ -18,7 +18,7 @@ The example has separate `generate` and `scan` commands. CI runs generation and 
 
 - Schema: `sequence INT64 NOT NULL`, `payload UTF8 NOT NULL`.
 - Payload length: 2,048 bytes per row.
-- Rows are persisted in 2,000-row insert segments.
+- Rows are persisted in 10,000-row insert segments.
 - Small dataset: 5,000 rows (about 10 MiB of raw UTF-8 payload).
 - Large dataset: 50,000 rows (about 100 MiB of raw UTF-8 payload).
 
