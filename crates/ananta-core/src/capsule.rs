@@ -132,9 +132,12 @@ fn min_max(data_type: DataType, values: &[&Value]) -> (Option<Value>, Option<Val
             (Some(Value::TimestampMicros(min)), Some(Value::TimestampMicros(max)))
         }
         DataType::Float64 => {
-            let mut min = f64::INFINITY;
-            let mut max = f64::NEG_INFINITY;
-            for value in values {
+            let Some(Value::Float64(first)) = values.first().copied() else {
+                return (None, None);
+            };
+            let mut min = *first;
+            let mut max = *first;
+            for value in values.iter().skip(1) {
                 if let Value::Float64(value) = value {
                     if value.total_cmp(&min).is_lt() { min = *value; }
                     if value.total_cmp(&max).is_gt() { max = *value; }
@@ -472,7 +475,7 @@ fn encode_scalar(data_type: DataType, value: Option<&Value>) -> Result<([u8; 8],
 
 fn decode_scalar(data_type: DataType, bytes: &[u8; 8], length: u8) -> Result<Value, DbError> {
     let value = match data_type {
-        DataType::Boolean if length == 1 && bytes[0] <= 1 => Value::Boolean(bytes[0] == 1),
+        DataType::Boolean if length == 1 && bytes[0] <= 1 && bytes[1..] == [0; 7] => Value::Boolean(bytes[0] == 1),
         DataType::Int32 if length == 4 && bytes[4..] == [0, 0, 0, 0] => {
             Value::Int32(i32::from_le_bytes(bytes[..4].try_into().map_err(|_| DbError::LengthOverflow)?))
         }
