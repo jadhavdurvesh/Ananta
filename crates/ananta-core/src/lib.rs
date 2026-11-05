@@ -59,6 +59,7 @@ pub enum DbError {
     EmptyBatch,
     BatchIdConflict(BatchId),
     ChronicleCorrupt(&'static str),
+    IngestRowValidation { row_index: usize, message: String },
 }
 
 impl fmt::Display for DbError {
@@ -84,6 +85,7 @@ impl fmt::Display for DbError {
             Self::EmptyBatch => f.write_str("an ingestion batch must contain at least one row"),
             Self::BatchIdConflict(id) => write!(f, "BatchId {id} was already committed with a different payload"),
             Self::ChronicleCorrupt(message) => write!(f, "corrupt Chronicle record: {message}"),
+            Self::IngestRowValidation { row_index, message } => write!(f, "ingestion row {row_index} failed validation: {message}"),
         }
     }
 }
@@ -649,10 +651,13 @@ impl Database {
             });
         }
 
-        for row in rows {
+        for (row_index, row) in rows.iter().enumerate() {
             if let Err(error) = definition.schema.validate_row(row) {
                 index.stats.rejected_requests = index.stats.rejected_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
-                return Err(DbError::Type(error));
+                return Err(DbError::IngestRowValidation {
+                    row_index,
+                    message: error.to_string(),
+                });
             }
         }
         let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
@@ -3121,7 +3126,7 @@ mod tests {
         ]];
         assert!(matches!(
             db.ingest_batch("telemetry", BatchId::from_bytes([6; 16]).unwrap(), &invalid),
-            Err(DbError::Type(_))
+            Err(DbError::IngestRowValidation { row_index: 0, .. })
         ));
         assert_eq!(db.scan("telemetry").unwrap(), Vec::<Vec<Value>>::new());
         assert_eq!(db.ingestion_stats("telemetry").unwrap().accepted_batches, 0);
