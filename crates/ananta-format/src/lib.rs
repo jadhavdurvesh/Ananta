@@ -4,6 +4,11 @@
 use ananta_types::{DataType, Schema, Value};
 use std::fmt;
 
+mod batch_reader;
+pub use batch_reader::{SegmentBatchReader, MAX_BATCH_ROWS};
+pub const MAX_BATCH_CELLS: usize = 1_000_000;
+pub const MAX_BATCH_COLUMNS: usize = 4_096;
+
 const MAGIC: &[u8; 4] = b"ANF1";
 const END_MAGIC: &[u8; 4] = b"AEND";
 const VERSION: u16 = 1;
@@ -28,6 +33,7 @@ pub enum FormatError {
     InvalidValue(&'static str),
     SchemaMismatch,
     Type(String),
+    Io(String),
     LengthOverflow,
     LimitExceeded(&'static str),
 }
@@ -45,6 +51,7 @@ impl fmt::Display for FormatError {
             Self::InvalidValue(message) => write!(f, "invalid ANF value: {message}"),
             Self::SchemaMismatch => f.write_str("ANF schema does not match requested schema"),
             Self::Type(message) => f.write_str(message),
+            Self::Io(message) => write!(f, "ANF I/O error: {message}"),
             Self::LengthOverflow => f.write_str("ANF length exceeds supported limits"),
             Self::LimitExceeded(limit) => write!(f, "ANF limit exceeded: {limit}"),
         }

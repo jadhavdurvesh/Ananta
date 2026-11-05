@@ -295,19 +295,22 @@ Specification: `docs/specifications/column-rename-reorder-v0.1.md`.
 
 Table rename/drop, column drop, type changes and non-null additions remain deferred until path identity, tombstones, backfill and compaction protocols are designed.
 
-## M1.3 Implement bounded read batches
-- [ ] Define a column-vector/batch representation.
-- [ ] Define batch row-count limits.
-- [ ] Define memory budget per scan.
-- [ ] Implement batch decoder for fixed-width numeric columns.
-- [ ] Implement batch decoder for UTF-8 and binary columns.
-- [ ] Implement null bitmap or a clearly documented initial null representation.
-- [ ] Expose projected scan batches.
-- [ ] Add early-stop/limit support to the scan iterator.
-- [ ] Ensure iterator errors are surfaced and not silently skipped.
-- [ ] Test batch boundaries at 0, 1, exact batch size and batch size + 1.
-- [ ] Measure peak memory while scanning a generated dataset.
-- [ ] Demonstrate memory bounded by batch size and selected columns.
+## M1.3 Implement bounded read batches — current work
+- [x] Define the columnar RecordBatch and streaming iterator contract.
+- [x] Set batch row bounds to 1–65,536 and define optional row limits.
+- [x] Define a fixed 64 KiB checksum scratch buffer and selected-column batch memory model.
+- [ ] Implement file-backed batch decoder for fixed-width numeric columns.
+- [ ] Implement file-backed batch decoder for UTF-8 and binary columns.
+- [ ] Validate null markers and current schema nullability while decoding batches.
+- [ ] Expose full and projected scan batch APIs for ANF v0.1/v0.2.
+- [ ] Add row-limit/early-stop support across segment boundaries.
+- [ ] Ensure iterator errors are surfaced once and stop iteration.
+- [ ] Test empty, 1, exact batch size and batch size + 1 boundaries.
+- [ ] Test projection order, repeated projections and mixed schema revisions.
+- [ ] Measure or instrument bounded batch memory on a generated dataset.
+- [ ] Demonstrate decoded memory scales with batch rows and selected columns, not total result rows.
+
+Specification: `docs/specifications/bounded-read-batches-v0.1.md`.
 
 ## M1.4 Safe segment publication
 - [ ] Define segment states: temporary, published and obsolete.

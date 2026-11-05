@@ -1,9 +1,9 @@
-use ananta_format::{decode_projected_segment, decode_segment_v2, encode_segment_v2, inspect_segment_v2, segment_version, FormatError, MAX_SEGMENT_BYTES};
+use ananta_format::{decode_projected_segment, decode_segment_v2, encode_segment_v2, inspect_segment_v2, segment_version, FormatError, SegmentBatchReader, MAX_BATCH_CELLS, MAX_BATCH_COLUMNS, MAX_BATCH_ROWS, MAX_SEGMENT_BYTES};
 use ananta_types::{Column, DataType, Schema, TypeError, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub mod schema_snapshot;
@@ -87,6 +87,189 @@ struct TableDefinition {
     schema_revision: u64,
     column_ids: Vec<ObjectId>,
     schema: Schema,
+}
+
+
+/// One typed output column in a RecordBatch. Duplicate names are allowed here because
+/// a projection may explicitly request the same logical column more than once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchColumn {
+    pub column: Column,
+    pub values: Vec<Value>,
+}
+
+/// An owned, columnar batch. Field descriptors preserve caller order and may
+/// repeat a logical column when the projection requests it more than once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordBatch {
+    pub columns: Vec<BatchColumn>,
+    pub row_count: usize,
+}
+
+impl RecordBatch {
+    pub fn row_count(&self) -> usize { self.row_count }
+    pub fn column(&self, index: usize) -> Option<&[Value]> {
+        self.columns.get(index).map(|column| column.values.as_slice())
+    }
+    pub fn column_by_name(&self, name: &str) -> Option<&[Value]> {
+        self.columns.iter().find(|column| column.column.name == name)
+            .map(|column| column.values.as_slice())
+    }
+}
+
+struct ActiveScanSegment {
+    decoder: SegmentBatchReader<File>,
+    output_slots: Vec<Option<usize>>,
+}
+
+/// Stateful scan iterator. It opens one segment at a time and never materialises
+/// the complete table result.
+pub struct ScanBatchIter {
+    root: PathBuf,
+    current: TableDefinition,
+    projection: Vec<usize>,
+    segments: Vec<PathBuf>,
+    next_segment: usize,
+    batch_rows: usize,
+    remaining_limit: Option<usize>,
+    active: Option<ActiveScanSegment>,
+    terminal: bool,
+}
+
+impl ScanBatchIter {
+    fn open_next_segment(&mut self) -> Result<bool, DbError> {
+        if self.next_segment >= self.segments.len() {
+            return Ok(false);
+        }
+        let path = self.segments[self.next_segment].clone();
+        self.next_segment += 1;
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut version_bytes = [0_u8; 6];
+        file.read_exact(&mut version_bytes)?;
+        if &version_bytes[..4] != b"ANF1" {
+            return Err(DbError::Format(FormatError::InvalidMagic));
+        }
+        let version = u16::from_le_bytes([version_bytes[4], version_bytes[5]]);
+        let (snapshot_revision, expected_v2) = match version {
+            1 => (1, None),
+            2 => {
+                let mut header = [0_u8; 36];
+                file.seek(SeekFrom::Start(0))?;
+                file.read_exact(&mut header)?;
+                let table_id = u64::from_le_bytes(header[20..28].try_into().map_err(|_| DbError::LengthOverflow)?);
+                let revision = u64::from_le_bytes(header[28..36].try_into().map_err(|_| DbError::LengthOverflow)?);
+                if table_id != self.current.id.0 || table_id == 0 || revision == 0 {
+                    return Err(DbError::SchemaCompatibility("segment table identity or schema revision is invalid"));
+                }
+                if revision > self.current.schema_revision {
+                    return Err(DbError::SchemaCompatibility("segment schema revision is newer than the current catalog schema"));
+                }
+                (revision, Some((table_id, revision)))
+            }
+            other => return Err(DbError::Format(FormatError::UnsupportedVersion(other))),
+        };
+
+        let snapshot = SchemaSnapshot::read_from(&self.root, self.current.id, snapshot_revision)
+            .map_err(|_| DbError::SchemaCompatibility("segment schema snapshot is missing or invalid"))?;
+        if snapshot.table_id() != self.current.id {
+            return Err(DbError::SchemaCompatibility("schema snapshot table ID does not match current table"));
+        }
+        let physical_schema = snapshot.schema()?;
+        let historical_ids = snapshot.column_ids().collect::<Vec<_>>();
+        let mut physical_projection = Vec::new();
+        let mut output_slots = Vec::with_capacity(self.projection.len());
+        for current_index in &self.projection {
+            let current_column = &self.current.schema.columns()[*current_index];
+            let current_id = self.current.column_ids[*current_index];
+            match historical_ids.iter().position(|id| *id == current_id) {
+                Some(physical_index) => {
+                    if physical_schema.columns()[physical_index].data_type != current_column.data_type {
+                        return Err(DbError::SchemaCompatibility("column data type changed across schema revisions"));
+                    }
+                    output_slots.push(Some(physical_projection.len()));
+                    physical_projection.push(physical_index);
+                }
+                None if current_column.nullable => output_slots.push(None),
+                None => return Err(DbError::SchemaCompatibility("a non-nullable current column is absent from an older segment")),
+            }
+        }
+
+        let expected_identity = match expected_v2 {
+            Some((table_id, revision)) => {
+                Some((table_id, revision, historical_ids.iter().map(|id| id.0).collect::<Vec<_>>()))
+            }
+            None => None,
+        };
+        let decoder = SegmentBatchReader::new(
+            file,
+            &physical_schema,
+            &physical_projection,
+            expected_identity,
+        )?;
+        self.active = Some(ActiveScanSegment { decoder, output_slots });
+        Ok(true)
+    }
+}
+
+impl Iterator for ScanBatchIter {
+    type Item = Result<RecordBatch, DbError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.terminal || self.remaining_limit == Some(0) {
+            return None;
+        }
+        loop {
+            if self.active.is_none() {
+                match self.open_next_segment() {
+                    Ok(true) => {}
+                    Ok(false) => return None,
+                    Err(error) => {
+                        self.terminal = true;
+                        return Some(Err(error));
+                    }
+                }
+            }
+
+            let active = self.active.as_mut().expect("active segment was opened");
+            let requested = self.remaining_limit.map_or(self.batch_rows, |limit| self.batch_rows.min(limit));
+            let take = requested.min(active.decoder.remaining_rows());
+            if take == 0 {
+                self.active = None;
+                continue;
+            }
+            let decoded = match active.decoder.next_batch(take) {
+                Ok(Some(columns)) => columns,
+                Ok(None) => {
+                    self.active = None;
+                    continue;
+                }
+                Err(error) => {
+                    self.terminal = true;
+                    self.active = None;
+                    return Some(Err(DbError::Format(error)));
+                }
+            };
+            let mut output_columns = Vec::with_capacity(active.output_slots.len());
+            for (output_index, slot) in active.output_slots.iter().enumerate() {
+                let values = match slot {
+                    Some(index) => decoded[*index].clone(),
+                    None => vec![Value::Null; take],
+                };
+                output_columns.push(BatchColumn {
+                    column: self.current.schema.columns()[self.projection[output_index]].clone(),
+                    values,
+                });
+            }
+            if let Some(limit) = &mut self.remaining_limit {
+                *limit -= take;
+            }
+            return Some(Ok(RecordBatch {
+                columns: output_columns,
+                row_count: take,
+            }));
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -390,6 +573,113 @@ impl Database {
             projection.push(index);
         }
         self.scan_projected_indices(table, &projection)
+    }
+
+
+    /// Scan all logical columns in bounded columnar batches.
+    pub fn scan_batches(&self, table: &str, batch_rows: usize) -> Result<ScanBatchIter, DbError> {
+        let schema = self.schema(table)?;
+        let projection = (0..schema.len()).collect::<Vec<_>>();
+        self.scan_indices_batches(table, projection, batch_rows, None)
+    }
+
+    /// Scan selected logical columns in caller order, preserving duplicate projections.
+    pub fn scan_columns_batches(
+        &self,
+        table: &str,
+        columns: &[&str],
+        batch_rows: usize,
+    ) -> Result<ScanBatchIter, DbError> {
+        let schema = self.schema(table)?;
+        let mut projection = Vec::with_capacity(columns.len());
+        for name in columns {
+            let index = schema.columns().iter().position(|column| column.name == *name)
+                .ok_or_else(|| DbError::ColumnNotFound((*name).to_owned()))?;
+            projection.push(index);
+        }
+        self.scan_indices_batches(table, projection, batch_rows, None)
+    }
+
+    /// Scan all columns with an optional global row limit.
+    pub fn scan_batches_with_limit(
+        &self,
+        table: &str,
+        batch_rows: usize,
+        row_limit: usize,
+    ) -> Result<ScanBatchIter, DbError> {
+        let schema = self.schema(table)?;
+        let projection = (0..schema.len()).collect::<Vec<_>>();
+        self.scan_indices_batches(table, projection, batch_rows, Some(row_limit))
+    }
+
+    /// Projected bounded scan with an optional global row limit.
+    pub fn scan_columns_batches_with_limit(
+        &self,
+        table: &str,
+        columns: &[&str],
+        batch_rows: usize,
+        row_limit: usize,
+    ) -> Result<ScanBatchIter, DbError> {
+        let schema = self.schema(table)?;
+        let mut projection = Vec::with_capacity(columns.len());
+        for name in columns {
+            let index = schema.columns().iter().position(|column| column.name == *name)
+                .ok_or_else(|| DbError::ColumnNotFound((*name).to_owned()))?;
+            projection.push(index);
+        }
+        self.scan_indices_batches(table, projection, batch_rows, Some(row_limit))
+    }
+
+    fn scan_indices_batches(
+        &self,
+        table: &str,
+        projection: Vec<usize>,
+        batch_rows: usize,
+        row_limit: Option<usize>,
+    ) -> Result<ScanBatchIter, DbError> {
+        if batch_rows == 0 || batch_rows > MAX_BATCH_ROWS {
+            return Err(DbError::Format(FormatError::LimitExceeded(
+                "batch row count must be between 1 and 65536",
+            )));
+        }
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        if projection.is_empty() {
+            return Err(DbError::Format(FormatError::InvalidValue("projection cannot be empty")));
+        }
+        if let Some(index) = projection.iter().find(|index| **index >= definition.schema.len()) {
+            return Err(DbError::Format(FormatError::InvalidProjection(*index)));
+        }
+        if projection.len() > MAX_BATCH_COLUMNS {
+            return Err(DbError::Format(FormatError::LimitExceeded("batch projection column count")));
+        }
+
+        let effective_batch_rows = batch_rows.min((MAX_BATCH_CELLS / projection.len()).max(1));
+        let mut segments = Vec::new();
+        if row_limit != Some(0) {
+            let table_dir = self.root.join("data").join(table);
+            for entry in fs::read_dir(&table_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_type()?.is_file()
+                    && path.extension().and_then(|extension| extension.to_str()) == Some("anf")
+                {
+                    segments.push(path);
+                }
+            }
+            segments.sort();
+        }
+        Ok(ScanBatchIter {
+            root: self.root.clone(),
+            current: definition.clone(),
+            projection,
+            segments,
+            next_segment: 0,
+            batch_rows: effective_batch_rows,
+            remaining_limit: row_limit,
+            active: None,
+            terminal: false,
+        })
     }
 
     fn scan_projected_indices(
@@ -2247,4 +2537,168 @@ mod tests {
         assert!(db.scan_columns("telemetry", &["missing"]).is_err());
         fs::remove_dir_all(path).unwrap();
     }
+
+    fn batches_to_rows(batches: Vec<RecordBatch>) -> Vec<Vec<Value>> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            for row_index in 0..batch.row_count {
+                rows.push(batch.columns.iter().map(|column| column.values[row_index].clone()).collect());
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn bounded_scan_returns_projected_columnar_batches_and_honours_limit() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let first_rows = vec![
+            vec![Value::TimestampMicros(1), Value::Utf8("a".into()), Value::Float64(1.0)],
+            vec![Value::TimestampMicros(2), Value::Utf8("b".into()), Value::Null],
+            vec![Value::TimestampMicros(3), Value::Utf8("c".into()), Value::Float64(3.0)],
+        ];
+        let second_rows = vec![
+            vec![Value::TimestampMicros(4), Value::Utf8("d".into()), Value::Float64(4.0)],
+            vec![Value::TimestampMicros(5), Value::Utf8("e".into()), Value::Float64(5.0)],
+        ];
+        db.insert_batch("telemetry", &first_rows).unwrap();
+        db.insert_batch("telemetry", &second_rows).unwrap();
+
+        let batches = db.scan_batches("telemetry", 2).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches.iter().map(|batch| batch.row_count).collect::<Vec<_>>(), vec![2, 1, 2]);
+        assert!(batches.iter().all(|batch| batch.row_count <= 2));
+        let mut expected = first_rows.clone();
+        expected.extend(second_rows.clone());
+        assert_eq!(batches_to_rows(batches), expected);
+
+        let projected = db.scan_columns_batches("telemetry", &["device", "temperature", "device"], 2).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            projected[0].columns.iter().map(|column| column.column.name.as_str()).collect::<Vec<_>>(),
+            vec!["device", "temperature", "device"]
+        );
+        assert_eq!(
+            batches_to_rows(projected),
+            vec![
+                vec![Value::Utf8("a".into()), Value::Float64(1.0), Value::Utf8("a".into())],
+                vec![Value::Utf8("b".into()), Value::Null, Value::Utf8("b".into())],
+                vec![Value::Utf8("c".into()), Value::Float64(3.0), Value::Utf8("c".into())],
+                vec![Value::Utf8("d".into()), Value::Float64(4.0), Value::Utf8("d".into())],
+                vec![Value::Utf8("e".into()), Value::Float64(5.0), Value::Utf8("e".into())],
+            ]
+        );
+
+        db.create_table("exact", sample_schema()).unwrap();
+        db.insert_batch("exact", &first_rows[..2]).unwrap();
+        let exact = db.scan_batches("exact", 2).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(exact.iter().map(|batch| batch.row_count).collect::<Vec<_>>(), vec![2]);
+
+        let limited = db.scan_columns_batches_with_limit(
+            "telemetry",
+            &["timestamp", "device"],
+            2,
+            3,
+        ).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(limited.iter().map(|batch| batch.row_count).collect::<Vec<_>>(), vec![2, 1]);
+        assert_eq!(
+            batches_to_rows(limited),
+            vec![
+                vec![Value::TimestampMicros(1), Value::Utf8("a".into())],
+                vec![Value::TimestampMicros(2), Value::Utf8("b".into())],
+                vec![Value::TimestampMicros(3), Value::Utf8("c".into())],
+            ]
+        );
+
+        assert!(db.scan_batches_with_limit("telemetry", 2, 0).unwrap().next().is_none());
+        assert!(db.scan_batches("telemetry", 0).is_err());
+        assert!(db.scan_batches("telemetry", MAX_BATCH_ROWS + 1).is_err());
+        assert!(db.scan_columns_batches("telemetry", &[], 2).is_err());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_scan_handles_empty_tables_and_one_row_batches() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        assert!(db.scan_batches("telemetry", 1).unwrap().next().is_none());
+
+        let rows = vec![
+            vec![Value::TimestampMicros(1), Value::Utf8("a".into()), Value::Float64(1.0)],
+            vec![Value::TimestampMicros(2), Value::Utf8("b".into()), Value::Float64(2.0)],
+        ];
+        db.insert_batch("telemetry", &rows).unwrap();
+        let batches = db.scan_batches("telemetry", 1).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches.iter().map(|batch| batch.row_count).collect::<Vec<_>>(), vec![1, 1]);
+        assert_eq!(batches_to_rows(batches), rows);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_scan_maps_legacy_columns_after_nullable_addition_and_reopen() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        let original = sample_schema();
+        db.create_table("telemetry", original.clone()).unwrap();
+        let old_rows = vec![
+            vec![Value::TimestampMicros(1), Value::Utf8("legacy-a".into()), Value::Float64(10.0)],
+            vec![Value::TimestampMicros(2), Value::Utf8("legacy-b".into()), Value::Float64(20.0)],
+        ];
+        let table_dir = path.join("data").join("telemetry");
+        fs::write(
+            table_dir.join("segment-00000000000000000001.anf"),
+            encode_segment(&original, &old_rows).unwrap(),
+        ).unwrap();
+        db.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
+        let new_rows = vec![
+            vec![Value::TimestampMicros(3), Value::Utf8("new-c".into()), Value::Float64(30.0), Value::Float64(40.0)],
+        ];
+        db.insert_batch("telemetry", &new_rows).unwrap();
+
+        let batches = db.scan_columns_batches("telemetry", &["humidity", "device"], 1).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches_to_rows(batches), vec![
+            vec![Value::Null, Value::Utf8("legacy-a".into())],
+            vec![Value::Null, Value::Utf8("legacy-b".into())],
+            vec![Value::Float64(40.0), Value::Utf8("new-c".into())],
+        ]);
+
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        let reopened_batches = reopened.scan_columns_batches("telemetry", &["humidity"], 2).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches_to_rows(reopened_batches), vec![
+            vec![Value::Null],
+            vec![Value::Null],
+            vec![Value::Float64(40.0)],
+        ]);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_scan_returns_corrupt_segment_error_once_then_stops() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("sensor".into()),
+            Value::Float64(12.5),
+        ]];
+        let segment = db.insert_batch("telemetry", &rows).unwrap().unwrap();
+        let mut bytes = fs::read(&segment).unwrap();
+        let last_payload = bytes.len() - 13;
+        bytes[last_payload] ^= 1;
+        fs::write(&segment, bytes).unwrap();
+
+        let mut iter = db.scan_batches("telemetry", 1).unwrap();
+        assert!(matches!(iter.next(), Some(Err(DbError::Format(FormatError::ChecksumMismatch)))));
+        assert!(iter.next().is_none());
+        fs::remove_dir_all(path).unwrap();
+    }
+
 }

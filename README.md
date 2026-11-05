@@ -41,6 +41,7 @@ The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source
 - [ADR 0005: immutable schema snapshots](docs/decisions/0005-schema-evolution-needs-immutable-snapshots.md)
 - [ANS1 v1 schema snapshot format](docs/specifications/schema-snapshot-ans1-v1.md)
 - [ANF v0.2 segment identity format](docs/specifications/anf-v0.2-prototype.md)
+- [Bounded read batch contract](docs/specifications/bounded-read-batches-v0.1.md)
 - [Nullable-column DDL specification](docs/specifications/nullable-column-ddl-v0.1.md)
 - [Column rename and reorder specification](docs/specifications/column-rename-reorder-v0.1.md)
 - [ADR 0004: stable catalog object identity](docs/decisions/0004-stable-catalog-object-identity.md)
@@ -67,3 +68,14 @@ The existing ClickHouse/PostgreSQL setup is retained for external comparisons an
 The benchmark runner and layout lab remain research tools for reference database experiments. Native ANANTA will need its own benchmark implementation and correctness-verified comparisons before direct performance claims.
 
 See `docs/decisions/` and `workloads/README.md`. Workloads are optional; Fire Bot is not a database dependency.
+
+## Native scan APIs
+
+The embedded Rust API provides bounded columnar reads:
+
+- `Database::scan_batches(table, batch_rows)` scans all logical columns.
+- `Database::scan_columns_batches(table, columns, batch_rows)` reads a projection in caller order.
+- `Database::scan_batches_with_limit(table, batch_rows, row_limit)` stops after a global row count.
+- `Database::scan_columns_batches_with_limit(table, columns, batch_rows, row_limit)` combines projection and early stop.
+
+Each call returns a `ScanBatchIter` yielding owned `RecordBatch` values. The file-backed decoder verifies each whole-segment checksum in fixed-size chunks, then decodes only selected column values for the next batch. Batch size is limited by the requested row bound, a 65,536-row maximum and a 1,000,000-cell output cap. ANF v0.1 and v0.2 segments are resolved against their historical schema snapshots; newly added nullable columns are emitted as NULL for older segments. This remains an experimental single-writer scan API, not a transactionally isolated query engine.
