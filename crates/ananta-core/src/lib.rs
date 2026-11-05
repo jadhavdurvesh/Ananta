@@ -849,15 +849,9 @@ impl Database {
         let (_, payload) = decode_capsule(&bytes)?;
         let snapshot = SchemaSnapshot::read_from(&self.root, definition.id, metadata.schema_revision)
             .map_err(|_| DbError::CapsuleCorrupt("Capsule schema snapshot is missing or corrupt"))?;
-        let schema = snapshot.schema()?;
-        let column_ids = snapshot.column_ids().map(|id| id.0).collect::<Vec<_>>();
-        decode_segment_v2(
-            &payload,
-            &schema,
-            definition.id.0,
-            metadata.schema_revision,
-            &column_ids,
-        ).map_err(DbError::Format)
+        // Resolve the historical Capsule schema into the current logical schema,
+        // synthesising NULL for nullable columns added after this Capsule was built.
+        self.decode_and_resolve_segment(table, definition, &payload)
     }
 
     /// Independently validate a Capsule file and recompute every statistic from its ANF payload.
