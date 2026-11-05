@@ -1,7 +1,7 @@
 //! Snapshot-first publication for the first supported schema change.
 
 use super::{
-    allocate_object_id, increment_catalog_revision, save_catalog, validate_name, Database,
+    allocate_object_id, increment_catalog_revision, save_catalog, Database,
     DbError, ObjectId,
 };
 use crate::schema_snapshot::SchemaSnapshot;
@@ -21,8 +21,6 @@ impl Database {
         data_type: DataType,
     ) -> Result<ObjectId, DbError> {
         let name = name.into();
-        validate_name(&name)?;
-
         let current = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
 
