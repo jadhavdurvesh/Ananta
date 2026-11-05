@@ -1,6 +1,6 @@
 # 0004: Stable catalog object identity
 
-- **Status:** Proposed for M1.2.1
+- **Status:** Accepted for M1.2.1; implementation is underway in M1.2.2
 - **Date:** 2026-11-05
 - **Decision scope:** Native catalog identity semantics; implementation is deferred to M1.2.2
 
