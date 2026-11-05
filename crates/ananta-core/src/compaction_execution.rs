@@ -226,6 +226,12 @@ impl Database {
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         let schema = &definition.schema;
         let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        if input.expected_row_count > MAX_VERIFY_ROWS {
+            return Err(DbError::CompactionExecution(format!(
+                "manifest row count {} exceeds the prototype's hard verification bound {}",
+                input.expected_row_count, MAX_VERIFY_ROWS
+            )));
+        }
         if input.expected_row_count > limits.max_rows {
             return Err(DbError::CompactionExecution(format!(
                 "row budget {} is below the manifest row count {}",
@@ -289,7 +295,6 @@ impl Database {
         }
         fs::create_dir(&stage_dir)?;
         let input_manifest_bytes = input.encode()?;
-        write_new_synced(&stage_dir.join("input.cim"), &input_manifest_bytes)?;
         progress.temporary_bytes = u64::try_from(input_manifest_bytes.len()).map_err(|_| DbError::LengthOverflow)?;
         limits.check(&CompactionProgress {
             input_bytes: preflight.total_source_bytes,
@@ -297,6 +302,7 @@ impl Database {
             open_files: 1,
             ..CompactionProgress::default()
         }).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+        write_new_synced(&stage_dir.join("input.cim"), &input_manifest_bytes)?;
 
         let result = (|| -> Result<CompactionExecutionReport, DbError> {
             let rechecked = self.preflight_compaction_inputs(table, input)?;
