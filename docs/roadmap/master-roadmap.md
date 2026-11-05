@@ -768,4 +768,4 @@ Do these in order. Do not skip ahead.
 10. [ ] Mark M0 complete only after all exit criteria pass.
 11. [ ] Start M1 with exactly one small PR: the ANF format/golden-fixture and safety work package.
 
-**Current focus: M1.2.3.1 — review immutable schema snapshots and mixed-segment compatibility. Do not enable DDL APIs until snapshot history and ANF v0.2 resolution are implemented and tested.**
+**Current focus: M1.2.3.3 — implement ANF v0.2 segment identity and a dual-version reader. Keep schema-changing DDL disabled until mixed-revision reads are proven.**

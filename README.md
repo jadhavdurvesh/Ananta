@@ -39,6 +39,7 @@ The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source
 - [Catalog v2 binary format](docs/specifications/catalog-v2-binary-format.md)
 - [Schema evolution compatibility proposal](docs/specifications/schema-evolution-compatibility.md)
 - [ADR 0005: immutable schema snapshots](docs/decisions/0005-schema-evolution-needs-immutable-snapshots.md)
+- [ANS1 v1 schema snapshot format](docs/specifications/schema-snapshot-ans1-v1.md)
 - [ADR 0004: stable catalog object identity](docs/decisions/0004-stable-catalog-object-identity.md)
 - [ChronoWeave storage research proposal](docs/specifications/chronoweave-storage-research.md)
 - [ANANTA Studio and developer platform roadmap](docs/roadmap/studio-and-platform.md)
