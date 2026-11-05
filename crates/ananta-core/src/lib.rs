@@ -276,7 +276,7 @@ impl Database {
                         }
 
                         match SchemaSnapshot::read_from(&self.root, table_id, revision) {
-                            Ok(snapshot) => match current.get(&table_id) {
+                            Ok(_) => match current.get(&table_id) {
                                 None => report.orphaned_files.push(path),
                                 Some(current_revision) if revision > *current_revision => {
                                     report.orphaned_files.push(path)
