@@ -617,7 +617,7 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, CompactionError> {
 }
 
 #[cfg(test)]
-mod tests {
+mod cim_tests {
     use super::*;
 
     fn job_id() -> CompactionJobId {
