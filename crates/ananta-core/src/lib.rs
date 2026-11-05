@@ -16,7 +16,7 @@ mod navigation_map;
 mod compaction_execution;
 mod active_generation;
 pub use active_generation::{ActiveWeaveGeneration, ActiveWeavePointer};
-pub use compaction_execution::{CompactionExecutionReport, RowOrigin};
+pub use compaction_execution::{CompactionExecutionReport, CompactionReadMeasurement, RowOrigin};
 pub mod compaction;
 pub mod compaction_manifest;
 pub use compaction_manifest::{CapsuleSourceReference, ChronicleReceiptReference, CompactionInputManifest, ManifestError};
