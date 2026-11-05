@@ -15,6 +15,9 @@ const CHRONICLE_SUFFIX: &str = ".chr";
 const CAPSULE_PREFIX: &str = "capsule-";
 const TEMP_CAPSULE_PREFIX: &str = ".capsule-";
 const CAPSULE_SUFFIX: &str = ".cap";
+const NAVIGATION_PREFIX: &str = "navigation-";
+const TEMP_NAVIGATION_PREFIX: &str = ".navigation-";
+const NAVIGATION_SUFFIX: &str = ".nvm";
 
 /// Exclusive local writer lock. Stale locks are deliberately not broken automatically.
 pub(crate) struct DatabaseLock {
@@ -265,6 +268,49 @@ pub(crate) fn publish_capsule(
     Ok(final_path)
 }
 
+pub(crate) fn publish_navigation_map(
+    directory: &Path,
+    generation: u64,
+    bytes: &[u8],
+) -> Result<PathBuf, DbError> {
+    if generation == 0 {
+        return Err(DbError::LengthOverflow);
+    }
+    let final_path = directory.join(format!("{NAVIGATION_PREFIX}{generation:020}{NAVIGATION_SUFFIX}"));
+    let temp_path = directory.join(format!("{TEMP_NAVIGATION_PREFIX}{generation:020}{TEMP_SEGMENT_SUFFIX}"));
+    let mut temporary_owned = false;
+    let mut published = false;
+    let result = (|| -> Result<(), DbError> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp_path)?;
+        temporary_owned = true;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&temp_path, &final_path)?;
+        published = true;
+        sync_directory(directory)?;
+        fs::remove_file(&temp_path)?;
+        temporary_owned = false;
+        sync_directory(directory)?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        if !published && temporary_owned {
+            let _ = fs::remove_file(&temp_path);
+        }
+        if published {
+            return Err(DbError::SegmentPublicationUncertain {
+                path: final_path,
+                reason: error.to_string(),
+            });
+        }
+        return Err(error);
+    }
+    Ok(final_path)
+}
+
 /// Remove only canonical regular-file temp segments. Temp names are never committed.
 pub(crate) fn cleanup_orphan_segment_temps(data_root: &Path) -> Result<Vec<PathBuf>, DbError> {
     let mut removed = Vec::new();
@@ -289,7 +335,7 @@ pub(crate) fn cleanup_orphan_segment_temps(data_root: &Path) -> Result<Vec<PathB
                     let Some(filename) = capsule_path.file_name().and_then(|name| name.to_str()) else {
                         continue;
                     };
-                    if is_canonical_temp_capsule_name(filename) {
+                    if is_canonical_temp_capsule_name(filename) || is_canonical_temp_navigation_name(filename) {
                         fs::remove_file(&capsule_path)?;
                         removed.push(capsule_path);
                         sync_directory(&path)?;
@@ -318,6 +364,15 @@ pub(crate) fn cleanup_orphan_segment_temps(data_root: &Path) -> Result<Vec<PathB
 }
 
 
+
+
+fn is_canonical_temp_navigation_name(filename: &str) -> bool {
+    let Some(value) = filename.strip_prefix(TEMP_NAVIGATION_PREFIX)
+        .and_then(|value| value.strip_suffix(TEMP_SEGMENT_SUFFIX))
+    else { return false; };
+    value.len() == 20 && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok_and(|id| id != 0 && format!("{id:020}") == value)
+}
 
 fn is_canonical_temp_capsule_name(filename: &str) -> bool {
     let Some(value) = filename.strip_prefix(TEMP_CAPSULE_PREFIX)
@@ -391,14 +446,27 @@ mod tests {
         let unrelated = table.join(".segment-1.tmp");
         let published = table.join("segment-00000000000000000001.anf");
         let nested = table.join(".segment-00000000000000000002.tmp");
+        let capsule_dir = table.join("capsules");
+        fs::create_dir_all(&capsule_dir).unwrap();
+        let orphan_capsule = capsule_dir.join(".capsule-00000000000000000003-g00000000000000000001.tmp");
+        let orphan_map = capsule_dir.join(".navigation-00000000000000000004.tmp");
+        let unrelated_map = capsule_dir.join(".navigation-4.tmp");
         fs::write(&canonical, b"interrupted").unwrap();
         fs::write(&unrelated, b"leave me").unwrap();
         fs::write(&published, b"published").unwrap();
         fs::create_dir(&nested).unwrap();
+        fs::write(&orphan_capsule, b"interrupted capsule").unwrap();
+        fs::write(&orphan_map, b"interrupted map").unwrap();
+        fs::write(&unrelated_map, b"leave map").unwrap();
 
+        let mut expected = vec![canonical.clone(), orphan_capsule.clone(), orphan_map.clone()];
+        expected.sort();
         let removed = cleanup_orphan_segment_temps(&root).unwrap();
-        assert_eq!(removed, vec![canonical.clone()]);
+        assert_eq!(removed, expected);
         assert!(!canonical.exists());
+        assert!(!orphan_capsule.exists());
+        assert!(!orphan_map.exists());
+        assert_eq!(fs::read(unrelated_map).unwrap(), b"leave map");
         assert_eq!(fs::read(unrelated).unwrap(), b"leave me");
         assert_eq!(fs::read(published).unwrap(), b"published");
         assert!(nested.is_dir());
