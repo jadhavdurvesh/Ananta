@@ -225,6 +225,273 @@ pub fn decode_projected_segment(
     Ok(rows)
 }
 
+/// Stable segment identity carried by ANF v0.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentIdentityV2 {
+    pub table_id: u64,
+    pub schema_revision: u64,
+    pub column_ids: Vec<u64>,
+}
+
+/// Return the ANF segment version after validating the magic and version field.
+pub fn segment_version(bytes: &[u8]) -> Result<u16, FormatError> {
+    if bytes.len() < 6 {
+        return Err(FormatError::Truncated);
+    }
+    if &bytes[..4] != MAGIC {
+        return Err(FormatError::InvalidMagic);
+    }
+    Ok(u16::from_le_bytes([bytes[4], bytes[5]]))
+}
+
+/// Inspect and validate ANF v0.2 identity and directory without decoding values.
+pub fn inspect_segment_v2(bytes: &[u8]) -> Result<SegmentIdentityV2, FormatError> {
+    const HEADER_V2_LEN: usize = 36;
+    const DIRECTORY_V2_ENTRY_LEN: usize = 25;
+    if bytes.len() < HEADER_V2_LEN + TRAILER_LEN {
+        return Err(FormatError::Truncated);
+    }
+    if bytes.len() > MAX_SEGMENT_BYTES {
+        return Err(FormatError::LimitExceeded("segment bytes"));
+    }
+    if &bytes[..4] != MAGIC {
+        return Err(FormatError::InvalidMagic);
+    }
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    if version != 2 {
+        return Err(FormatError::UnsupportedVersion(version));
+    }
+    let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
+    if flags != 0 {
+        return Err(FormatError::InvalidValue("unknown mandatory feature flags"));
+    }
+
+    let row_count = usize::try_from(read_u64(bytes, 8)?)
+        .map_err(|_| FormatError::LengthOverflow)?;
+    let column_count = usize::try_from(read_u32(bytes, 16)?)
+        .map_err(|_| FormatError::LengthOverflow)?;
+    validate_counts(row_count, column_count, false)?;
+
+    let table_id = read_u64(bytes, 20)?;
+    let schema_revision = read_u64(bytes, 28)?;
+    if table_id == 0 || schema_revision == 0 {
+        return Err(FormatError::InvalidValue("table ID and schema revision must be nonzero"));
+    }
+
+    let directory_len = column_count.checked_mul(DIRECTORY_V2_ENTRY_LEN)
+        .ok_or(FormatError::LengthOverflow)?;
+    let directory_end = HEADER_V2_LEN.checked_add(directory_len)
+        .ok_or(FormatError::LengthOverflow)?;
+    let trailer_start = bytes.len().checked_sub(TRAILER_LEN)
+        .ok_or(FormatError::Truncated)?;
+    if directory_end > trailer_start {
+        return Err(FormatError::Truncated);
+    }
+    let expected_checksum = read_u64(bytes, trailer_start)?;
+    if &bytes[trailer_start + 8..] != END_MAGIC {
+        return Err(FormatError::InvalidEndMarker);
+    }
+    if checksum64(&bytes[..trailer_start]) != expected_checksum {
+        return Err(FormatError::ChecksumMismatch);
+    }
+
+    let mut column_ids = Vec::with_capacity(column_count);
+    let mut unique_ids = std::collections::BTreeSet::new();
+    let mut cursor = HEADER_V2_LEN;
+    let mut expected_offset = directory_end;
+    for _ in 0..column_count {
+        let type_code = bytes[cursor];
+        let column_id = read_u64(bytes, cursor + 1)?;
+        let offset = usize::try_from(read_u64(bytes, cursor + 9)?)
+            .map_err(|_| FormatError::LengthOverflow)?;
+        let length = usize::try_from(read_u64(bytes, cursor + 17)?)
+            .map_err(|_| FormatError::LengthOverflow)?;
+        cursor += DIRECTORY_V2_ENTRY_LEN;
+
+        if DataType::from_code(type_code).is_none() {
+            return Err(FormatError::InvalidDirectory);
+        }
+        if column_id == 0 || !unique_ids.insert(column_id) {
+            return Err(FormatError::InvalidValue("column IDs must be nonzero and unique"));
+        }
+        if offset != expected_offset {
+            return Err(FormatError::InvalidDirectory);
+        }
+        let end = offset.checked_add(length).ok_or(FormatError::LengthOverflow)?;
+        if length < row_count || end > trailer_start {
+            return Err(FormatError::InvalidDirectory);
+        }
+        expected_offset = end;
+        column_ids.push(column_id);
+    }
+    if expected_offset != trailer_start {
+        return Err(FormatError::InvalidDirectory);
+    }
+
+    Ok(SegmentIdentityV2 { table_id, schema_revision, column_ids })
+}
+
+/// Encode an ANF v0.2 segment with stable table, schema and column identities.
+pub fn encode_segment_v2(
+    schema: &Schema,
+    rows: &[Vec<Value>],
+    table_id: u64,
+    schema_revision: u64,
+    column_ids: &[u64],
+) -> Result<Vec<u8>, FormatError> {
+    const HEADER_V2_LEN: usize = 36;
+    const DIRECTORY_V2_ENTRY_LEN: usize = 25;
+
+    if table_id == 0 || schema_revision == 0 {
+        return Err(FormatError::InvalidValue("table ID and schema revision must be nonzero"));
+    }
+    if column_ids.len() != schema.len() {
+        return Err(FormatError::SchemaMismatch);
+    }
+    let mut unique_ids = std::collections::BTreeSet::new();
+    if column_ids.iter().any(|id| *id == 0 || !unique_ids.insert(*id)) {
+        return Err(FormatError::InvalidValue("column IDs must be nonzero and unique"));
+    }
+
+    let column_count = schema.len();
+    let row_count = rows.len();
+    validate_counts(row_count, column_count, true)?;
+    for row in rows {
+        schema.validate_row(row).map_err(|error| FormatError::Type(error.to_string()))?;
+    }
+
+    let column_count_u32 = u32::try_from(column_count).map_err(|_| FormatError::LengthOverflow)?;
+    let row_count_u64 = u64::try_from(row_count).map_err(|_| FormatError::LengthOverflow)?;
+    let directory_len = column_count.checked_mul(DIRECTORY_V2_ENTRY_LEN)
+        .ok_or(FormatError::LengthOverflow)?;
+    let payload_start = HEADER_V2_LEN.checked_add(directory_len)
+        .ok_or(FormatError::LengthOverflow)?;
+
+    let mut payloads = Vec::with_capacity(column_count);
+    let mut total_payload_bytes = 0_usize;
+    for column_index in 0..column_count {
+        let mut payload = Vec::new();
+        for row in rows {
+            encode_value(&mut payload, &row[column_index])?;
+        }
+        total_payload_bytes = total_payload_bytes.checked_add(payload.len())
+            .ok_or(FormatError::LengthOverflow)?;
+        let total = payload_start.checked_add(total_payload_bytes)
+            .and_then(|size| size.checked_add(TRAILER_LEN))
+            .ok_or(FormatError::LengthOverflow)?;
+        if total > MAX_SEGMENT_BYTES {
+            return Err(FormatError::LimitExceeded("segment bytes"));
+        }
+        payloads.push(payload);
+    }
+
+    let mut output = Vec::new();
+    output.extend_from_slice(MAGIC);
+    output.extend_from_slice(&2_u16.to_le_bytes());
+    output.extend_from_slice(&0_u16.to_le_bytes());
+    output.extend_from_slice(&row_count_u64.to_le_bytes());
+    output.extend_from_slice(&column_count_u32.to_le_bytes());
+    output.extend_from_slice(&table_id.to_le_bytes());
+    output.extend_from_slice(&schema_revision.to_le_bytes());
+
+    let mut offset = payload_start;
+    for ((column, column_id), payload) in schema.columns().iter().zip(column_ids).zip(&payloads) {
+        output.push(column.data_type as u8);
+        output.extend_from_slice(&column_id.to_le_bytes());
+        output.extend_from_slice(&u64::try_from(offset).map_err(|_| FormatError::LengthOverflow)?.to_le_bytes());
+        output.extend_from_slice(&u64::try_from(payload.len()).map_err(|_| FormatError::LengthOverflow)?.to_le_bytes());
+        offset = offset.checked_add(payload.len()).ok_or(FormatError::LengthOverflow)?;
+    }
+    for payload in payloads {
+        output.extend_from_slice(&payload);
+    }
+    let total_len = output.len().checked_add(TRAILER_LEN).ok_or(FormatError::LengthOverflow)?;
+    if total_len > MAX_SEGMENT_BYTES {
+        return Err(FormatError::LimitExceeded("segment bytes"));
+    }
+    let checksum = checksum64(&output);
+    output.extend_from_slice(&checksum.to_le_bytes());
+    output.extend_from_slice(END_MAGIC);
+    Ok(output)
+}
+
+/// Decode an ANF v0.2 segment after validating its expected table, schema and column identities.
+pub fn decode_segment_v2(
+    bytes: &[u8],
+    schema: &Schema,
+    expected_table_id: u64,
+    expected_schema_revision: u64,
+    expected_column_ids: &[u64],
+) -> Result<Vec<Vec<Value>>, FormatError> {
+    const HEADER_V2_LEN: usize = 36;
+    const DIRECTORY_V2_ENTRY_LEN: usize = 25;
+    let identity = inspect_segment_v2(bytes)?;
+    if identity.table_id != expected_table_id
+        || identity.schema_revision != expected_schema_revision
+        || identity.column_ids != expected_column_ids
+        || schema.len() != expected_column_ids.len()
+    {
+        return Err(FormatError::SchemaMismatch);
+    }
+
+    let row_count = usize::try_from(read_u64(bytes, 8)?)
+        .map_err(|_| FormatError::LengthOverflow)?;
+    validate_counts(row_count, schema.len(), true)?;
+    let trailer_start = bytes.len() - TRAILER_LEN;
+    let mut entries = Vec::with_capacity(schema.len());
+    let mut cursor = HEADER_V2_LEN;
+    let mut expected_offset = HEADER_V2_LEN
+        .checked_add(schema.len().checked_mul(DIRECTORY_V2_ENTRY_LEN).ok_or(FormatError::LengthOverflow)?)
+        .ok_or(FormatError::LengthOverflow)?;
+
+    for column in schema.columns() {
+        let type_code = bytes[cursor];
+        let column_id = read_u64(bytes, cursor + 1)?;
+        let offset = usize::try_from(read_u64(bytes, cursor + 9)?)
+            .map_err(|_| FormatError::LengthOverflow)?;
+        let length = usize::try_from(read_u64(bytes, cursor + 17)?)
+            .map_err(|_| FormatError::LengthOverflow)?;
+        cursor += DIRECTORY_V2_ENTRY_LEN;
+        if type_code != column.data_type as u8 || column_id != identity.column_ids[entries.len()] || offset != expected_offset {
+            return Err(FormatError::SchemaMismatch);
+        }
+        let end = offset.checked_add(length).ok_or(FormatError::LengthOverflow)?;
+        if end > trailer_start || length < row_count {
+            return Err(FormatError::InvalidDirectory);
+        }
+        entries.push(Entry { type_code, offset, length });
+        expected_offset = end;
+    }
+    if expected_offset != trailer_start {
+        return Err(FormatError::InvalidDirectory);
+    }
+
+    let mut columns = Vec::with_capacity(schema.len());
+    for (index, column) in schema.columns().iter().enumerate() {
+        let entry = entries[index];
+        let end = entry.offset.checked_add(entry.length).ok_or(FormatError::LengthOverflow)?;
+        let mut value_cursor = entry.offset;
+        let mut values = Vec::with_capacity(row_count);
+        for _ in 0..row_count {
+            let value = decode_value(bytes, &mut value_cursor, end, column.data_type)?;
+            if matches!(value, Value::Null) && !column.nullable {
+                return Err(FormatError::Type(format!("column '{}' does not allow NULL", column.name)));
+            }
+            values.push(value);
+        }
+        if value_cursor != end {
+            return Err(FormatError::InvalidDirectory);
+        }
+        columns.push(values);
+    }
+
+    let mut rows = Vec::with_capacity(row_count);
+    for row_index in 0..row_count {
+        rows.push(columns.iter().map(|column| column[row_index].clone()).collect());
+    }
+    Ok(rows)
+}
+
 fn encode_value(out: &mut Vec<u8>, value: &Value) -> Result<(), FormatError> {
     if matches!(value, Value::Null) { out.push(0); return Ok(()); }
     out.push(1);
