@@ -342,7 +342,7 @@ fn validate_catalog(catalog: &Catalog) -> Result<(), DbError> {
     Ok(())
 }
 
-fn save_catalog(path: &Path, catalog: &Catalog) -> Result<(), DbError> {
+fn encode_catalog_v2(catalog: &Catalog) -> Result<Vec<u8>, DbError> {
     validate_catalog(catalog)?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(CATALOG_MAGIC);
@@ -376,10 +376,13 @@ fn save_catalog(path: &Path, catalog: &Catalog) -> Result<(), DbError> {
     bytes.extend_from_slice(&checksum.to_le_bytes());
     bytes.extend_from_slice(CATALOG_END);
 
-    // Validate the exact bytes before publishing them.
     let decoded = decode_catalog_v2(&bytes)?;
     validate_catalog(&decoded)?;
+    Ok(bytes)
+}
 
+fn save_catalog(path: &Path, catalog: &Catalog) -> Result<(), DbError> {
+    let bytes = encode_catalog_v2(catalog)?;
     let temp = path.with_extension("anc.tmp");
     // Acquire the temporary path before entering the cleanup scope. If it
     // already exists, create_new fails and the pre-existing file is untouched.
@@ -388,8 +391,6 @@ fn save_catalog(path: &Path, catalog: &Catalog) -> Result<(), DbError> {
         file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
-        // On filesystems with atomic same-directory rename, the old catalog
-        // remains readable until this publication step succeeds.
         fs::rename(&temp, path)?;
         Ok(())
     })();
