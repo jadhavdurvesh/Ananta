@@ -53,7 +53,8 @@ The manifest must satisfy all of these conditions before compaction starts:
 3. Capsule source intervals are sorted, non-overlapping and exactly tile the declared coverage interval. A gap, overlap or repeated Capsule identity rejects the manifest.
 4. The Chronicle receipt inventory contains exactly one verified receipt for every sequence in that interval. Its BatchId and payload fingerprint must match the durable Chronicle record.
 5. For each Capsule interval, the sum of Chronicle receipt row counts equals the Capsule row count. The sum across all inputs equals the manifest total.
-6. The target schema snapshot exists and is immutable. Historical source payloads are resolved to it by stable ColumnId; column names are not identity.
+6. Capsule rows have a defined logical origin order: ingestion sequence ascending, then row ordinal ascending within each committed Chronicle batch. This is the order produced by the current Capsule builder. Input validation must reconstruct that mapping from the verified Chronicle receipts and compare each decoded Capsule row against the corresponding Chronicle-derived row after target-schema resolution; row counts and min/max statistics alone are insufficient.
+7. The target schema snapshot exists and is immutable. Historical source payloads are resolved to it by stable ColumnId; column names are not identity.
 7. All path components are derived from validated numeric identities. A manifest cannot name an arbitrary path, parent directory, symlink target or file outside the table's data root.
 
 The initial compaction input is deliberately a contiguous source interval. Sparse selection, partial-Capsule compaction and mixing legacy ANF segments with Chronicle-derived Capsules are out of scope until their lineage semantics are specified.
@@ -75,7 +76,7 @@ The sum of output artifact row counts and provenance entry counts must equal the
 
 **(TableId, IngestionSequence, RowOrdinalWithinBatch)**
 
-The origin identity is independent of physical row order. The output provenance sidecar maps each physical row to exactly one origin identity. Validation sorts or externally orders the fixed-width origin identities and proves exact set equality with the input receipt inventory expanded by each batch's row count. Duplicate origins, missing origins, unknown sequences, out-of-range row ordinals or repeated origins reject the candidate. Row values are also decoded and checked against the target schema. Row count alone is not accepted as proof of equivalence.
+The origin identity is independent of physical row order. The output provenance sidecar maps each physical row to exactly one origin identity. Validation sorts or externally orders the fixed-width origin identities and proves exact set equality with the input receipt inventory expanded by each batch's row count. Duplicate origins, missing origins, unknown sequences, out-of-range row ordinals or repeated origins reject the candidate. For every origin, validation recomputes a canonical typed-row fingerprint from the decoded output values and compares it with the fingerprint derived from the corresponding verified Chronicle source row under the pinned target schema. This comparison uses the engine's canonical typed encoding (not language-level floating-point equality), so physical reordering cannot conceal altered values and NaN/signed-zero handling is deterministic. Row count and origin-set equality alone are not accepted as proof of logical equivalence.
 
 The output manifest records the complete input lineage, not merely the minimum and maximum source sequence of each output file. A time-first or entity-first layout may place rows from distant source sequences in the same output file.
 
