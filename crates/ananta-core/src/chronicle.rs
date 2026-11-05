@@ -520,6 +520,13 @@ mod tests {
     }
 
     #[test]
+    fn ingestion_sequence_overflow_fails_closed() {
+        let mut index = TableChronicleIndex::default();
+        index.last_sequence = u64::MAX;
+        assert!(matches!(index.next_sequence(), Err(DbError::LengthOverflow)));
+    }
+
+    #[test]
     fn sha256_matches_standard_vectors() {
         assert_eq!(
             hex(&sha256(b"")),
