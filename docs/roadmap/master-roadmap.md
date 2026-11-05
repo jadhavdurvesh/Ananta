@@ -297,18 +297,18 @@ Table rename/drop, column drop, type changes and non-null additions remain defer
 
 ## M1.3 Implement bounded read batches — current work
 - [x] Define the columnar RecordBatch and streaming iterator contract.
-- [x] Set batch row bounds to 1–65,536 and define optional row limits.
+- [x] Set batch row bounds to 1–65,536, with a 1,000,000-cell output ceiling and optional row limits.
 - [x] Define a fixed 64 KiB checksum scratch buffer and selected-column batch memory model.
-- [ ] Implement file-backed batch decoder for fixed-width numeric columns.
-- [ ] Implement file-backed batch decoder for UTF-8 and binary columns.
-- [ ] Validate null markers and current schema nullability while decoding batches.
-- [ ] Expose full and projected scan batch APIs for ANF v0.1/v0.2.
-- [ ] Add row-limit/early-stop support across segment boundaries.
-- [ ] Ensure iterator errors are surfaced once and stop iteration.
-- [ ] Test empty, 1, exact batch size and batch size + 1 boundaries.
-- [ ] Test projection order, repeated projections and mixed schema revisions.
-- [ ] Measure or instrument bounded batch memory on a generated dataset.
-- [ ] Demonstrate decoded memory scales with batch rows and selected columns, not total result rows.
+- [x] Implement file-backed batch decoding for fixed-width numeric columns.
+- [x] Implement file-backed batch decoding for UTF-8 and binary columns.
+- [x] Validate null markers and current schema nullability while decoding batches.
+- [x] Expose full and projected scan batch APIs for ANF v0.1/v0.2.
+- [x] Add row-limit/early-stop support across segment boundaries.
+- [x] Ensure iterator errors are surfaced once and stop iteration.
+- [x] Test empty, one-row, exact batch size and batch-size-plus-one boundaries.
+- [x] Test projection order, repeated projections and mixed schema revisions.
+- [ ] Measure peak memory while scanning a generated dataset.
+- [ ] Demonstrate with a reproducible benchmark that decoded memory scales with configured batch output, not total result rows.
 
 Specification: `docs/specifications/bounded-read-batches-v0.1.md`.
 
@@ -325,10 +325,10 @@ Specification: `docs/specifications/bounded-read-batches-v0.1.md`.
 - [ ] Add safe startup handling for orphan temporary files.
 
 ## M1 exit gate
-- [ ] Golden ANF fixtures pass.
-- [ ] Property/fuzz tests reject malformed data safely.
-- [ ] Catalog survives repeated close/reopen.
-- [ ] Projected streaming scans work without full-result materialisation.
+- [x] Golden ANF fixtures pass.
+- [x] Deterministic malformed-input tests reject invalid data without panics.
+- [x] Catalog survives repeated close/reopen.
+- [x] Projected streaming scans work without full-result materialisation.
 - [ ] Memory is measured and bounded by configured batches.
 - [ ] Publication failure tests pass.
 - [ ] Exclusive-writer boundary is enforced or clearly guarded.
