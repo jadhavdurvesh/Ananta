@@ -41,6 +41,10 @@ A compact index over capsules and columns. It enables the engine to reject irrel
 
 False positives in probabilistic filters are acceptable; false negatives are not. A navigation map may never exclude a row that could satisfy a query.
 
+## Relationship to the M2.1 ingestion contract
+
+The accepted [Ingestion Contract v0.1](ingestion-contract-v0.1.md) defines BatchId, payload fingerprint, per-table commit-order sequence, atomic batch acceptance, event-time neutrality and caller-visible outcomes. Chronicle units/commit records must preserve that receipt and sequence information at the same durable commit boundary as the accepted data. The current ANF segment plus `insert_batch` API is the pre-Chronicle baseline and does not yet provide durable idempotency receipts.
+
 ## 3. Conceptual write and read paths
 
 ### Write path

@@ -5,6 +5,7 @@
 **Owner:** DMJ  
 **Current release target:** 0.1.0 — Native Storage Prototype  
 **Roadmap status:** Active; review this file before starting work outside the current milestone
+**Current focus:** M2.1 ingestion contract accepted; next implementation is M2.2 Chronicle
 
 ---
 
@@ -347,29 +348,43 @@ ADR: `docs/decisions/0006-atomic-segment-publication-and-writer-lock.md`.
 
 **Goal:** implement a robust append-oriented ingestion path and determine whether ChronoWeave is a useful storage design.
 
-## M2.1 Ingestion contract
-- [ ] Define batch identity.
-- [ ] Define monotonically ordered ingestion sequence per table.
-- [ ] Define accepted/rejected row behaviour.
-- [ ] Define all-or-nothing batch validation.
-- [ ] Define duplicate-batch behaviour.
-- [ ] Define late-arriving timestamp behaviour.
-- [ ] Define out-of-order event behaviour.
-- [ ] Define maximum batch size.
-- [ ] Define backpressure/error behaviour.
-- [ ] Add ingestion result counters.
+## M2.1 Ingestion contract — design accepted
+- [x] Define caller-supplied 128-bit BatchId scoped by stable TableId.
+- [x] Define per-table monotonically increasing 64-bit ingestion sequence assigned at durable commit.
+- [x] Define whole-batch accepted/rejected behavior (no partial-row acceptance).
+- [x] Define all-or-nothing validation against one captured schema revision.
+- [x] Define duplicate-batch idempotency using a canonical payload fingerprint; conflicting ID reuse fails.
+- [x] Define accepted BatchId retention for the logical lifetime of the table.
+- [x] Define late-arriving timestamp behavior (accept; do not reorder by event time).
+- [x] Define out-of-order event behavior and preserve source row order.
+- [x] Define initial ANF v0.2 batch limits (rows, cells, columns, field and segment bytes).
+- [x] Define synchronous backpressure and publication failure/uncertain-outcome behavior.
+- [x] Define IngestResult outcomes and accepted/duplicate/rejected/publication counter semantics.
+
+Specification: `docs/specifications/ingestion-contract-v0.1.md`.
+Decision: `docs/decisions/0007-idempotent-commit-ordered-ingestion.md`.
+
+**Status boundary:** M2.1 is a design/contract milestone only. Runtime BatchId, receipt persistence, sequence allocation, result types and counters are not implemented yet; they are explicit M2.2 work.
 
 ## M2.2 Chronicle prototype
-- [ ] Define Chronicle metadata.
-- [ ] Define append order and sequence semantics.
-- [ ] Define immutable publication boundary.
+- [ ] Implement the public 128-bit BatchId and IngestResult types.
+- [ ] Implement deterministic SHA-256 fingerprinting over canonical ANF v0.2 batch bytes.
+- [ ] Define and implement Chronicle commit-record metadata (BatchId, fingerprint, TableId, schema revision, sequence, row count, encoded bytes and data reference).
+- [ ] Make the Chronicle commit record the single durable publication point for data identity and sequence.
+- [ ] Persist per-table next/last committed sequence without gaps from failed or duplicate submissions.
+- [ ] Persist accepted BatchId receipts and resolve identical retries after restart.
+- [ ] Reject accepted BatchId reuse with a different fingerprint.
+- [ ] Expose ingestion result and counter snapshots with the M2.1 semantics.
+- [ ] Define append order and sequence semantics in Chronicle metadata.
+- [ ] Define immutable publication boundary and crash-recovery behavior.
 - [ ] Map incoming batches to Chronicle units.
 - [ ] Add Chronicle reader.
 - [ ] Add Chronicle integrity summary.
-- [ ] Test repeated ingestion.
-- [ ] Test out-of-order timestamps.
-- [ ] Test duplicate batch submission.
-- [ ] Test partially failed ingestion.
+- [ ] Test repeated ingestion and duplicate retry after restart.
+- [ ] Test conflicting BatchId reuse and table-ID scoping.
+- [ ] Test out-of-order timestamps and source row-order preservation.
+- [ ] Test partially failed ingestion and failures on both sides of the durable commit point.
+- [ ] Test schema changes between calls and sequence overflow.
 
 ## M2.3 Capsule prototype
 - [ ] Define Capsule identity and generation.
