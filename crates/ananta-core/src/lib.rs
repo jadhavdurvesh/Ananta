@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub mod schema_snapshot;
 mod nullable_ddl;
+mod column_rename_reorder;
 use schema_snapshot::{SchemaSnapshot, SchemaSnapshotConsistencyReport};
 
 const CATALOG_MAGIC: &[u8; 4] = b"ANC1";
@@ -41,6 +42,7 @@ pub enum DbError {
     TableNotFound(String),
     ColumnNotFound(String),
     ColumnExists(String),
+    InvalidColumnOrder(String),
     CorruptCatalog(&'static str),
     SchemaCompatibility(&'static str),
     UnsupportedCatalogVersion(u16),
@@ -59,6 +61,7 @@ impl fmt::Display for DbError {
             Self::TableNotFound(s) => write!(f, "table not found: {s}"),
             Self::ColumnNotFound(s) => write!(f, "column not found: {s}"),
             Self::ColumnExists(s) => write!(f, "column already exists: {s}"),
+            Self::InvalidColumnOrder(s) => write!(f, "invalid column order: {s}"),
             Self::CorruptCatalog(s) => write!(f, "corrupt ANANTA catalog: {s}"),
             Self::SchemaCompatibility(s) => write!(f, "ANANTA schema compatibility error: {s}"),
             Self::UnsupportedCatalogVersion(v) => write!(f, "unsupported catalog version: {v}"),
