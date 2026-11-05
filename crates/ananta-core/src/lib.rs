@@ -245,7 +245,6 @@ impl ScanBatchIter {
         self.active = Some(ActiveScanSegment { decoder, output_slots });
         Ok(true)
     }
-    }
 }
 
 impl Iterator for ScanBatchIter {
