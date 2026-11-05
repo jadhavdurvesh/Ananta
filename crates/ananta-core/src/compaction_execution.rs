@@ -42,7 +42,17 @@ pub struct CompactionExecutionReport {
     pub rows_processed: u64,
     pub elapsed_micros: u64,
     pub cpu_time_micros: Option<u64>,
+    pub final_storage_bytes: u64,
+    pub read_latency_micros: Option<u64>,
     pub temporary_disk_amplification_milli: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionReadMeasurement {
+    pub rows_read: u64,
+    pub data_bytes_read: u64,
+    pub read_latency_micros: u64,
+    pub cpu_time_micros: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +205,7 @@ impl Database {
         cancel: Option<&AtomicBool>,
     ) -> Result<CompactionExecutionReport, DbError> {
         let started = Instant::now();
+        let cpu_started = process_cpu_time_micros();
         limits.validate().map_err(|e| DbError::CompactionExecution(e.to_string()))?;
         input.validate()?;
         if weave_id == 0 || generation == 0 {
@@ -265,8 +276,15 @@ impl Database {
             return finish_cancelled(&mut journal, &journal_path, progress);
         }
         fs::create_dir(&stage_dir)?;
-        let input_bytes = input.encode()?;
-        write_new_synced(&stage_dir.join("input.cim"), &input_bytes)?;
+        let input_manifest_bytes = input.encode()?;
+        write_new_synced(&stage_dir.join("input.cim"), &input_manifest_bytes)?;
+        progress.temporary_bytes = u64::try_from(input_manifest_bytes.len()).map_err(|_| DbError::LengthOverflow)?;
+        limits.check(&CompactionProgress {
+            input_bytes: preflight.total_source_bytes,
+            temporary_bytes: progress.temporary_bytes,
+            open_files: 1,
+            ..CompactionProgress::default()
+        }).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
 
         let result = (|| -> Result<CompactionExecutionReport, DbError> {
             let rechecked = self.preflight_compaction_inputs(table, input)?;
@@ -358,7 +376,10 @@ impl Database {
                 artifact_bytes_total = artifact_bytes_total.checked_add(data_len)
                     .and_then(|n| n.checked_add(pvm_len)).ok_or(DbError::LengthOverflow)?;
                 progress.output_bytes = artifact_bytes_total;
-                progress.temporary_bytes = artifact_bytes_total;
+                progress.temporary_bytes = u64::try_from(input_manifest_bytes.len())
+                    .map_err(|_| DbError::LengthOverflow)?
+                    .checked_add(artifact_bytes_total)
+                    .ok_or(DbError::LengthOverflow)?;
                 progress.current_work_unit_rows = u64::try_from(chunk.len()).map_err(|_| DbError::LengthOverflow)?;
                 progress.open_files = 2;
                 limits.check(&progress).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
@@ -448,6 +469,15 @@ impl Database {
             };
             let manifest_bytes = output_manifest.encode()
                 .map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+            let output_bytes = artifact_bytes_total.checked_add(
+                u64::try_from(manifest_bytes.len()).map_err(|_| DbError::LengthOverflow)?
+            ).ok_or(DbError::LengthOverflow)?;
+            let temporary_bytes = output_bytes.checked_add(
+                u64::try_from(input_manifest_bytes.len()).map_err(|_| DbError::LengthOverflow)?
+            ).ok_or(DbError::LengthOverflow)?;
+            progress.output_bytes = output_bytes;
+            progress.temporary_bytes = temporary_bytes;
+            limits.check(&progress).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
             verify_candidate_directory(&stage_dir, &output_manifest, schema, definition.id.0,
                 definition.schema_revision, &column_ids, &expected)?;
 
@@ -468,12 +498,16 @@ impl Database {
                 output_manifest,
                 candidate_directory: final_dir.clone(),
                 input_bytes: preflight.total_source_bytes,
-                output_bytes: artifact_bytes_total,
-                temporary_bytes: artifact_bytes_total,
+                output_bytes,
+                temporary_bytes,
                 rows_processed: progress.rows_processed,
                 elapsed_micros,
-                cpu_time_micros: None,
-                temporary_disk_amplification_milli: amplification,
+                cpu_time_micros: process_cpu_time_micros().zip(cpu_started)
+                    .and_then(|(end, start)| end.checked_sub(start)),
+                final_storage_bytes: temporary_bytes,
+                read_latency_micros: None,
+                temporary_disk_amplification_milli: if preflight.total_source_bytes == 0 { 0 }
+                    else { temporary_bytes.saturating_mul(1000) / preflight.total_source_bytes },
             })
         })();
 
@@ -500,6 +534,56 @@ impl Database {
             return Err(error);
         }
         result
+    }
+
+
+    /// Measure the storage read/decode path for one immutable candidate generation.
+    /// This records wall latency and, on Linux, process CPU time from procfs.
+    pub fn measure_compaction_candidate_read(
+        &self,
+        table: &str,
+        weave_id: u64,
+        generation: u64,
+    ) -> Result<CompactionReadMeasurement, DbError> {
+        let started = Instant::now();
+        let cpu_started = process_cpu_time_micros();
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        let root = self.root.join("data").join(table).join("weaves");
+        let dir = root.join(format!("weave-{weave_id:020}-g{generation:020}"));
+        let manifest_bytes = read_regular_file(&dir.join("manifest.owm"))?;
+        let manifest = CompactionOutputManifest::decode(&manifest_bytes)
+            .map_err(|e| DbError::CompactionExecution(e.to_string()))?;
+        let ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let mut rows_read = 0_u64;
+        let mut data_bytes_read = 0_u64;
+        for artifact in &manifest.artifacts {
+            let bytes = read_verified_artifact(
+                &dir.join(artifact.data_relative_path()),
+                artifact.data_file_len,
+                artifact.data_file_sha256,
+            )?;
+            data_bytes_read = data_bytes_read.checked_add(
+                u64::try_from(bytes.len()).map_err(|_| DbError::LengthOverflow)?
+            ).ok_or(DbError::LengthOverflow)?;
+            let rows = crate::decode_segment_v2(
+                &bytes, &definition.schema, definition.id.0,
+                definition.schema_revision, &ids,
+            )?;
+            rows_read = rows_read.checked_add(
+                u64::try_from(rows.len()).map_err(|_| DbError::LengthOverflow)?
+            ).ok_or(DbError::LengthOverflow)?;
+        }
+        if rows_read != manifest.expected_row_count {
+            return Err(DbError::CompactionPreflight("candidate read measurement row total differs from OWM1"));
+        }
+        Ok(CompactionReadMeasurement {
+            rows_read,
+            data_bytes_read,
+            read_latency_micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            cpu_time_micros: process_cpu_time_micros().zip(cpu_started)
+                .and_then(|(end, start)| end.checked_sub(start)),
+        })
     }
 
     /// Re-open a candidate by identity and independently verify its OWM1,
@@ -625,6 +709,29 @@ fn check_cancel(cancel: Option<&AtomicBool>) -> Result<(), DbError> {
         Err(DbError::CompactionExecution("compaction cancelled at a bounded work-unit boundary".into()))
     } else { Ok(()) }
 }
+
+fn process_cpu_time_micros() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string("/proc/self/stat").ok()?;
+        let fields = stat.rsplit_once(") ")?.1.split_whitespace().collect::<Vec<_>>();
+        let user_ticks = fields.get(11)?.parse::<u64>().ok()?;
+        let system_ticks = fields.get(12)?.parse::<u64>().ok()?;
+        let ticks_per_second = std::process::Command::new("getconf")
+            .arg("CLK_TCK").output().ok()?;
+        let ticks_per_second = std::str::from_utf8(&ticks_per_second.stdout)
+            .ok()?.trim().parse::<u64>().ok()?;
+        if ticks_per_second == 0 { return None; }
+        user_ticks.checked_add(system_ticks)?
+            .checked_mul(1_000_000)?
+            .checked_div(ticks_per_second)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 fn compare_value(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Null, Value::Null) => Ordering::Equal,
