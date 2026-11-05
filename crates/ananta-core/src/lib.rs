@@ -3515,4 +3515,161 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
+
+    #[test]
+    fn capsule_builds_from_contiguous_chronicle_range_and_validates_column_stats() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        let schema = Schema::new(vec![
+            Column::new("event_time", DataType::TimestampMicros, false),
+            Column::new("temperature", DataType::Float64, true),
+            Column::new("device", DataType::Utf8, false),
+            Column::new("all_null", DataType::Int64, true),
+        ]).unwrap();
+        db.create_table("telemetry", schema).unwrap();
+        let rows = vec![
+            vec![Value::TimestampMicros(100), Value::Float64(21.5), Value::Utf8("a".into()), Value::Null],
+            vec![Value::TimestampMicros(300), Value::Null, Value::Utf8("bb".into()), Value::Null],
+            vec![Value::TimestampMicros(200), Value::Float64(18.5), Value::Utf8("c".into()), Value::Null],
+        ];
+        for (index, row) in rows.iter().enumerate() {
+            db.ingest_batch(
+                "telemetry",
+                BatchId::from_bytes([20 + index as u8; 16]).unwrap(),
+                std::slice::from_ref(row),
+            ).unwrap();
+        }
+
+        let capsule_path = db.build_capsule("telemetry", 42, 1, 1, 3, Some("event_time")).unwrap();
+        assert!(capsule_path.is_file());
+        assert_eq!(
+            capsule_path.file_name().and_then(|name| name.to_str()),
+            Some("capsule-00000000000000000042-g00000000000000000001.cap")
+        );
+        let metadata = db.validate_capsule("telemetry", 42, 1).unwrap();
+        assert_eq!(metadata.row_count, 3);
+        assert_eq!((metadata.first_ingestion_sequence, metadata.last_ingestion_sequence), (1, 3));
+        assert_eq!(metadata.event_time_column_id, Some(db.column_id("telemetry", "event_time").unwrap().0));
+        assert_eq!((metadata.temporal_min, metadata.temporal_max), (Some(100), Some(300)));
+        assert_eq!(metadata.columns[1].null_count, 1);
+        assert_eq!(metadata.columns[1].minimum, Some(Value::Float64(18.5)));
+        assert_eq!(metadata.columns[1].maximum, Some(Value::Float64(21.5)));
+        assert_eq!(metadata.columns[2].minimum, None);
+        assert_eq!(metadata.columns[3].null_count, 3);
+        assert_eq!(metadata.columns[3].minimum, None);
+        assert_eq!(db.scan("telemetry").unwrap(), rows);
+
+        // Capsules are derived copies: all committed Chronicle records remain present.
+        let chronicle_count = fs::read_dir(path.join("data").join("telemetry")).unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("chr"))
+            .count();
+        assert_eq!(chronicle_count, 3);
+
+        // A new generation can coexist; the same identity/generation cannot overwrite.
+        let second_generation = db.build_capsule("telemetry", 42, 2, 1, 3, None).unwrap();
+        assert!(second_generation.is_file());
+        let second_metadata = db.validate_capsule("telemetry", 42, 2).unwrap();
+        assert_eq!(second_metadata.event_time_column_id, None);
+        assert_eq!(second_metadata.temporal_min, None);
+        assert!(matches!(
+            db.build_capsule("telemetry", 42, 1, 1, 3, Some("event_time")),
+            Err(DbError::Io(_))
+        ));
+        assert!(capsule_path.is_file());
+
+        assert!(matches!(
+            db.build_capsule("telemetry", 43, 1, 1, 4, Some("event_time")),
+            Err(DbError::CapsuleCorrupt("source sequence range is not fully committed and contiguous"))
+        ));
+        assert!(matches!(
+            db.build_capsule("telemetry", 44, 1, 1, 3, Some("device")),
+            Err(DbError::CapsuleCorrupt("event-time column must have type TIMESTAMP_MICROS"))
+        ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn capsule_build_resolves_historical_rows_into_current_schema_revision() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        let original = sample_schema();
+        db.create_table("telemetry", original).unwrap();
+        let old_rows = vec![vec![
+            Value::TimestampMicros(10),
+            Value::Utf8("old".into()),
+            Value::Float64(1.0),
+        ]];
+        db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([30; 16]).unwrap(),
+            &old_rows,
+        ).unwrap();
+
+        db.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
+        let new_rows = vec![vec![
+            Value::TimestampMicros(20),
+            Value::Utf8("new".into()),
+            Value::Float64(2.0),
+            Value::Float64(60.0),
+        ]];
+        db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([31; 16]).unwrap(),
+            &new_rows,
+        ).unwrap();
+
+        let path_to_capsule = db.build_capsule("telemetry", 5, 1, 1, 2, Some("timestamp")).unwrap();
+        let metadata = db.validate_capsule("telemetry", 5, 1).unwrap();
+        assert_eq!(metadata.schema_revision, 2);
+        assert_eq!(metadata.row_count, 2);
+        assert_eq!(metadata.columns.len(), 4);
+        assert_eq!(metadata.columns[3].null_count, 1);
+        assert_eq!(metadata.columns[3].minimum, Some(Value::Float64(60.0)));
+        assert_eq!(metadata.columns[3].maximum, Some(Value::Float64(60.0)));
+        assert!(path_to_capsule.is_file());
+        assert_eq!(db.scan("telemetry").unwrap(), vec![
+            vec![
+                Value::TimestampMicros(10),
+                Value::Utf8("old".into()),
+                Value::Float64(1.0),
+                Value::Null,
+            ],
+            new_rows[0].clone(),
+        ]);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn capsule_temp_files_are_cleaned_and_corruption_is_detected_by_validator() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(50),
+            Value::Utf8("capsule".into()),
+            Value::Float64(5.0),
+        ]];
+        db.ingest_batch("telemetry", BatchId::from_bytes([32; 16]).unwrap(), &rows).unwrap();
+        let capsule_path = db.build_capsule("telemetry", 9, 1, 1, 1, Some("timestamp")).unwrap();
+        drop(db);
+
+        let capsule_dir = path.join("data").join("telemetry").join("capsules");
+        let orphan_temp = capsule_dir.join(".capsule-00000000000000000010-g00000000000000000001.tmp");
+        fs::write(&orphan_temp, b"interrupted Capsule publication").unwrap();
+        let mut bytes = fs::read(&capsule_path).unwrap();
+        let payload_start = 144 + 3 * 48;
+        bytes[payload_start] ^= 1;
+        fs::write(&capsule_path, bytes).unwrap();
+
+        let reopened = Database::open(&path).unwrap();
+        assert!(!orphan_temp.exists());
+        assert!(matches!(
+            reopened.validate_capsule("telemetry", 9, 1),
+            Err(DbError::CapsuleCorrupt("Capsule checksum mismatch"))
+        ));
+        assert_eq!(reopened.scan("telemetry").unwrap(), rows);
+        fs::remove_dir_all(path).unwrap();
+    }
+
 }
