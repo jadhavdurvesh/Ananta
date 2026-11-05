@@ -604,9 +604,9 @@ impl Database {
         rows: &[Vec<Value>],
     ) -> Result<IngestResult, DbError> {
         if rows.is_empty() {
-            self.chronicle_indices.entry(self.table_id(table)?).or_default().stats.rejected_requests =
-                self.chronicle_indices.get(&self.table_id(table)?).map_or(0, |index| index.stats.rejected_requests)
-                    .checked_add(1).ok_or(DbError::LengthOverflow)?;
+            let table_id = self.table_id(table)?;
+            let index = self.chronicle_indices.entry(table_id).or_default();
+            index.stats.rejected_requests = index.stats.rejected_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
             return Err(DbError::EmptyBatch);
         }
 
@@ -833,7 +833,7 @@ impl Database {
                 let entry = entry?;
                 let path = entry.path();
                 if entry.file_type()?.is_file()
-                    && path.extension().and_then(|extension| extension.to_str()) == Some("anf")
+                    && matches!(path.extension().and_then(|extension| extension.to_str()), Some("anf" | "chr"))
                 {
                     segments.push(path);
                 }
@@ -869,7 +869,7 @@ impl Database {
         for entry in fs::read_dir(&table_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("anf") {
+            if matches!(path.extension().and_then(|s| s.to_str()), Some("anf" | "chr")) {
                 segments.push(path);
             }
         }
@@ -885,7 +885,12 @@ impl Database {
             let capacity = usize::try_from(file_len).map_err(|_| DbError::LengthOverflow)?;
             let mut bytes = Vec::with_capacity(capacity);
             file.read_to_end(&mut bytes)?;
-            let logical_rows = self.decode_and_resolve_segment(table, definition, &bytes)?;
+            let segment_bytes = if bytes.starts_with(b"CHR1") {
+                extract_payload(&bytes, definition.id.0)?.1
+            } else {
+                bytes
+            };
+            let logical_rows = self.decode_and_resolve_segment(table, definition, &segment_bytes)?;
             for row in logical_rows {
                 rows.push(projection.iter().map(|index| row[*index].clone()).collect());
             }
@@ -1029,7 +1034,7 @@ fn next_segment_id(directory: &Path) -> Result<u64, DbError> {
     let mut max_id = 0_u64;
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("anf") { continue; }
+        if !matches!(path.extension().and_then(|s| s.to_str()), Some("anf" | "chr")) { continue; }
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             if let Some(number) = stem.strip_prefix("segment-").and_then(|s| s.parse::<u64>().ok()) {
                 max_id = max_id.max(number);
