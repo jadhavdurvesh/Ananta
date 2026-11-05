@@ -829,6 +829,37 @@ impl Database {
         publish_capsule(&capsule_directory, capsule_id, generation, &capsule_bytes)
     }
 
+    /// Read all rows from one independently validated Capsule.
+    ///
+    /// This convenience API materialises the selected Capsule's full row set. Use
+    /// bounded Chronicle scan APIs for large logical tables; this is primarily useful
+    /// for Capsule validation and offline benchmark tooling.
+    pub fn scan_capsule(
+        &self,
+        table: &str,
+        capsule_id: u64,
+        generation: u64,
+    ) -> Result<Vec<Vec<Value>>, DbError> {
+        let metadata = self.validate_capsule(table, capsule_id, generation)?;
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        let path = self.root.join("data").join(table).join("capsules")
+            .join(format!("capsule-{capsule_id:020}-g{generation:020}.cap"));
+        let bytes = fs::read(path)?;
+        let (_, payload) = decode_capsule(&bytes)?;
+        let snapshot = SchemaSnapshot::read_from(&self.root, definition.id, metadata.schema_revision)
+            .map_err(|_| DbError::CapsuleCorrupt("Capsule schema snapshot is missing or corrupt"))?;
+        let schema = snapshot.schema()?;
+        let column_ids = snapshot.column_ids().map(|id| id.0).collect::<Vec<_>>();
+        decode_segment_v2(
+            &payload,
+            &schema,
+            definition.id.0,
+            metadata.schema_revision,
+            &column_ids,
+        ).map_err(DbError::Format)
+    }
+
     /// Independently validate a Capsule file and recompute every statistic from its ANF payload.
     pub fn validate_capsule(
         &self,
