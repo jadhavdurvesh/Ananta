@@ -1,10 +1,15 @@
 use crate::chronicle::sha256;
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 const EVENT_MAGIC: &[u8; 4] = b"CJE1";
 const EVENT_VERSION: u16 = 1;
 const EVENT_LEN: usize = 160;
 const EVENT_CHECKSUM_OFFSET: usize = EVENT_LEN - 32;
+const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_JOURNAL_EVENTS: u64 = MAX_JOURNAL_BYTES / EVENT_LEN as u64;
 
 /// Stable identity for one logical compaction job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -350,6 +355,194 @@ impl CompactionJobJournal {
     }
 }
 
+
+/// Read and verify every fixed-width event in one attempt journal.
+///
+/// The file must be a regular file and must contain complete CJE1 records. A
+/// partial tail is reported as corruption; it is never silently truncated.
+pub fn read_compaction_journal(path: impl AsRef<Path>) -> Result<Vec<CompactionJobEvent>, CompactionError> {
+    let path = path.as_ref();
+    let path_metadata = fs::symlink_metadata(path).map_err(compaction_io_error)?;
+    if !path_metadata.file_type().is_file() {
+        return Err(CompactionError::JournalNotRegularFile);
+    }
+    let file_len = path_metadata.len();
+    if file_len == 0 {
+        return Err(CompactionError::EmptyJournal);
+    }
+    if file_len > MAX_JOURNAL_BYTES {
+        return Err(CompactionError::JournalTooLarge { actual: file_len, limit: MAX_JOURNAL_BYTES });
+    }
+    if file_len % EVENT_LEN as u64 != 0 {
+        return Err(CompactionError::JournalTruncated);
+    }
+    let event_count = file_len / EVENT_LEN as u64;
+    if event_count > MAX_JOURNAL_EVENTS {
+        return Err(CompactionError::JournalTooLarge { actual: file_len, limit: MAX_JOURNAL_BYTES });
+    }
+
+    let file = File::open(path).map_err(compaction_io_error)?;
+    if file.metadata().map_err(compaction_io_error)?.len() != file_len {
+        return Err(CompactionError::JournalChangedDuringRead);
+    }
+    let capacity = usize::try_from(file_len).map_err(|_| CompactionError::JournalTooLarge {
+        actual: file_len,
+        limit: MAX_JOURNAL_BYTES,
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(MAX_JOURNAL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(compaction_io_error)?;
+    if bytes.len() as u64 != file_len {
+        return Err(CompactionError::JournalChangedDuringRead);
+    }
+
+    let mut events = Vec::with_capacity(event_count as usize);
+    for chunk in bytes.chunks_exact(EVENT_LEN) {
+        events.push(CompactionJobEvent::decode(chunk)?);
+    }
+    CompactionJobJournal::replay(&events)?;
+    Ok(events)
+}
+
+/// Append one event to an attempt journal and sync it to stable storage.
+///
+/// The caller must hold the database's exclusive writer ownership and derive
+/// the path from validated job identities beneath the database's compaction area.
+/// Existing journal bytes are replayed before append, so illegal transitions,
+/// sequence gaps, checksum damage and partial tails are rejected without writes.
+/// An I/O error after writing begins is reported as uncertain; reload the journal
+/// before deciding whether to retry.
+pub fn append_compaction_journal_event(
+    path: impl AsRef<Path>,
+    event: &CompactionJobEvent,
+) -> Result<(), CompactionError> {
+    let path = path.as_ref();
+    let encoded = event.encode()?;
+    let path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(compaction_io_error(error)),
+    };
+
+    let previous_len = if let Some(metadata) = &path_metadata {
+        if !metadata.file_type().is_file() {
+            return Err(CompactionError::JournalNotRegularFile);
+        }
+        let events = read_compaction_journal(path)?;
+        let mut journal = CompactionJobJournal::replay(&events)?;
+        let expected = journal.append(event.state, event.progress)?;
+        if expected != *event {
+            return Err(CompactionError::JournalEventMismatch);
+        }
+        Some(metadata.len())
+    } else {
+        let mut journal = CompactionJobJournal::new(
+            event.job_id,
+            event.attempt,
+            event.input_manifest_sha256,
+        )?;
+        let expected = journal.append(event.state, event.progress)?;
+        if expected != *event {
+            return Err(CompactionError::JournalEventMismatch);
+        }
+        None
+    };
+
+    let previous_len_value = previous_len.unwrap_or(0);
+    let new_len = previous_len_value
+        .checked_add(EVENT_LEN as u64)
+        .ok_or(CompactionError::SequenceOverflow)?;
+    if new_len > MAX_JOURNAL_BYTES {
+        return Err(CompactionError::JournalTooLarge { actual: new_len, limit: MAX_JOURNAL_BYTES });
+    }
+
+    let mut file = if previous_len.is_some() {
+        OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(path)
+            .map_err(compaction_io_error)?
+    } else {
+        OpenOptions::new()
+            .write(true)
+            .append(true)
+            .create_new(true)
+            .open(path)
+            .map_err(compaction_io_error)?
+    };
+
+    let actual_len = file.metadata().map_err(compaction_io_error)?.len();
+    if actual_len != previous_len_value {
+        return Err(CompactionError::JournalChangedBeforeAppend);
+    }
+
+    if let Err(error) = file.write_all(&encoded) {
+        return Err(CompactionError::JournalAppendUncertain {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        });
+    }
+    if let Err(error) = file.sync_all() {
+        return Err(CompactionError::JournalAppendUncertain {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        });
+    }
+    drop(file);
+
+    if previous_len.is_none() {
+        let parent = journal_parent(path);
+        if let Err(error) = sync_journal_directory(parent) {
+            return Err(CompactionError::JournalAppendUncertain {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Recover an unfinished attempt by appending exactly one Interrupted event.
+///
+/// Completed/failed/cancelled/interrupted attempts are returned unchanged.
+/// A journal with a partial or corrupt record is preserved and rejected; recovery
+/// never truncates evidence or guesses which event was durable.
+pub fn recover_compaction_journal(path: impl AsRef<Path>) -> Result<CompactionJobState, CompactionError> {
+    let path = path.as_ref();
+    let events = read_compaction_journal(path)?;
+    let last = events.last().ok_or(CompactionError::EmptyJournal)?;
+    if last.state.is_terminal() {
+        return Ok(last.state);
+    }
+
+    let mut journal = CompactionJobJournal::replay(&events)?;
+    let interrupted = journal.append(CompactionJobState::Interrupted, last.progress)?;
+    append_compaction_journal_event(path, &interrupted)?;
+    Ok(CompactionJobState::Interrupted)
+}
+
+fn journal_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn compaction_io_error(error: std::io::Error) -> CompactionError {
+    CompactionError::Io(error.to_string())
+}
+
+#[cfg(unix)]
+fn sync_journal_directory(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_journal_directory(_path: &Path) -> std::io::Result<()> {
+    // Portable std does not expose directory-entry flushing on all supported targets.
+    Ok(())
+}
+
 /// Errors from the M3.1 compaction state and resource primitives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionError {
@@ -363,6 +556,14 @@ pub enum CompactionError {
     JournalSequenceMismatch,
     SequenceOverflow,
     CorruptEvent(&'static str),
+    Io(String),
+    JournalNotRegularFile,
+    JournalTooLarge { actual: u64, limit: u64 },
+    JournalTruncated,
+    JournalChangedDuringRead,
+    JournalChangedBeforeAppend,
+    JournalEventMismatch,
+    JournalAppendUncertain { path: PathBuf, reason: String },
 }
 
 impl fmt::Display for CompactionError {
@@ -380,6 +581,14 @@ impl fmt::Display for CompactionError {
             Self::JournalSequenceMismatch => f.write_str("compaction journal event sequence is not contiguous"),
             Self::SequenceOverflow => f.write_str("compaction journal event sequence overflow"),
             Self::CorruptEvent(message) => write!(f, "corrupt compaction journal event: {message}"),
+            Self::Io(message) => write!(f, "compaction journal I/O error: {message}"),
+            Self::JournalNotRegularFile => f.write_str("compaction journal path is not a regular file"),
+            Self::JournalTooLarge { actual, limit } => write!(f, "compaction journal is too large: {actual} > {limit} bytes"),
+            Self::JournalTruncated => f.write_str("compaction journal ends with a partial CJE1 event; preserve it and use a fresh attempt"),
+            Self::JournalChangedDuringRead => f.write_str("compaction journal changed while being read"),
+            Self::JournalChangedBeforeAppend => f.write_str("compaction journal changed after validation and before append"),
+            Self::JournalEventMismatch => f.write_str("compaction journal event does not match the next valid event for this attempt"),
+            Self::JournalAppendUncertain { path, reason } => write!(f, "compaction journal append durability is uncertain for {}: {reason}; reload before retrying", path.display()),
         }
     }
 }
@@ -569,4 +778,109 @@ mod tests {
             CompactionError::InvalidIdentity
         );
     }
+
+    fn temp_journal_path(label: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("ananta-compaction-{label}-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        directory.join("job.cje")
+    }
+
+    #[test]
+    fn persists_events_and_recovers_unfinished_attempt_once() {
+        let path = temp_journal_path("recover");
+        let mut journal = CompactionJobJournal::new(job_id(), 4, manifest_hash()).unwrap();
+        for state in [
+            CompactionJobState::Planned,
+            CompactionJobState::ValidatingInputs,
+            CompactionJobState::Running,
+        ] {
+            let event = journal.append(state, progress()).unwrap();
+            append_compaction_journal_event(&path, &event).unwrap();
+        }
+
+        let stored = read_compaction_journal(&path).unwrap();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored.last().unwrap().state, CompactionJobState::Running);
+
+        assert_eq!(recover_compaction_journal(&path).unwrap(), CompactionJobState::Interrupted);
+        let recovered = read_compaction_journal(&path).unwrap();
+        assert_eq!(recovered.len(), 4);
+        assert_eq!(recovered.last().unwrap().state, CompactionJobState::Interrupted);
+        assert_eq!(recovered.last().unwrap().event_sequence, 4);
+
+        let length = fs::metadata(&path).unwrap().len();
+        assert_eq!(recover_compaction_journal(&path).unwrap(), CompactionJobState::Interrupted);
+        assert_eq!(fs::metadata(&path).unwrap().len(), length);
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn completed_journal_is_not_modified_by_recovery() {
+        let path = temp_journal_path("completed");
+        let mut journal = CompactionJobJournal::new(job_id(), 5, manifest_hash()).unwrap();
+        for state in [
+            CompactionJobState::Planned,
+            CompactionJobState::ValidatingInputs,
+            CompactionJobState::Running,
+            CompactionJobState::Verifying,
+            CompactionJobState::Publishing,
+            CompactionJobState::Completed,
+        ] {
+            let event = journal.append(state, progress()).unwrap();
+            append_compaction_journal_event(&path, &event).unwrap();
+        }
+
+        let length = fs::metadata(&path).unwrap().len();
+        assert_eq!(recover_compaction_journal(&path).unwrap(), CompactionJobState::Completed);
+        assert_eq!(fs::metadata(&path).unwrap().len(), length);
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_append_to_a_partial_tail_without_truncating_it() {
+        let path = temp_journal_path("partial");
+        let mut journal = CompactionJobJournal::new(job_id(), 6, manifest_hash()).unwrap();
+        let planned = journal.append(CompactionJobState::Planned, progress()).unwrap();
+        append_compaction_journal_event(&path, &planned).unwrap();
+
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0x43, 0x4a, 0x45]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let damaged_len = fs::metadata(&path).unwrap().len();
+
+        let next = journal.append(CompactionJobState::ValidatingInputs, progress()).unwrap();
+        assert_eq!(append_compaction_journal_event(&path, &next).unwrap_err(), CompactionError::JournalTruncated);
+        assert_eq!(recover_compaction_journal(&path).unwrap_err(), CompactionError::JournalTruncated);
+        assert_eq!(fs::metadata(&path).unwrap().len(), damaged_len);
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn rejects_mismatched_event_and_checksum_damage_on_disk() {
+        let path = temp_journal_path("mismatch");
+        let mut journal = CompactionJobJournal::new(job_id(), 7, manifest_hash()).unwrap();
+        let planned = journal.append(CompactionJobState::Planned, progress()).unwrap();
+        append_compaction_journal_event(&path, &planned).unwrap();
+
+        let mut wrong = journal.append(CompactionJobState::ValidatingInputs, progress()).unwrap();
+        wrong.event_sequence = 3;
+        assert_eq!(append_compaction_journal_event(&path, &wrong).unwrap_err(), CompactionError::JournalEventMismatch);
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[90] ^= 1;
+        fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            read_compaction_journal(&path),
+            Err(CompactionError::CorruptEvent("event checksum mismatch"))
+        ));
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
 }

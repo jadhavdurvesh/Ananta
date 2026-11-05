@@ -455,8 +455,10 @@ Specification: docs/specifications/navigation-map-v0.1.md.
 - [x] Define safely discardable attempts and fresh-attempt retry semantics.
 - [x] Implement deterministic compaction job transitions, a fixed-width checksummed event codec and strict journal replay validation.
 - [x] Implement finite resource-budget validation for input/output/temp bytes, working memory, rows, open files and work-unit size.
+- [x] Persist append-only CJE1 job events with file sync and verify the complete journal on read.
+- [x] Recover unfinished attempts by appending one Interrupted event; reject partial/corrupt tails without truncating evidence.
 - [ ] Implement canonical input/output manifest codecs and fingerprint validation.
-- [ ] Persist the append-only job journal and add crash recovery, bounded execution and staging publication.
+- [ ] Add bounded compaction execution, attempt-owned staging and crash-safe candidate publication.
 - [ ] Add database-level compaction correctness and fault-injection tests.
 
 Specification: docs/specifications/compaction-manifest-v0.1.md.
