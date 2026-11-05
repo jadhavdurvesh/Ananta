@@ -464,7 +464,12 @@ Specification: docs/specifications/navigation-map-v0.1.md.
 - [x] Add budget-checked candidate execution with attempt-owned staging, chunked ANF-v2 output artifacts, work-unit cancellation and CJE1 progress.
 - [x] Implement append-only, time-first and entity-first candidate ordering with deterministic origin tie-breaking.
 - [ ] Measure candidate read latency, process CPU time and repeatable workload benefit; mixed layout remains conditional on evidence.
-- [ ] Add crash-safe active-generation promotion, rollback and recovery.
+- [x] Define AWP1 active-generation pointer retaining the previous immutable generation.
+- [x] Verify full logical table equivalence before atomic promotion.
+- [x] Publish active pointer with same-directory atomic replacement and directory sync.
+- [x] Implement rollback by pointer swap while retaining both generations.
+- [x] Recover invalid active candidate to retained previous generation on database open.
+- [ ] Complete promotion interruption and missing/incomplete-generation fault-injection tests.
 - [ ] Add bounded compaction execution, attempt-owned staging and crash-safe candidate publication.
 - [ ] Add database-level compaction correctness and fault-injection tests.
 
@@ -483,13 +488,13 @@ Decision: docs/decisions/0010-compaction-input-snapshots-and-candidate-outputs.m
 - [ ] Record read latency for each workload.
 
 ## M3.3 Generation promotion
-- [ ] Define active generation pointer.
-- [ ] Build candidate generation off the active path.
-- [ ] Verify row counts and checksums.
-- [ ] Run reference query equivalence checks.
-- [ ] Publish the new manifest safely.
-- [ ] Retain previous generation until verification completes.
-- [ ] Implement rollback to previous generation.
+- [x] Define active generation pointer.
+- [x] Build candidate generation off the active path.
+- [x] Verify row counts and checksums.
+- [x] Run reference query equivalence checks.
+- [x] Publish the new pointer safely after candidate verification.
+- [x] Retain previous generation until verification completes.
+- [x] Implement rollback to previous generation.
 - [ ] Test interruption during promotion.
 - [ ] Test recovery from missing/incomplete candidate generation.
 

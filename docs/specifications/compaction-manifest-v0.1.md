@@ -283,3 +283,16 @@ Each artifact has an ANF-v2 data object and a PVM1 sidecar. PVM1 stores Ingestio
 The executor journals Planned, ValidatingInputs, Running, Verifying, Publishing and Completed transitions in CJE1. Cancellation is checked between source Capsules, bounded sort runs and output merge work units; once Publishing is journalled, cancellation is too late. Progress tracks input/output/temp bytes, estimated working memory, rows and open files. Wall duration is recorded. Process CPU time is currently reported as unavailable by the portable prototype and remains an M3.2 measurement task.
 
 execute_compaction and verify_compaction_candidate do not modify source Chronicle/Capsule files or normal scan visibility. They create only an immutable candidate directory and per-attempt journal. Active-generation promotion remains M3.3.
+
+
+## 16. Active generation pointer — AWP1
+
+AWP1 is the atomic read-path selector stored in data/table/weaves/active.awp. It is a fixed 128-byte little-endian header followed by SHA-256 and AEND. It stores TableId, monotonic pointer revision, current WeaveId/generation and complete OWM1 SHA-256, plus the retained previous generation identity and OWM1 SHA-256. A previous generation is either entirely absent (all zero fields) or entirely present.
+
+Promotion is allowed only when the candidate covers the complete Chronicle sequence range beginning at one and there are no legacy ANF segments outside the pinned inventory. The candidate is independently verified against CIM1 and PVM1, and its typed-row fingerprint multiset is compared with the current logical table scan before the pointer is switched. The pointer temp file is created exclusively in the same directory, fully written and synced, then renamed over active.awp; the directory is synced. No candidate data file is overwritten or deleted.
+
+Normal row scans read the current active OWM1 and substitute its Weave data artifacts for the Chronicle records whose sequences are covered by that manifest. Chronicle records outside the active interval remain visible. The old generation is retained as the rollback target. Rollback is a new pointer revision that swaps current and previous identities; it never rewrites source data or deletes either generation.
+
+On open, an active pointer is decoded and its current candidate is fully reverified from persisted CIM1, OWM1, data artifacts and PVM1 provenance. If the active candidate is missing or invalid and the retained previous generation verifies, recovery publishes a new pointer selecting the previous generation. If neither generation verifies, opening fails closed.
+
+The atomic replace guarantee is validated on Unix filesystems with same-directory rename and directory sync. Platforms without equivalent atomic replacement must not claim crash-safe promotion until a platform-specific primitive is supplied.
