@@ -30,6 +30,26 @@ pub struct SchemaSnapshot {
     columns: Vec<SnapshotColumn>,
 }
 
+/// Findings from checking catalog references and immutable snapshot files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaSnapshotConsistencyReport {
+    /// Current catalog revisions without a valid matching snapshot file.
+    pub missing_current: Vec<(ObjectId, u64)>,
+    /// Snapshot paths that are malformed, corrupt or have an invalid filename.
+    pub invalid_files: Vec<PathBuf>,
+    /// Snapshot/temp files not referenced by the current catalog revision.
+    /// Older valid revisions are retained because future segments may reference them.
+    pub orphaned_files: Vec<PathBuf>,
+}
+
+impl SchemaSnapshotConsistencyReport {
+    pub fn is_clean(&self) -> bool {
+        self.missing_current.is_empty()
+            && self.invalid_files.is_empty()
+            && self.orphaned_files.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotColumn {
     id: ObjectId,
