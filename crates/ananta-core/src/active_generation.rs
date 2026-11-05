@@ -396,25 +396,37 @@ mod tests {
     }
 
     #[test]
-    fn atomic_pointer_failure_after_replace_leaves_complete_new_pointer() {
-        let root = std::env::temp_dir().join(format!("ananta-awp-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let old = ActiveWeavePointer {
-            table_id: 1, revision: 1,
-            active: ActiveWeaveGeneration { weave_id: 1, generation: 1, manifest_sha256: [1;32] },
-            previous: None,
-        };
-        let new = ActiveWeavePointer {
-            table_id: 1, revision: 2,
-            active: ActiveWeaveGeneration { weave_id: 2, generation: 1, manifest_sha256: [2;32] },
-            previous: Some(old.active),
-        };
-        publish_pointer(&root, &old).unwrap();
-        assert!(publish_pointer_with_hook(&root, &new, |stage| {
-            if stage == PublishStage::Replaced { Err(std::io::Error::other("injected crash")) } else { Ok(()) }
-        }).is_err());
-        assert_eq!(read_pointer(&root, 1).unwrap().unwrap(), new);
-        fs::remove_dir_all(root).unwrap();
+    fn atomic_pointer_faults_leave_only_a_complete_old_or_new_pointer() {
+        for (case, fail_at, expected_new) in [
+            (0_u8, PublishStage::TempCreated, false),
+            (1_u8, PublishStage::BytesWritten, false),
+            (2_u8, PublishStage::TempSynced, false),
+            (3_u8, PublishStage::Replaced, true),
+            (4_u8, PublishStage::DirectorySynced, true),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "ananta-awp-fault-{}-{case}", std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            let old = ActiveWeavePointer {
+                table_id: 1, revision: 1,
+                active: ActiveWeaveGeneration { weave_id: 1, generation: 1, manifest_sha256: [1;32] },
+                previous: None,
+            };
+            let new = ActiveWeavePointer {
+                table_id: 1, revision: 2,
+                active: ActiveWeaveGeneration { weave_id: 2, generation: 1, manifest_sha256: [2;32] },
+                previous: Some(old.active),
+            };
+            publish_pointer(&root, &old).unwrap();
+            let result = publish_pointer_with_hook(&root, &new, |stage| {
+                if stage == fail_at { Err(std::io::Error::other("injected promotion interruption")) } else { Ok(()) }
+            });
+            assert!(result.is_err());
+            let observed = read_pointer(&root, 1).unwrap().unwrap();
+            assert_eq!(observed, if expected_new { new } else { old });
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }
