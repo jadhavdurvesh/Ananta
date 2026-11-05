@@ -11,6 +11,10 @@ const HEADER_LEN: usize = 20;
 const DIRECTORY_ENTRY_LEN: usize = 17;
 const TRAILER_LEN: usize = 12;
 const MAX_FIELD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SEGMENT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_ROWS: usize = 1_000_000;
+const MAX_COLUMNS: usize = 4_096;
+const MAX_DECODED_CELLS: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatError {
@@ -25,6 +29,7 @@ pub enum FormatError {
     SchemaMismatch,
     Type(String),
     LengthOverflow,
+    LimitExceeded(&'static str),
 }
 
 impl fmt::Display for FormatError {
@@ -41,6 +46,7 @@ impl fmt::Display for FormatError {
             Self::SchemaMismatch => f.write_str("ANF schema does not match requested schema"),
             Self::Type(message) => f.write_str(message),
             Self::LengthOverflow => f.write_str("ANF length exceeds supported limits"),
+            Self::LimitExceeded(limit) => write!(f, "ANF limit exceeded: {limit}"),
         }
     }
 }
@@ -49,14 +55,32 @@ impl std::error::Error for FormatError {}
 #[derive(Debug, Clone, Copy)]
 struct Entry { type_code: u8, offset: usize, length: usize }
 
+fn validate_counts(row_count: usize, column_count: usize, validate_full_decode: bool) -> Result<(), FormatError> {
+    if row_count > MAX_ROWS {
+        return Err(FormatError::LimitExceeded("row count"));
+    }
+    if column_count == 0 || column_count > MAX_COLUMNS {
+        return Err(FormatError::LimitExceeded("column count"));
+    }
+    let cells = row_count.checked_mul(column_count).ok_or(FormatError::LengthOverflow)?;
+    if validate_full_decode && cells > MAX_DECODED_CELLS {
+        return Err(FormatError::LimitExceeded("decoded cells"));
+    }
+    Ok(())
+}
+
 pub fn encode_segment(schema: &Schema, rows: &[Vec<Value>]) -> Result<Vec<u8>, FormatError> {
+    let column_count = schema.len();
+    let row_count = rows.len();
+    validate_counts(row_count, column_count, true)?;
+
     for row in rows {
         schema.validate_row(row).map_err(|e| FormatError::Type(e.to_string()))?;
     }
 
-    let column_count = u32::try_from(schema.len()).map_err(|_| FormatError::LengthOverflow)?;
-    let row_count = u64::try_from(rows.len()).map_err(|_| FormatError::LengthOverflow)?;
-    let directory_len = schema.len().checked_mul(DIRECTORY_ENTRY_LEN).ok_or(FormatError::LengthOverflow)?;
+    let column_count_u32 = u32::try_from(column_count).map_err(|_| FormatError::LengthOverflow)?;
+    let row_count_u64 = u64::try_from(row_count).map_err(|_| FormatError::LengthOverflow)?;
+    let directory_len = column_count.checked_mul(DIRECTORY_ENTRY_LEN).ok_or(FormatError::LengthOverflow)?;
     let payload_start = HEADER_LEN.checked_add(directory_len).ok_or(FormatError::LengthOverflow)?;
 
     let mut payloads = Vec::with_capacity(schema.len());
@@ -64,6 +88,9 @@ pub fn encode_segment(schema: &Schema, rows: &[Vec<Value>]) -> Result<Vec<u8>, F
         let mut payload = Vec::new();
         for row in rows {
             encode_value(&mut payload, &row[column_index])?;
+            if payload.len() > MAX_SEGMENT_BYTES {
+                return Err(FormatError::LimitExceeded("column payload bytes"));
+            }
         }
         payloads.push(payload);
     }
@@ -72,8 +99,8 @@ pub fn encode_segment(schema: &Schema, rows: &[Vec<Value>]) -> Result<Vec<u8>, F
     output.extend_from_slice(MAGIC);
     output.extend_from_slice(&VERSION.to_le_bytes());
     output.extend_from_slice(&0_u16.to_le_bytes()); // reserved flags
-    output.extend_from_slice(&row_count.to_le_bytes());
-    output.extend_from_slice(&column_count.to_le_bytes());
+    output.extend_from_slice(&row_count_u64.to_le_bytes());
+    output.extend_from_slice(&column_count_u32.to_le_bytes());
 
     let mut cursor = payload_start;
     for (column, payload) in schema.columns().iter().zip(&payloads) {
@@ -83,6 +110,11 @@ pub fn encode_segment(schema: &Schema, rows: &[Vec<Value>]) -> Result<Vec<u8>, F
         cursor = cursor.checked_add(payload.len()).ok_or(FormatError::LengthOverflow)?;
     }
     for payload in payloads { output.extend_from_slice(&payload); }
+
+    let total_len = output.len().checked_add(TRAILER_LEN).ok_or(FormatError::LengthOverflow)?;
+    if total_len > MAX_SEGMENT_BYTES {
+        return Err(FormatError::LimitExceeded("segment bytes"));
+    }
 
     let checksum = checksum64(&output);
     output.extend_from_slice(&checksum.to_le_bytes());
@@ -103,6 +135,9 @@ pub fn decode_projected_segment(
     projection: &[usize],
 ) -> Result<Vec<Vec<Value>>, FormatError> {
     if bytes.len() < HEADER_LEN + TRAILER_LEN { return Err(FormatError::Truncated); }
+    if bytes.len() > MAX_SEGMENT_BYTES {
+        return Err(FormatError::LimitExceeded("segment bytes"));
+    }
     if &bytes[0..4] != MAGIC { return Err(FormatError::InvalidMagic); }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
     if version != VERSION { return Err(FormatError::UnsupportedVersion(version)); }
@@ -113,6 +148,11 @@ pub fn decode_projected_segment(
     let row_count = usize::try_from(row_count_u64).map_err(|_| FormatError::LengthOverflow)?;
     let column_count = usize::try_from(read_u32(bytes, 16)?).map_err(|_| FormatError::LengthOverflow)?;
     if column_count != schema.len() { return Err(FormatError::SchemaMismatch); }
+    validate_counts(row_count, column_count, false)?;
+    let decoded_cells = row_count.checked_mul(projection.len()).ok_or(FormatError::LengthOverflow)?;
+    if decoded_cells > MAX_DECODED_CELLS {
+        return Err(FormatError::LimitExceeded("decoded cells"));
+    }
     if let Some(index) = projection.iter().find(|index| **index >= column_count) {
         return Err(FormatError::InvalidProjection(*index));
     }
