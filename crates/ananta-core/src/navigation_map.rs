@@ -423,12 +423,6 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, DbError> {
         .try_into().map_err(|_| DbError::LengthOverflow)?))
 }
 
-fn read_i64(bytes: &[u8], offset: usize) -> Result<i64, DbError> {
-    Ok(i64::from_le_bytes(bytes.get(offset..offset + 8)
-        .ok_or(DbError::NavigationMapCorrupt("truncated map integer"))?
-        .try_into().map_err(|_| DbError::LengthOverflow)?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
