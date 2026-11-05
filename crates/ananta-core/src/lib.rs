@@ -10,8 +10,11 @@ pub mod schema_snapshot;
 mod nullable_ddl;
 mod column_rename_reorder;
 mod segment_publication;
+mod chronicle;
+pub use chronicle::{BatchId, IngestOutcome, IngestResult, IngestionStats};
 use schema_snapshot::{SchemaSnapshot, SchemaSnapshotConsistencyReport};
-use segment_publication::{cleanup_orphan_segment_temps, publish_segment, DatabaseLock};
+use segment_publication::{cleanup_orphan_segment_temps, publish_segment, publish_chronicle, DatabaseLock};
+use chronicle::{encode_record, extract_payload, inspect_file as inspect_chronicle_file, scan_table_index, BatchReceipt, PayloadReader, TableChronicleIndex};
 
 const CATALOG_MAGIC: &[u8; 4] = b"ANC1";
 const CATALOG_END: &[u8; 4] = b"CEND";
@@ -52,6 +55,11 @@ pub enum DbError {
     LengthOverflow,
     DatabaseLocked(PathBuf),
     SegmentPublicationUncertain { path: PathBuf, reason: String },
+    InvalidBatchId,
+    EmptyBatch,
+    BatchIdConflict(BatchId),
+    ChronicleCorrupt(&'static str),
+    IngestRowValidation { row_index: usize, message: String },
 }
 
 impl fmt::Display for DbError {
@@ -73,6 +81,11 @@ impl fmt::Display for DbError {
             Self::LengthOverflow => f.write_str("catalog field exceeds supported limits"),
             Self::DatabaseLocked(path) => write!(f, "database is locked by another writer: {} (verify no process owns it before removing a stale lock)", path.display()),
             Self::SegmentPublicationUncertain { path, reason } => write!(f, "segment publication durability is uncertain for {}: {reason}; inspect the final path before retrying", path.display()),
+            Self::InvalidBatchId => f.write_str("BatchId must be 16 nonzero bytes"),
+            Self::EmptyBatch => f.write_str("an ingestion batch must contain at least one row"),
+            Self::BatchIdConflict(id) => write!(f, "BatchId {id} was already committed with a different payload"),
+            Self::ChronicleCorrupt(message) => write!(f, "corrupt Chronicle record: {message}"),
+            Self::IngestRowValidation { row_index, message } => write!(f, "ingestion row {row_index} failed validation: {message}"),
         }
     }
 }
@@ -124,7 +137,7 @@ impl RecordBatch {
 }
 
 struct ActiveScanSegment {
-    decoder: SegmentBatchReader<File>,
+    decoder: SegmentBatchReader<PayloadReader<File>>,
     output_slots: Vec<Option<usize>>,
 }
 
@@ -149,31 +162,49 @@ impl ScanBatchIter {
         }
         let path = self.segments[self.next_segment].clone();
         self.next_segment += 1;
-        let mut file = File::open(path)?;
+        let mut file = File::open(&path)?;
+        let file_len = file.metadata()?.len();
         file.seek(SeekFrom::Start(0))?;
-        let mut version_bytes = [0_u8; 6];
-        file.read_exact(&mut version_bytes)?;
-        if &version_bytes[..4] != b"ANF1" {
-            return Err(DbError::Format(FormatError::InvalidMagic));
-        }
-        let version = u16::from_le_bytes([version_bytes[4], version_bytes[5]]);
-        let (snapshot_revision, expected_v2) = match version {
-            1 => (1, None),
-            2 => {
-                let mut header = [0_u8; 36];
-                file.seek(SeekFrom::Start(0))?;
-                file.read_exact(&mut header)?;
-                let table_id = u64::from_le_bytes(header[20..28].try_into().map_err(|_| DbError::LengthOverflow)?);
-                let revision = u64::from_le_bytes(header[28..36].try_into().map_err(|_| DbError::LengthOverflow)?);
-                if table_id != self.current.id.0 || table_id == 0 || revision == 0 {
-                    return Err(DbError::SchemaCompatibility("segment table identity or schema revision is invalid"));
-                }
-                if revision > self.current.schema_revision {
-                    return Err(DbError::SchemaCompatibility("segment schema revision is newer than the current catalog schema"));
-                }
-                (revision, Some((table_id, revision)))
+        let mut magic = [0_u8; 4];
+        file.read_exact(&mut magic)?;
+
+        let (snapshot_revision, expected_v2, payload_reader) = if &magic == b"CHR1" {
+            let (metadata, payload_offset) = chronicle::inspect_reader(&mut file, self.current.id.0)?;
+            if metadata.schema_revision > self.current.schema_revision {
+                return Err(DbError::SchemaCompatibility("Chronicle schema revision is newer than the current catalog schema"));
             }
-            other => return Err(DbError::Format(FormatError::UnsupportedVersion(other))),
+            let reader = PayloadReader::new(file, payload_offset, metadata.payload_len);
+            (
+                metadata.schema_revision,
+                Some((metadata.table_id, metadata.schema_revision)),
+                reader,
+            )
+        } else if &magic == b"ANF1" {
+            file.seek(SeekFrom::Start(0))?;
+            let mut version_bytes = [0_u8; 6];
+            file.read_exact(&mut version_bytes)?;
+            let version = u16::from_le_bytes([version_bytes[4], version_bytes[5]]);
+            let (revision, identity) = match version {
+                1 => (1, None),
+                2 => {
+                    let mut header = [0_u8; 36];
+                    file.seek(SeekFrom::Start(0))?;
+                    file.read_exact(&mut header)?;
+                    let table_id = u64::from_le_bytes(header[20..28].try_into().map_err(|_| DbError::LengthOverflow)?);
+                    let revision = u64::from_le_bytes(header[28..36].try_into().map_err(|_| DbError::LengthOverflow)?);
+                    if table_id != self.current.id.0 || table_id == 0 || revision == 0 {
+                        return Err(DbError::SchemaCompatibility("segment table identity or schema revision is invalid"));
+                    }
+                    if revision > self.current.schema_revision {
+                        return Err(DbError::SchemaCompatibility("segment schema revision is newer than the current catalog schema"));
+                    }
+                    (revision, Some((table_id, revision)))
+                }
+                other => return Err(DbError::Format(FormatError::UnsupportedVersion(other))),
+            };
+            (revision, identity, PayloadReader::new(file, 0, file_len))
+        } else {
+            return Err(DbError::Format(FormatError::InvalidMagic));
         };
 
         let snapshot = SchemaSnapshot::read_from(&self.root, self.current.id, snapshot_revision)
@@ -208,7 +239,7 @@ impl ScanBatchIter {
             None => None,
         };
         let decoder = SegmentBatchReader::new(
-            file,
+            payload_reader,
             &physical_schema,
             &physical_projection,
             expected_identity,
@@ -309,6 +340,7 @@ fn increment_catalog_revision(catalog: &mut Catalog) -> Result<(), DbError> {
 pub struct Database {
     root: PathBuf,
     catalog: Catalog,
+    chronicle_indices: BTreeMap<ObjectId, TableChronicleIndex>,
     _writer_lock: DatabaseLock,
 }
 
@@ -327,7 +359,12 @@ impl Database {
         };
         ensure_initial_schema_snapshots(&root, &catalog)?;
         cleanup_orphan_segment_temps(&root.join("data"))?;
-        Ok(Self { root, catalog, _writer_lock: writer_lock })
+        let mut chronicle_indices = BTreeMap::new();
+        for (name, definition) in &catalog.tables {
+            let directory = root.join("data").join(name);
+            chronicle_indices.insert(definition.id, scan_table_index(&directory, definition.id.0)?);
+        }
+        Ok(Self { root, catalog, chronicle_indices, _writer_lock: writer_lock })
     }
 
     pub fn create_table(&mut self, name: impl Into<String>, schema: Schema) -> Result<(), DbError> {
@@ -364,6 +401,7 @@ impl Database {
         )?.write_to(&self.root)?;
         save_catalog(&self.root.join("catalog").join("catalog.anc"), &candidate)?;
         self.catalog = candidate;
+        self.chronicle_indices.entry(table_id).or_default();
         Ok(())
     }
 
@@ -555,6 +593,144 @@ impl Database {
         Ok(Some(final_path))
     }
 
+    /// Atomically ingest one batch using a caller-supplied idempotency identity.
+    ///
+    /// An identical retry returns the original receipt. A reused BatchId with a
+    /// different historical payload is rejected. Data and receipt are published
+    /// together in one immutable Chronicle file.
+    pub fn ingest_batch(
+        &mut self,
+        table: &str,
+        batch_id: BatchId,
+        rows: &[Vec<Value>],
+    ) -> Result<IngestResult, DbError> {
+        if rows.is_empty() {
+            let table_id = self.table_id(table)?;
+            let index = self.chronicle_indices.entry(table_id).or_default();
+            index.stats.rejected_requests = index.stats.rejected_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+            return Err(DbError::EmptyBatch);
+        }
+
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?
+            .clone();
+        let directory = self.root.join("data").join(table);
+        let index = self.chronicle_indices.entry(definition.id).or_default();
+
+        if let Some(existing) = index.by_batch_id.get(&batch_id).cloned() {
+            let snapshot = SchemaSnapshot::read_from(
+                &self.root,
+                definition.id,
+                existing.metadata.schema_revision,
+            )?;
+            let historical_ids = snapshot.column_ids().map(|id| id.0).collect::<Vec<_>>();
+            let candidate = encode_segment_v2(
+                &snapshot.schema()?,
+                rows,
+                definition.id.0,
+                existing.metadata.schema_revision,
+                &historical_ids,
+            );
+            let fingerprint_matches = candidate
+                .as_ref()
+                .map(|bytes| chronicle::sha256(bytes) == existing.metadata.fingerprint)
+                .unwrap_or(false);
+            if !fingerprint_matches {
+                index.stats.rejected_requests = index.stats.rejected_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                return Err(DbError::BatchIdConflict(batch_id));
+            }
+            index.stats.duplicate_requests = index.stats.duplicate_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+            return Ok(IngestResult {
+                outcome: IngestOutcome::Duplicate,
+                batch_id,
+                table_id: definition.id.0,
+                ingestion_sequence: existing.metadata.sequence,
+                row_count: existing.metadata.row_count,
+                encoded_bytes: existing.metadata.payload_len,
+                chronicle_path: existing.path,
+            });
+        }
+
+        for (row_index, row) in rows.iter().enumerate() {
+            if let Err(error) = definition.schema.validate_row(row) {
+                index.stats.rejected_requests = index.stats.rejected_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                return Err(DbError::IngestRowValidation {
+                    row_index,
+                    message: error.to_string(),
+                });
+            }
+        }
+        let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let payload = match encode_segment_v2(
+            &definition.schema,
+            rows,
+            definition.id.0,
+            definition.schema_revision,
+            &column_ids,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                index.stats.rejected_requests = index.stats.rejected_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                return Err(DbError::Format(error));
+            }
+        };
+        let sequence = index.next_sequence()?;
+        let (record_bytes, metadata) = encode_record(
+            definition.id.0,
+            batch_id,
+            sequence,
+            definition.schema_revision,
+            u64::try_from(rows.len()).map_err(|_| DbError::LengthOverflow)?,
+            &payload,
+        )?;
+        fs::create_dir_all(&directory)?;
+        let physical_file_id = next_segment_id(&directory)?;
+        let expected_path = directory.join(format!("segment-{physical_file_id:020}.chr"));
+
+        match publish_chronicle(&directory, physical_file_id, &record_bytes) {
+            Ok(path) => {
+                let receipt = BatchReceipt { metadata: metadata.clone(), path: path.clone() };
+                index.record(receipt)?;
+                Ok(IngestResult {
+                    outcome: IngestOutcome::Accepted,
+                    batch_id,
+                    table_id: definition.id.0,
+                    ingestion_sequence: sequence,
+                    row_count: metadata.row_count,
+                    encoded_bytes: metadata.payload_len,
+                    chronicle_path: path,
+                })
+            }
+            Err(error @ DbError::SegmentPublicationUncertain { .. }) => {
+                if expected_path.is_file() {
+                    let (published_metadata, _) = inspect_chronicle_file(&expected_path, definition.id.0)?;
+                    index.record(BatchReceipt {
+                        metadata: published_metadata,
+                        path: expected_path,
+                    })?;
+                    index.stats.uncertain_publications = index.stats.uncertain_publications.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                } else {
+                    index.stats.publication_failures = index.stats.publication_failures.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                }
+                Err(error)
+            }
+            Err(error) => {
+                index.stats.publication_failures = index.stats.publication_failures.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Durable accepted counters are reconstructed from Chronicle receipts on open.
+    /// Request/failure counters are process-local and reset after restart.
+    pub fn ingestion_stats(&self, table: &str) -> Result<IngestionStats, DbError> {
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        Ok(self.chronicle_indices.get(&definition.id)
+            .map(|index| index.stats.clone())
+            .unwrap_or_default())
+    }
+
     pub fn scan(&self, table: &str) -> Result<Vec<Vec<Value>>, DbError> {
         let schema = self.schema(table)?;
         let projection = (0..schema.len()).collect::<Vec<_>>();
@@ -661,7 +837,7 @@ impl Database {
                 let entry = entry?;
                 let path = entry.path();
                 if entry.file_type()?.is_file()
-                    && path.extension().and_then(|extension| extension.to_str()) == Some("anf")
+                    && matches!(path.extension().and_then(|extension| extension.to_str()), Some("anf" | "chr"))
                 {
                     segments.push(path);
                 }
@@ -697,7 +873,7 @@ impl Database {
         for entry in fs::read_dir(&table_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("anf") {
+            if matches!(path.extension().and_then(|s| s.to_str()), Some("anf" | "chr")) {
                 segments.push(path);
             }
         }
@@ -707,13 +883,20 @@ impl Database {
         for segment in segments {
             let mut file = File::open(&segment)?;
             let file_len = file.metadata()?.len();
-            if file_len > MAX_SEGMENT_BYTES as u64 {
+            let is_chronicle = segment.extension().and_then(|value| value.to_str()) == Some("chr");
+            let maximum_file_len = MAX_SEGMENT_BYTES as u64 + if is_chronicle { 108 } else { 0 };
+            if file_len > maximum_file_len {
                 return Err(DbError::Format(FormatError::LimitExceeded("segment bytes")));
             }
             let capacity = usize::try_from(file_len).map_err(|_| DbError::LengthOverflow)?;
             let mut bytes = Vec::with_capacity(capacity);
             file.read_to_end(&mut bytes)?;
-            let logical_rows = self.decode_and_resolve_segment(table, definition, &bytes)?;
+            let segment_bytes = if bytes.starts_with(b"CHR1") {
+                extract_payload(&bytes, definition.id.0)?.1
+            } else {
+                bytes
+            };
+            let logical_rows = self.decode_and_resolve_segment(table, definition, &segment_bytes)?;
             for row in logical_rows {
                 rows.push(projection.iter().map(|index| row[*index].clone()).collect());
             }
@@ -857,7 +1040,7 @@ fn next_segment_id(directory: &Path) -> Result<u64, DbError> {
     let mut max_id = 0_u64;
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("anf") { continue; }
+        if !matches!(path.extension().and_then(|s| s.to_str()), Some("anf" | "chr")) { continue; }
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             if let Some(number) = stem.strip_prefix("segment-").and_then(|s| s.parse::<u64>().ok()) {
                 max_id = max_id.max(number);
@@ -2735,14 +2918,17 @@ mod tests {
 
         let table_dir = path.join("data").join("telemetry");
         let orphan_temp = table_dir.join(".segment-00000000000000000099.tmp");
+        let orphan_chronicle_temp = table_dir.join(".chronicle-00000000000000000100.tmp");
         let unrelated = table_dir.join(".segment-99.tmp");
         let unknown = table_dir.join("notes.txt");
         fs::write(&orphan_temp, b"interrupted segment write").unwrap();
+        fs::write(&orphan_chronicle_temp, b"interrupted Chronicle write").unwrap();
         fs::write(&unrelated, b"not a canonical temp segment").unwrap();
         fs::write(&unknown, b"leave untouched").unwrap();
 
         let reopened = Database::open(&path).unwrap();
         assert!(!orphan_temp.exists());
+        assert!(!orphan_chronicle_temp.exists());
         assert_eq!(fs::read(unrelated).unwrap(), b"not a canonical temp segment");
         assert_eq!(fs::read(unknown).unwrap(), b"leave untouched");
         assert_eq!(reopened.scan("telemetry").unwrap(), rows);
@@ -2787,6 +2973,354 @@ mod tests {
             .join(".segment-00000000000000000001.tmp").exists());
         assert_eq!(db.scan("telemetry").unwrap(), rows);
         drop(db);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+
+    #[test]
+    fn chronicle_ingestion_accepts_once_and_resolves_duplicate_retry_after_restart() {
+        let path = temp_path();
+        let rows = vec![vec![
+            Value::TimestampMicros(100),
+            Value::Utf8("sensor-1".into()),
+            Value::Float64(21.5),
+        ]];
+        let batch_id = BatchId::from_bytes([1; 16]).unwrap();
+        let first_result;
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.create_table("telemetry", sample_schema()).unwrap();
+            first_result = db.ingest_batch("telemetry", batch_id, &rows).unwrap();
+            assert_eq!(first_result.outcome, IngestOutcome::Accepted);
+            assert_eq!(first_result.ingestion_sequence, 1);
+            assert_eq!(first_result.row_count, 1);
+            assert!(first_result.chronicle_path.extension().is_some_and(|ext| ext == "chr"));
+
+            let retry = db.ingest_batch("telemetry", batch_id, &rows).unwrap();
+            assert_eq!(retry.outcome, IngestOutcome::Duplicate);
+            assert_eq!(retry.ingestion_sequence, first_result.ingestion_sequence);
+            assert_eq!(retry.chronicle_path, first_result.chronicle_path);
+            assert_eq!(db.scan("telemetry").unwrap(), rows);
+            let stats = db.ingestion_stats("telemetry").unwrap();
+            assert_eq!(stats.accepted_batches, 1);
+            assert_eq!(stats.accepted_rows, 1);
+            assert_eq!(stats.duplicate_requests, 1);
+        }
+
+        {
+            let mut db = Database::open(&path).unwrap();
+            let retry = db.ingest_batch("telemetry", batch_id, &rows).unwrap();
+            assert_eq!(retry.outcome, IngestOutcome::Duplicate);
+            assert_eq!(retry.ingestion_sequence, 1);
+            assert_eq!(db.scan("telemetry").unwrap(), rows);
+            // Durable accepted counters are reconstructed; request counters are process-local.
+            let stats = db.ingestion_stats("telemetry").unwrap();
+            assert_eq!(stats.accepted_batches, 1);
+            assert_eq!(stats.accepted_rows, 1);
+            assert_eq!(stats.duplicate_requests, 1);
+        }
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_rejects_conflicting_batch_id_and_does_not_consume_sequence() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let first = vec![vec![
+            Value::TimestampMicros(10),
+            Value::Utf8("sensor-a".into()),
+            Value::Float64(10.0),
+        ]];
+        let different = vec![vec![
+            Value::TimestampMicros(11),
+            Value::Utf8("sensor-b".into()),
+            Value::Float64(11.0),
+        ]];
+        let id = BatchId::from_bytes([2; 16]).unwrap();
+
+        let accepted = db.ingest_batch("telemetry", id, &first).unwrap();
+        assert_eq!(accepted.ingestion_sequence, 1);
+        assert!(matches!(
+            db.ingest_batch("telemetry", id, &different),
+            Err(DbError::BatchIdConflict(found)) if found == id
+        ));
+        let next = db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([3; 16]).unwrap(),
+            &different,
+        ).unwrap();
+        assert_eq!(next.ingestion_sequence, 2);
+        assert_eq!(db.scan("telemetry").unwrap(), vec![first[0].clone(), different[0].clone()]);
+        let stats = db.ingestion_stats("telemetry").unwrap();
+        assert_eq!(stats.accepted_batches, 2);
+        assert_eq!(stats.rejected_requests, 1);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_batch_id_scope_uses_stable_table_identity() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("alpha", sample_schema()).unwrap();
+        db.create_table("beta", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("same-id-different-table".into()),
+            Value::Float64(1.0),
+        ]];
+        let id = BatchId::from_bytes([4; 16]).unwrap();
+
+        let alpha = db.ingest_batch("alpha", id, &rows).unwrap();
+        let beta = db.ingest_batch("beta", id, &rows).unwrap();
+        assert_eq!(alpha.ingestion_sequence, 1);
+        assert_eq!(beta.ingestion_sequence, 1);
+        assert_ne!(alpha.table_id, beta.table_id);
+        assert_eq!(db.ingestion_stats("alpha").unwrap().accepted_batches, 1);
+        assert_eq!(db.ingestion_stats("beta").unwrap().accepted_batches, 1);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_precommit_publication_failure_consumes_no_sequence() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(44),
+            Value::Utf8("retry-after-write-failure".into()),
+            Value::Float64(4.4),
+        ]];
+        let blocked_temp = path.join("data").join("telemetry")
+            .join(".chronicle-00000000000000000001.tmp");
+        fs::write(&blocked_temp, b"owned by another attempt").unwrap();
+        let batch_id = BatchId::from_bytes([17; 16]).unwrap();
+
+        assert!(matches!(
+            db.ingest_batch("telemetry", batch_id, &rows),
+            Err(DbError::Io(_))
+        ));
+        assert_eq!(db.ingestion_stats("telemetry").unwrap().accepted_batches, 0);
+        assert_eq!(db.ingestion_stats("telemetry").unwrap().publication_failures, 1);
+        assert_eq!(fs::read(&blocked_temp).unwrap(), b"owned by another attempt");
+
+        fs::remove_file(blocked_temp).unwrap();
+        let accepted = db.ingest_batch("telemetry", batch_id, &rows).unwrap();
+        assert_eq!(accepted.ingestion_sequence, 1);
+        assert_eq!(db.ingestion_stats("telemetry").unwrap().accepted_batches, 1);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_rejects_empty_and_invalid_batches_without_sequence_gaps() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let id1 = BatchId::from_bytes([5; 16]).unwrap();
+        assert!(matches!(db.ingest_batch("telemetry", id1, &[]), Err(DbError::EmptyBatch)));
+
+        let invalid = vec![vec![
+            Value::Utf8("not-a-timestamp".into()),
+            Value::Utf8("sensor".into()),
+            Value::Float64(1.0),
+        ]];
+        assert!(matches!(
+            db.ingest_batch("telemetry", BatchId::from_bytes([6; 16]).unwrap(), &invalid),
+            Err(DbError::IngestRowValidation { row_index: 0, .. })
+        ));
+        assert_eq!(db.scan("telemetry").unwrap(), Vec::<Vec<Value>>::new());
+        assert_eq!(db.ingestion_stats("telemetry").unwrap().accepted_batches, 0);
+        assert_eq!(db.ingestion_stats("telemetry").unwrap().rejected_requests, 2);
+
+        let valid = vec![vec![
+            Value::TimestampMicros(2),
+            Value::Utf8("sensor".into()),
+            Value::Float64(2.0),
+        ]];
+        let result = db.ingest_batch("telemetry", BatchId::from_bytes([7; 16]).unwrap(), &valid).unwrap();
+        assert_eq!(result.ingestion_sequence, 1);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_keeps_commit_order_and_preserves_late_event_timestamps() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let later_event = vec![vec![
+            Value::TimestampMicros(900),
+            Value::Utf8("later".into()),
+            Value::Float64(9.0),
+        ]];
+        let late_event = vec![vec![
+            Value::TimestampMicros(100),
+            Value::Utf8("late".into()),
+            Value::Float64(1.0),
+        ]];
+        let first = db.ingest_batch("telemetry", BatchId::from_bytes([8; 16]).unwrap(), &later_event).unwrap();
+        let second = db.ingest_batch("telemetry", BatchId::from_bytes([9; 16]).unwrap(), &late_event).unwrap();
+        assert_eq!((first.ingestion_sequence, second.ingestion_sequence), (1, 2));
+        assert_eq!(db.scan("telemetry").unwrap(), vec![later_event[0].clone(), late_event[0].clone()]);
+        let batches = db.scan_batches("telemetry", 1).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(batches.iter().map(|batch| batch.row_count).collect::<Vec<_>>(), vec![1, 1]);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_coexists_with_legacy_segments_and_legacy_insert_keeps_physical_order() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let legacy_before = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("legacy-before".into()),
+            Value::Float64(1.0),
+        ]];
+        db.insert_batch("telemetry", &legacy_before).unwrap();
+
+        let chronicle_rows = vec![vec![
+            Value::TimestampMicros(2),
+            Value::Utf8("chronicle".into()),
+            Value::Float64(2.0),
+        ]];
+        db.ingest_batch("telemetry", BatchId::from_bytes([10; 16]).unwrap(), &chronicle_rows).unwrap();
+
+        let legacy_after = vec![vec![
+            Value::TimestampMicros(3),
+            Value::Utf8("legacy-after".into()),
+            Value::Float64(3.0),
+        ]];
+        db.insert_batch("telemetry", &legacy_after).unwrap();
+        let next_chronicle = vec![vec![
+            Value::TimestampMicros(4),
+            Value::Utf8("chronicle-next".into()),
+            Value::Float64(4.0),
+        ]];
+        let second = db.ingest_batch("telemetry", BatchId::from_bytes([11; 16]).unwrap(), &next_chronicle).unwrap();
+        assert_eq!(second.ingestion_sequence, 2);
+        assert_eq!(
+            db.scan("telemetry").unwrap(),
+            vec![
+                legacy_before[0].clone(),
+                chronicle_rows[0].clone(),
+                legacy_after[0].clone(),
+                next_chronicle[0].clone(),
+            ]
+        );
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap().len(), 4);
+        assert_eq!(reopened.ingestion_stats("telemetry").unwrap().accepted_batches, 2);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_duplicate_retry_uses_the_original_schema_after_nullable_column_evolution() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let old_rows = vec![vec![
+            Value::TimestampMicros(100),
+            Value::Utf8("schema-v1".into()),
+            Value::Float64(10.0),
+        ]];
+        let id = BatchId::from_bytes([13; 16]).unwrap();
+        let accepted = db.ingest_batch("telemetry", id, &old_rows).unwrap();
+        assert_eq!(accepted.ingestion_sequence, 1);
+
+        db.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
+        let retry = db.ingest_batch("telemetry", id, &old_rows).unwrap();
+        assert_eq!(retry.outcome, IngestOutcome::Duplicate);
+        assert_eq!(retry.ingestion_sequence, 1);
+
+        let new_rows = vec![vec![
+            Value::TimestampMicros(200),
+            Value::Utf8("schema-v2".into()),
+            Value::Float64(20.0),
+            Value::Float64(30.0),
+        ]];
+        let next = db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([14; 16]).unwrap(),
+            &new_rows,
+        ).unwrap();
+        assert_eq!(next.ingestion_sequence, 2);
+        assert_eq!(db.scan("telemetry").unwrap(), vec![
+            vec![
+                Value::TimestampMicros(100),
+                Value::Utf8("schema-v1".into()),
+                Value::Float64(10.0),
+                Value::Null,
+            ],
+            new_rows[0].clone(),
+        ]);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_commit_file_recovers_an_uncertain_client_acknowledgement() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let table_id = db.table_id("telemetry").unwrap().0;
+        let schema_revision = db.table_schema_revision("telemetry").unwrap();
+        let column_ids = ["timestamp", "device", "temperature"]
+            .map(|name| db.column_id("telemetry", name).unwrap().0);
+        let rows = vec![vec![
+            Value::TimestampMicros(77),
+            Value::Utf8("ack-lost".into()),
+            Value::Float64(7.7),
+        ]];
+        let payload = encode_segment_v2(
+            db.schema("telemetry").unwrap(),
+            &rows,
+            table_id,
+            schema_revision,
+            &column_ids,
+        ).unwrap();
+        let batch_id = BatchId::from_bytes([15; 16]).unwrap();
+        let (record, _) = encode_record(table_id, batch_id, 1, schema_revision, 1, &payload).unwrap();
+        let directory = path.join("data").join("telemetry");
+        let final_path = publish_chronicle(&directory, 1, &record).unwrap();
+        assert!(final_path.exists());
+        drop(db);
+
+        let mut reopened = Database::open(&path).unwrap();
+        let retry = reopened.ingest_batch("telemetry", batch_id, &rows).unwrap();
+        assert_eq!(retry.outcome, IngestOutcome::Duplicate);
+        assert_eq!(retry.ingestion_sequence, 1);
+        let next = reopened.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([16; 16]).unwrap(),
+            &rows,
+        ).unwrap();
+        assert_eq!(next.ingestion_sequence, 2);
+        assert_eq!(reopened.scan("telemetry").unwrap(), vec![rows[0].clone(), rows[0].clone()]);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn chronicle_corruption_is_detected_during_database_open() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(5),
+            Value::Utf8("integrity".into()),
+            Value::Float64(5.0),
+        ]];
+        let result = db.ingest_batch("telemetry", BatchId::from_bytes([12; 16]).unwrap(), &rows).unwrap();
+        drop(db);
+
+        let mut bytes = fs::read(&result.chronicle_path).unwrap();
+        let position = 96 + 36 + 3;
+        bytes[position] ^= 0x01;
+        fs::write(&result.chronicle_path, bytes).unwrap();
+        assert!(matches!(
+            Database::open(&path),
+            Err(DbError::ChronicleCorrupt("record checksum mismatch"))
+        ));
         fs::remove_dir_all(path).unwrap();
     }
 

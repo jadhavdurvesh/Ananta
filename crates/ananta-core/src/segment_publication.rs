@@ -9,6 +9,9 @@ const SEGMENT_PREFIX: &str = "segment-";
 const TEMP_SEGMENT_PREFIX: &str = ".segment-";
 const SEGMENT_SUFFIX: &str = ".anf";
 const TEMP_SEGMENT_SUFFIX: &str = ".tmp";
+const CHRONICLE_PREFIX: &str = "segment-";
+const TEMP_CHRONICLE_PREFIX: &str = ".chronicle-";
+const CHRONICLE_SUFFIX: &str = ".chr";
 
 /// Exclusive local writer lock. Stale locks are deliberately not broken automatically.
 pub(crate) struct DatabaseLock {
@@ -135,6 +138,86 @@ where
     Ok(final_path)
 }
 
+
+pub(crate) fn publish_chronicle(
+    directory: &Path,
+    file_id: u64,
+    bytes: &[u8],
+) -> Result<PathBuf, DbError> {
+    publish_chronicle_with_hook(directory, file_id, bytes, |_| Ok(()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChroniclePublicationStage {
+    TemporaryCreated,
+    BytesWritten,
+    TemporaryFileSynced,
+    FinalNamePublished,
+    DirectorySyncedAfterPublish,
+    TemporaryNameRemoved,
+    DirectorySyncedAfterCleanup,
+}
+
+fn publish_chronicle_with_hook<F>(
+    directory: &Path,
+    file_id: u64,
+    bytes: &[u8],
+    mut checkpoint: F,
+) -> Result<PathBuf, DbError>
+where
+    F: FnMut(ChroniclePublicationStage) -> io::Result<()>,
+{
+    if file_id == 0 {
+        return Err(DbError::LengthOverflow);
+    }
+    let final_path = directory.join(format!("{CHRONICLE_PREFIX}{file_id:020}{CHRONICLE_SUFFIX}"));
+    let temp_path = directory.join(format!("{TEMP_CHRONICLE_PREFIX}{file_id:020}{TEMP_SEGMENT_SUFFIX}"));
+    let mut temporary_owned = false;
+    let mut published = false;
+    let result = (|| -> Result<(), DbError> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp_path)?;
+        temporary_owned = true;
+        checkpoint(ChroniclePublicationStage::TemporaryCreated).map_err(DbError::Io)?;
+
+        file.write_all(bytes)?;
+        file.flush()?;
+        checkpoint(ChroniclePublicationStage::BytesWritten).map_err(DbError::Io)?;
+
+        file.sync_all()?;
+        drop(file);
+        checkpoint(ChroniclePublicationStage::TemporaryFileSynced).map_err(DbError::Io)?;
+
+        fs::hard_link(&temp_path, &final_path)?;
+        published = true;
+        checkpoint(ChroniclePublicationStage::FinalNamePublished).map_err(DbError::Io)?;
+
+        sync_directory(directory)?;
+        checkpoint(ChroniclePublicationStage::DirectorySyncedAfterPublish).map_err(DbError::Io)?;
+
+        fs::remove_file(&temp_path)?;
+        temporary_owned = false;
+        checkpoint(ChroniclePublicationStage::TemporaryNameRemoved).map_err(DbError::Io)?;
+
+        sync_directory(directory)?;
+        checkpoint(ChroniclePublicationStage::DirectorySyncedAfterCleanup).map_err(DbError::Io)?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        if !published && temporary_owned {
+            let _ = fs::remove_file(&temp_path);
+        }
+        if published {
+            return Err(DbError::SegmentPublicationUncertain {
+                path: final_path,
+                reason: error.to_string(),
+            });
+        }
+        return Err(error);
+    }
+    Ok(final_path)
+}
+
 /// Remove only canonical regular-file temp segments. Temp names are never committed.
 pub(crate) fn cleanup_orphan_segment_temps(data_root: &Path) -> Result<Vec<PathBuf>, DbError> {
     let mut removed = Vec::new();
@@ -154,7 +237,7 @@ pub(crate) fn cleanup_orphan_segment_temps(data_root: &Path) -> Result<Vec<PathB
             let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if is_canonical_temp_segment_name(filename) {
+            if is_canonical_temp_segment_name(filename) || is_canonical_temp_chronicle_name(filename) {
                 fs::remove_file(&path)?;
                 removed.push(path);
                 changed = true;
@@ -166,6 +249,20 @@ pub(crate) fn cleanup_orphan_segment_temps(data_root: &Path) -> Result<Vec<PathB
     }
     removed.sort();
     Ok(removed)
+}
+
+
+fn is_canonical_temp_chronicle_name(filename: &str) -> bool {
+    let Some(id_text) = filename
+        .strip_prefix(TEMP_CHRONICLE_PREFIX)
+        .and_then(|value| value.strip_suffix(TEMP_SEGMENT_SUFFIX))
+    else {
+        return false;
+    };
+    if id_text.len() != 20 || !id_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    id_text.parse::<u64>().is_ok_and(|id| id != 0 && format!("{id:020}") == id_text)
 }
 
 fn is_canonical_temp_segment_name(filename: &str) -> bool {
@@ -270,6 +367,43 @@ mod tests {
             assert_eq!(fs::read(final_path).unwrap(), bytes);
             // Cleanup is safe after an uncertain post-link error whether or not
             // the temp name survived the injected checkpoint.
+            cleanup_orphan_segment_temps(&root).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chronicle_publication_faults_are_classified_before_and_after_commit_link() {
+        let root = temp_path();
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"complete Chronicle receipt and payload";
+
+        for stage in [
+            ChroniclePublicationStage::TemporaryCreated,
+            ChroniclePublicationStage::BytesWritten,
+            ChroniclePublicationStage::TemporaryFileSynced,
+        ] {
+            let result = publish_chronicle_with_hook(&root, 1, bytes, |current| {
+                if current == stage { Err(io::Error::other("injected failure")) } else { Ok(()) }
+            });
+            assert!(matches!(result, Err(DbError::Io(_))));
+            assert!(!root.join("segment-00000000000000000001.chr").exists());
+            assert!(!root.join(".chronicle-00000000000000000001.tmp").exists());
+        }
+
+        for (index, stage) in [
+            ChroniclePublicationStage::FinalNamePublished,
+            ChroniclePublicationStage::DirectorySyncedAfterPublish,
+            ChroniclePublicationStage::TemporaryNameRemoved,
+            ChroniclePublicationStage::DirectorySyncedAfterCleanup,
+        ].into_iter().enumerate() {
+            let file_id = 2 + index as u64;
+            let result = publish_chronicle_with_hook(&root, file_id, bytes, |current| {
+                if current == stage { Err(io::Error::other("injected failure")) } else { Ok(()) }
+            });
+            assert!(matches!(result, Err(DbError::SegmentPublicationUncertain { .. })));
+            let final_path = root.join(format!("segment-{file_id:020}.chr"));
+            assert_eq!(fs::read(final_path).unwrap(), bytes);
             cleanup_orphan_segment_temps(&root).unwrap();
         }
         fs::remove_dir_all(root).unwrap();
