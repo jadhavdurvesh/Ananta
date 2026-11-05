@@ -30,7 +30,7 @@ This is an experimental first vertical slice, not a complete or production-ready
 
 ## Master execution roadmap
 
-The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M2.3 — Capsule prototype.** M1 is complete. M2.1's ingestion contract and the M2.2 Chronicle prototype are implemented; M2.2's release-mode ingestion/startup benchmark is recorded. Navigation Map and Weave research remain ahead.
+The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M3.1 — compaction foundation.** M1 and M2 are complete. M2 delivered the Chronicle ingestion contract and prototype, immutable Capsule v0.1 files, a correctness-first Navigation Map, and reproducible M2 benchmarks. M3 begins with fingerprinted compaction manifests, row provenance, bounded job execution and safely discardable attempts.
 
 ## Native design documents
 
