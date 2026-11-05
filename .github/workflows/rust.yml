@@ -49,3 +49,24 @@ jobs:
           "$BENCH" scan "$LARGE" 1024
           "$BENCH" scan "$LARGE" 4096
           rm -rf "$SMALL" "$LARGE"
+      - name: Benchmark Chronicle ingestion and startup index rebuild
+        run: |
+          set -euo pipefail
+          cargo build -p ananta-core --example chronicle_benchmark
+          BENCH=target/debug/examples/chronicle_benchmark
+          ROOT=/tmp/ananta-chronicle-bench
+          CHR_SMALL="$ROOT/chronicle-small"
+          CHR_LARGE="$ROOT/chronicle-large"
+          LEGACY_LARGE="$ROOT/legacy-large"
+          mkdir -p "$ROOT"
+          echo "=== Ingestion comparison: 100 batches × 128 rows × 512-byte payload ==="
+          "$BENCH" generate "$CHR_LARGE" chronicle 100 128 512
+          "$BENCH" generate "$LEGACY_LARGE" legacy 100 128 512
+          echo "=== Fresh-process startup: legacy ANF vs Chronicle (100 files) ==="
+          "$BENCH" open "$LEGACY_LARGE"
+          "$BENCH" open "$CHR_LARGE"
+          echo "=== Chronicle startup scaling: 25 vs 100 receipt records ==="
+          "$BENCH" generate "$CHR_SMALL" chronicle 25 128 512
+          "$BENCH" open "$CHR_SMALL"
+          "$BENCH" open "$CHR_LARGE"
+          rm -rf "$ROOT"
