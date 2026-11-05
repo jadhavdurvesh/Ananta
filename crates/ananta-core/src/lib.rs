@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 pub mod schema_snapshot;
 mod nullable_ddl;
 mod column_rename_reorder;
+mod segment_publication;
 use schema_snapshot::{SchemaSnapshot, SchemaSnapshotConsistencyReport};
+use segment_publication::{cleanup_orphan_segment_temps, publish_segment, DatabaseLock};
 
 const CATALOG_MAGIC: &[u8; 4] = b"ANC1";
 const CATALOG_END: &[u8; 4] = b"CEND";
@@ -48,6 +50,8 @@ pub enum DbError {
     UnsupportedCatalogVersion(u16),
     ChecksumMismatch,
     LengthOverflow,
+    DatabaseLocked(PathBuf),
+    SegmentPublicationUncertain { path: PathBuf, reason: String },
 }
 
 impl fmt::Display for DbError {
@@ -67,6 +71,8 @@ impl fmt::Display for DbError {
             Self::UnsupportedCatalogVersion(v) => write!(f, "unsupported catalog version: {v}"),
             Self::ChecksumMismatch => f.write_str("catalog checksum mismatch"),
             Self::LengthOverflow => f.write_str("catalog field exceeds supported limits"),
+            Self::DatabaseLocked(path) => write!(f, "database is locked by another writer: {} (verify no process owns it before removing a stale lock)", path.display()),
+            Self::SegmentPublicationUncertain { path, reason } => write!(f, "segment publication durability is uncertain for {}: {reason}; inspect the final path before retrying", path.display()),
         }
     }
 }
@@ -303,6 +309,7 @@ fn increment_catalog_revision(catalog: &mut Catalog) -> Result<(), DbError> {
 pub struct Database {
     root: PathBuf,
     catalog: Catalog,
+    _writer_lock: DatabaseLock,
 }
 
 impl Database {
@@ -310,6 +317,8 @@ impl Database {
         let root = path.as_ref().to_path_buf();
         fs::create_dir_all(root.join("catalog"))?;
         fs::create_dir_all(root.join("data"))?;
+        // A handle owns the exclusive local writer lock for its entire lifetime.
+        let writer_lock = DatabaseLock::acquire(&root)?;
         let catalog_path = root.join("catalog").join("catalog.anc");
         let catalog = match fs::metadata(&catalog_path) {
             Ok(_) => load_catalog(&catalog_path)?,
@@ -317,7 +326,8 @@ impl Database {
             Err(error) => return Err(DbError::Io(error)),
         };
         ensure_initial_schema_snapshots(&root, &catalog)?;
-        Ok(Self { root, catalog })
+        cleanup_orphan_segment_temps(&root.join("data"))?;
+        Ok(Self { root, catalog, _writer_lock: writer_lock })
     }
 
     pub fn create_table(&mut self, name: impl Into<String>, schema: Schema) -> Result<(), DbError> {
@@ -541,18 +551,7 @@ impl Database {
         let table_dir = self.root.join("data").join(table);
         fs::create_dir_all(&table_dir)?;
         let segment_id = next_segment_id(&table_dir)?;
-        let final_path = table_dir.join(format!("segment-{segment_id:020}.anf"));
-        let temp_path = table_dir.join(format!(".segment-{segment_id:020}.tmp"));
-
-        let write_result = (|| -> Result<(), DbError> {
-            let mut file = OpenOptions::new().write(true).create_new(true).open(&temp_path)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temp_path, &final_path)?;
-            Ok(())
-        })();
-        if write_result.is_err() { let _ = fs::remove_file(&temp_path); }
-        write_result?;
+        let final_path = publish_segment(&table_dir, segment_id, &bytes)?;
         Ok(Some(final_path))
     }
 
@@ -2698,6 +2697,96 @@ mod tests {
         let mut iter = db.scan_batches("telemetry", 1).unwrap();
         assert!(matches!(iter.next(), Some(Err(DbError::Format(FormatError::ChecksumMismatch)))));
         assert!(iter.next().is_none());
+        fs::remove_dir_all(path).unwrap();
+    }
+
+
+    #[test]
+    fn database_handle_enforces_exclusive_writer_lock_and_releases_it_on_drop() {
+        let path = temp_path();
+        let db = Database::open(&path).unwrap();
+        assert!(path.join(".ananta.lock").is_file());
+        assert!(matches!(
+            Database::open(&path),
+            Err(DbError::DatabaseLocked(_))
+        ));
+
+        drop(db);
+        assert!(!path.join(".ananta.lock").exists());
+        let reopened = Database::open(&path).unwrap();
+        assert!(path.join(".ananta.lock").is_file());
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn database_open_cleans_orphan_temp_segments_but_preserves_published_and_unknown_files() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("published".into()),
+            Value::Float64(12.5),
+        ]];
+        let published = db.insert_batch("telemetry", &rows).unwrap().unwrap();
+        assert!(published.is_file());
+        drop(db);
+
+        let table_dir = path.join("data").join("telemetry");
+        let orphan_temp = table_dir.join(".segment-00000000000000000099.tmp");
+        let unrelated = table_dir.join(".segment-99.tmp");
+        let unknown = table_dir.join("notes.txt");
+        fs::write(&orphan_temp, b"interrupted segment write").unwrap();
+        fs::write(&unrelated, b"not a canonical temp segment").unwrap();
+        fs::write(&unknown, b"leave untouched").unwrap();
+
+        let reopened = Database::open(&path).unwrap();
+        assert!(!orphan_temp.exists());
+        assert_eq!(fs::read(unrelated).unwrap(), b"not a canonical temp segment");
+        assert_eq!(fs::read(unknown).unwrap(), b"leave untouched");
+        assert_eq!(reopened.scan("telemetry").unwrap(), rows);
+        assert!(published.exists());
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn database_open_fails_closed_on_stale_writer_lock() {
+        let path = temp_path();
+        fs::create_dir_all(&path).unwrap();
+        let lock_path = path.join(".ananta.lock");
+        fs::write(&lock_path, b"pid=unverified\n").unwrap();
+
+        assert!(matches!(
+            Database::open(&path),
+            Err(DbError::DatabaseLocked(found)) if found == lock_path
+        ));
+        assert_eq!(fs::read(&lock_path).unwrap(), b"pid=unverified\n");
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn insert_batch_publishes_complete_segment_without_leaving_temp_name() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(7),
+            Value::Utf8("sensor".into()),
+            Value::Float64(21.0),
+        ]];
+
+        let final_path = db.insert_batch("telemetry", &rows).unwrap().unwrap();
+        assert_eq!(
+            final_path.file_name().and_then(|name| name.to_str()),
+            Some("segment-00000000000000000001.anf")
+        );
+        assert!(final_path.is_file());
+        assert!(!path.join("data").join("telemetry")
+            .join(".segment-00000000000000000001.tmp").exists());
+        assert_eq!(db.scan("telemetry").unwrap(), rows);
+        drop(db);
         fs::remove_dir_all(path).unwrap();
     }
 

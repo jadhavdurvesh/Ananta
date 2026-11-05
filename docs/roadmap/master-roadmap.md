@@ -312,17 +312,21 @@ Table rename/drop, column drop, type changes and non-null additions remain defer
 
 Specification: `docs/specifications/bounded-read-batches-v0.1.md`.
 
-## M1.4 Safe segment publication
-- [ ] Define segment states: temporary, published and obsolete.
-- [ ] Define deterministic unique segment IDs.
-- [ ] Document the exact write, flush, sync and rename sequence.
-- [ ] Sync the containing directory where supported and required.
-- [ ] Document platform-specific guarantees.
-- [ ] Ensure failed temporary writes are cleaned up.
-- [ ] Ensure incomplete segments are never listed as committed.
-- [ ] Test interruption at each publication step using fault injection.
-- [ ] Add orphan temporary-file detection.
-- [ ] Add safe startup handling for orphan temporary files.
+## M1.4 Safe segment publication — implementation complete
+- [x] Define temporary and published segment states; defer obsolete state until deletion/compaction exists.
+- [x] Use deterministic monotonically allocated segment IDs under an exclusive local writer lock.
+- [x] Document write, flush, file sync and no-overwrite atomic hard-link publication.
+- [x] Sync the containing directory after publication and temp-name removal on Unix.
+- [x] Document Unix and non-Unix durability guarantees and hard-link requirements.
+- [x] Clean up operation-owned temporary files after pre-publication failures.
+- [x] Keep temporary names invisible to scans; only final `.anf` names are published segments.
+- [x] Fault-inject every publication boundary, including post-publication uncertain outcomes.
+- [x] Detect canonical orphan temporary segment files.
+- [x] Remove recognized orphan temp files on startup after acquiring the writer lock.
+- [x] Enforce one local database handle/process with `.ananta.lock`; fail closed on stale locks.
+
+Specification: `docs/specifications/segment-publication-recovery-v0.1.md`.
+ADR: `docs/decisions/0006-atomic-segment-publication-and-writer-lock.md`.
 
 ## M1 exit gate
 - [x] Golden ANF fixtures pass.
@@ -330,8 +334,8 @@ Specification: `docs/specifications/bounded-read-batches-v0.1.md`.
 - [x] Catalog survives repeated close/reopen.
 - [x] Projected streaming scans work without full-result materialisation.
 - [ ] Memory is measured and bounded by configured batches.
-- [ ] Publication failure tests pass.
-- [ ] Exclusive-writer boundary is enforced or clearly guarded.
+- [x] Publication failure tests pass.
+- [x] Exclusive-writer boundary is enforced with a fail-closed local lock.
 
 **Deliverable:** Native Storage Core v0.2.
 
