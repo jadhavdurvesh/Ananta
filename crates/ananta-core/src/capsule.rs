@@ -404,7 +404,7 @@ fn validate_metadata(metadata: &CapsuleMetadata, inspection: &SegmentInspectionV
     Ok(())
 }
 
-fn encode_column_descriptor(out: &mut Vec<u8>, stats: &CapsuleColumnStats) -> Result<(), DbError> {
+pub(crate) fn encode_column_descriptor(out: &mut Vec<u8>, stats: &CapsuleColumnStats) -> Result<(), DbError> {
     let (min_bytes, min_len) = encode_scalar(stats.data_type, stats.minimum.as_ref())?;
     let (max_bytes, max_len) = encode_scalar(stats.data_type, stats.maximum.as_ref())?;
     let flags = u8::from(stats.minimum.is_some());
@@ -422,7 +422,7 @@ fn encode_column_descriptor(out: &mut Vec<u8>, stats: &CapsuleColumnStats) -> Re
     Ok(())
 }
 
-fn decode_column_descriptor(bytes: &[u8]) -> Result<CapsuleColumnStats, DbError> {
+pub(crate) fn decode_column_descriptor(bytes: &[u8]) -> Result<CapsuleColumnStats, DbError> {
     if bytes.len() != COLUMN_DESCRIPTOR_LEN {
         return Err(DbError::CapsuleCorrupt("invalid Capsule descriptor length"));
     }
