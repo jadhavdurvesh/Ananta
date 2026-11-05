@@ -254,8 +254,8 @@ impl SchemaSnapshot {
     /// never removed or overwritten.
     pub fn write_to(&self, root: impl AsRef<Path>) -> Result<PathBuf, DbError> {
         let bytes = self.encode()?;
-        let root = root.as_ref();
-        let destination = Self::path(root, self.table_id, self.revision)?;
+        let root_path: &Path = root.as_ref();
+        let destination = Self::path(root_path, self.table_id, self.revision)?;
         let parent = destination.parent().ok_or(DbError::LengthOverflow)?;
         fs::create_dir_all(parent)?;
 
@@ -265,7 +265,7 @@ impl SchemaSnapshot {
                     return Err(DbError::CorruptCatalog("schema snapshot exceeds size limit"));
                 }
                 let existing_snapshot = Self::read_from(
-                    root.as_ref(),
+                    root_path,
                     self.table_id,
                     self.revision,
                 )?;
