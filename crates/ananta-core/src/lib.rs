@@ -653,6 +653,13 @@ mod tests {
         bytes
     }
 
+    fn read_catalog_v2_fixture() -> Vec<u8> {
+        include_str!("../tests/fixtures/catalog-v2-single-table.hex")
+            .split_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).expect("valid catalog hex fixture byte"))
+            .collect()
+    }
+
     fn refresh_catalog_checksum(bytes: &mut [u8]) {
         let trailer = bytes.len() - CATALOG_TRAILER_LEN;
         let checksum = checksum64(&bytes[..trailer]);
@@ -662,6 +669,83 @@ mod tests {
     fn write_catalog(path: &Path, bytes: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn catalog_v2_golden_fixture_is_byte_for_byte_stable() {
+        let schema = Schema::new(vec![
+            Column::new("x", DataType::Int32, false),
+        ]).unwrap();
+        let mut tables = BTreeMap::new();
+        tables.insert("t".to_owned(), TableDefinition {
+            id: ObjectId(1),
+            schema_revision: 1,
+            column_ids: vec![ObjectId(2)],
+            schema,
+        });
+        let catalog = Catalog { revision: 1, next_object_id: 3, tables };
+        let fixture = read_catalog_v2_fixture();
+
+        assert_eq!(encode_catalog_v2(&catalog).unwrap(), fixture);
+        let decoded = decode_catalog_v2(&fixture).unwrap();
+        assert_eq!(decoded.revision, 1);
+        assert_eq!(decoded.next_object_id, 3);
+        assert_eq!(decoded.tables["t"].id, ObjectId(1));
+        assert_eq!(decoded.tables["t"].column_ids, vec![ObjectId(2)]);
+        assert_eq!(decoded.tables["t"].schema_revision, 1);
+    }
+
+    #[test]
+    fn catalog_v2_rejects_next_object_id_not_above_allocated_ids() {
+        let fixture = read_catalog_v2_fixture();
+        let mut bytes = fixture;
+        bytes[16..24].copy_from_slice(&2_u64.to_le_bytes());
+        refresh_catalog_checksum(&mut bytes);
+        assert!(matches!(
+            decode_catalog_v2(&bytes),
+            Err(DbError::CorruptCatalog("next object ID is not greater than allocated IDs"))
+        ));
+    }
+
+    #[test]
+    fn catalog_v2_rejects_zero_schema_revision() {
+        let mut bytes = read_catalog_v2_fixture();
+        let table_name_len = u32::from_le_bytes(bytes[36..40].try_into().unwrap()) as usize;
+        let schema_revision_offset = 40 + table_name_len;
+        bytes[schema_revision_offset..schema_revision_offset + 8]
+            .copy_from_slice(&0_u64.to_le_bytes());
+        refresh_catalog_checksum(&mut bytes);
+        assert!(matches!(
+            decode_catalog_v2(&bytes),
+            Err(DbError::CorruptCatalog("schema revision is zero"))
+        ));
+    }
+
+    #[test]
+    fn catalog_v2_rejects_unsupported_version() {
+        let mut bytes = read_catalog_v2_fixture();
+        bytes[4..6].copy_from_slice(&3_u16.to_le_bytes());
+        assert!(matches!(
+            decode_catalog_v2(&bytes),
+            Err(DbError::UnsupportedCatalogVersion(3))
+        ));
+    }
+
+    #[test]
+    fn failed_table_creation_does_not_advance_in_memory_catalog() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        fs::write(path.join("catalog").join("catalog.anc.tmp"), b"reserved").unwrap();
+
+        assert!(matches!(
+            db.create_table("telemetry", sample_schema()),
+            Err(DbError::Io(_))
+        ));
+        assert_eq!(db.catalog_revision(), 0);
+        assert_eq!(db.table_names().count(), 0);
+        assert_eq!(fs::read(path.join("catalog").join("catalog.anc.tmp")).unwrap(), b"reserved");
+
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
