@@ -940,6 +940,109 @@ mod tests {
         );
     }
 
+    fn read_v2_fixture_hex() -> Vec<u8> {
+        include_str!("../tests/fixtures/anf-v0.2-int32-single-row.hex")
+            .split_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).expect("valid ANF v0.2 fixture byte"))
+            .collect()
+    }
+
+    #[test]
+    fn anf_v0_2_golden_fixture_is_byte_for_byte_stable() {
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::Int32, false),
+        ]).unwrap();
+        let rows = vec![vec![Value::Int32(7)]];
+        let fixture = read_v2_fixture_hex();
+
+        assert_eq!(encode_segment_v2(&schema, &rows, 1, 1, &[2]).unwrap(), fixture);
+        assert_eq!(segment_version(&fixture).unwrap(), 2);
+        assert_eq!(inspect_segment_v2(&fixture).unwrap(), SegmentIdentityV2 {
+            table_id: 1,
+            schema_revision: 1,
+            column_ids: vec![2],
+        });
+        assert_eq!(decode_segment_v2(&fixture, &schema, 1, 1, &[2]).unwrap(), rows);
+    }
+
+    #[test]
+    fn anf_v0_2_rejects_zero_or_duplicate_identity() {
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::Int32, false),
+        ]).unwrap();
+        let rows = vec![vec![Value::Int32(7)]];
+        assert_eq!(
+            encode_segment_v2(&schema, &rows, 0, 1, &[2]),
+            Err(FormatError::InvalidValue("table ID and schema revision must be nonzero"))
+        );
+        assert_eq!(
+            encode_segment_v2(&schema, &rows, 1, 1, &[0]),
+            Err(FormatError::InvalidValue("column IDs must be nonzero and unique"))
+        );
+        let two_columns = Schema::new(vec![
+            Column::new("a", DataType::Int32, false),
+            Column::new("b", DataType::Int32, false),
+        ]).unwrap();
+        assert!(matches!(
+            encode_segment_v2(&two_columns, &[vec![Value::Int32(1), Value::Int32(2)]], 1, 1, &[3, 3]),
+            Err(FormatError::InvalidValue("column IDs must be nonzero and unique"))
+        ));
+    }
+
+    #[test]
+    fn anf_v0_2_decoder_rejects_wrong_table_revision_or_column_ids() {
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::Int32, false),
+        ]).unwrap();
+        let bytes = encode_segment_v2(&schema, &[vec![Value::Int32(7)]], 11, 4, &[21]).unwrap();
+
+        assert_eq!(
+            decode_segment_v2(&bytes, &schema, 12, 4, &[21]),
+            Err(FormatError::SchemaMismatch)
+        );
+        assert_eq!(
+            decode_segment_v2(&bytes, &schema, 11, 3, &[21]),
+            Err(FormatError::SchemaMismatch)
+        );
+        assert_eq!(
+            decode_segment_v2(&bytes, &schema, 11, 4, &[22]),
+            Err(FormatError::SchemaMismatch)
+        );
+    }
+
+    #[test]
+    fn anf_v0_2_inspector_rejects_corrupt_identity_directory_and_flags() {
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::Int32, false),
+        ]).unwrap();
+        let rows = vec![vec![Value::Int32(7)]];
+        let valid = encode_segment_v2(&schema, &rows, 1, 1, &[2]).unwrap();
+
+        let mut zero_table = valid.clone();
+        zero_table[20..28].copy_from_slice(&0_u64.to_le_bytes());
+        refresh_checksum(&mut zero_table);
+        assert_eq!(
+            inspect_segment_v2(&zero_table),
+            Err(FormatError::InvalidValue("table ID and schema revision must be nonzero"))
+        );
+
+        let mut bad_column_id = valid.clone();
+        bad_column_id[37..45].copy_from_slice(&0_u64.to_le_bytes());
+        refresh_checksum(&mut bad_column_id);
+        assert_eq!(
+            inspect_segment_v2(&bad_column_id),
+            Err(FormatError::InvalidValue("column IDs must be nonzero and unique"))
+        );
+
+        let mut unknown_flags = valid;
+        unknown_flags[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        refresh_checksum(&mut unknown_flags);
+        assert_eq!(
+            inspect_segment_v2(&unknown_flags),
+            Err(FormatError::InvalidValue("unknown mandatory feature flags"))
+        );
+    }
+
     #[test]
     fn truncated_segment_is_rejected() {
         let schema = schema();
