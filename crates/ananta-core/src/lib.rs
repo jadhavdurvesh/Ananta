@@ -410,6 +410,7 @@ impl Database {
             chronicle_indices.insert(definition.id, scan_table_index(&directory, definition.id.0)?);
         }
         let database = Self { root, catalog, chronicle_indices, _writer_lock: writer_lock };
+        database.recover_compaction_jobs()?;
         database.recover_active_weaves()?;
         Ok(database)
     }
