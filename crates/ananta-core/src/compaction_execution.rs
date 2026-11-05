@@ -1,6 +1,6 @@
 use crate::chronicle::sha256;
 use crate::compaction::{
-    append_compaction_journal_event, CompactionJobJournal, CompactionJobState,
+    append_compaction_journal_event, CompactionJobId, CompactionJobJournal, CompactionJobState,
     CompactionProgress, CompactionResourceLimits,
 };
 use crate::compaction_manifest::{CompactionInputManifest, ManifestError};
@@ -737,9 +737,6 @@ fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire))
 }
 
-fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
-    cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire))
-}
 
 fn check_cancel(cancel: Option<&AtomicBool>) -> Result<(), DbError> {
     if cancel.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
