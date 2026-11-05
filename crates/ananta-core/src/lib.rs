@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub mod schema_snapshot;
 mod nullable_ddl;
+mod column_rename_reorder;
 use schema_snapshot::{SchemaSnapshot, SchemaSnapshotConsistencyReport};
 
 const CATALOG_MAGIC: &[u8; 4] = b"ANC1";
@@ -41,6 +42,7 @@ pub enum DbError {
     TableNotFound(String),
     ColumnNotFound(String),
     ColumnExists(String),
+    InvalidColumnOrder(String),
     CorruptCatalog(&'static str),
     SchemaCompatibility(&'static str),
     UnsupportedCatalogVersion(u16),
@@ -59,6 +61,7 @@ impl fmt::Display for DbError {
             Self::TableNotFound(s) => write!(f, "table not found: {s}"),
             Self::ColumnNotFound(s) => write!(f, "column not found: {s}"),
             Self::ColumnExists(s) => write!(f, "column already exists: {s}"),
+            Self::InvalidColumnOrder(s) => write!(f, "invalid column order: {s}"),
             Self::CorruptCatalog(s) => write!(f, "corrupt ANANTA catalog: {s}"),
             Self::SchemaCompatibility(s) => write!(f, "ANANTA schema compatibility error: {s}"),
             Self::UnsupportedCatalogVersion(v) => write!(f, "unsupported catalog version: {v}"),
@@ -1587,6 +1590,356 @@ mod tests {
         let next_snapshot = SchemaSnapshot::path(&path, table_id, 2).unwrap();
         assert!(matches!(
             db.add_nullable_column("telemetry", "humidity", DataType::Float64),
+            Err(DbError::LengthOverflow)
+        ));
+        assert!(!next_snapshot.exists());
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+        assert_eq!(db.catalog_revision(), u64::MAX);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn rename_and_reorder_preserve_ids_and_historical_segment_reads() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        let original_schema = sample_schema();
+        db.create_table("telemetry", original_schema.clone()).unwrap();
+
+        let table_id = db.table_id("telemetry").unwrap();
+        let timestamp_id = db.column_id("telemetry", "timestamp").unwrap();
+        let device_id = db.column_id("telemetry", "device").unwrap();
+        let temperature_id = db.column_id("telemetry", "temperature").unwrap();
+
+        // Legacy v0.1 data resolves via the immutable revision-one snapshot.
+        let legacy_v0_1 = vec![vec![
+            Value::TimestampMicros(10),
+            Value::Utf8("sensor-v0.1".into()),
+            Value::Float64(18.5),
+        ]];
+        let table_dir = path.join("data").join("telemetry");
+        fs::write(
+            table_dir.join("segment-00000000000000000001.anf"),
+            encode_segment(&original_schema, &legacy_v0_1).unwrap(),
+        ).unwrap();
+
+        // A v0.2 segment also records the pre-rename/pre-reorder identity.
+        let legacy_v0_2 = vec![vec![
+            Value::TimestampMicros(20),
+            Value::Utf8("sensor-v0.2".into()),
+            Value::Float64(19.5),
+        ]];
+        db.insert_batch("telemetry", &legacy_v0_2).unwrap();
+
+        assert_eq!(
+            db.rename_column("telemetry", "device", "sensor").unwrap(),
+            device_id,
+        );
+        assert_eq!(db.column_id("telemetry", "sensor").unwrap(), device_id);
+        assert!(matches!(
+            db.column_id("telemetry", "device"),
+            Err(DbError::ColumnNotFound(_))
+        ));
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 2);
+        assert_eq!(db.catalog_revision(), 2);
+
+        db.reorder_columns("telemetry", &["temperature", "timestamp", "sensor"]).unwrap();
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 3);
+        assert_eq!(db.catalog_revision(), 3);
+        assert_eq!(
+            db.schema("telemetry").unwrap().columns().iter()
+                .map(|column| column.name.as_str()).collect::<Vec<_>>(),
+            vec!["temperature", "timestamp", "sensor"],
+        );
+        assert_eq!(db.column_id("telemetry", "timestamp").unwrap(), timestamp_id);
+        assert_eq!(db.column_id("telemetry", "sensor").unwrap(), device_id);
+        assert_eq!(db.column_id("telemetry", "temperature").unwrap(), temperature_id);
+
+        let new_rows = vec![vec![
+            Value::Float64(23.5),
+            Value::TimestampMicros(30),
+            Value::Utf8("sensor-new".into()),
+        ]];
+        let new_segment = db.insert_batch("telemetry", &new_rows).unwrap().unwrap();
+        let identity = inspect_segment_v2(&fs::read(new_segment).unwrap()).unwrap();
+        assert_eq!(identity.table_id, table_id.0);
+        assert_eq!(identity.schema_revision, 3);
+        assert_eq!(
+            identity.column_ids,
+            vec![temperature_id.0, timestamp_id.0, device_id.0],
+        );
+
+        let expected = vec![
+            vec![
+                Value::Float64(18.5),
+                Value::TimestampMicros(10),
+                Value::Utf8("sensor-v0.1".into()),
+            ],
+            vec![
+                Value::Float64(19.5),
+                Value::TimestampMicros(20),
+                Value::Utf8("sensor-v0.2".into()),
+            ],
+            new_rows[0].clone(),
+        ];
+        assert_eq!(db.scan("telemetry").unwrap(), expected);
+        assert_eq!(
+            db.scan_columns("telemetry", &["sensor", "temperature"]).unwrap(),
+            vec![
+                vec![Value::Utf8("sensor-v0.1".into()), Value::Float64(18.5)],
+                vec![Value::Utf8("sensor-v0.2".into()), Value::Float64(19.5)],
+                vec![Value::Utf8("sensor-new".into()), Value::Float64(23.5)],
+            ],
+        );
+        assert!(db.check_schema_snapshot_consistency().unwrap().is_clean());
+
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap(), expected);
+        assert_eq!(reopened.table_schema_revision("telemetry").unwrap(), 3);
+        assert_eq!(reopened.catalog_revision(), 3);
+        assert_eq!(reopened.column_id("telemetry", "sensor").unwrap(), device_id);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn rename_column_validates_names_and_exact_rename_is_a_noop() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let device_id = db.column_id("telemetry", "device").unwrap();
+
+        assert_eq!(db.rename_column("telemetry", "device", "device").unwrap(), device_id);
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+        assert_eq!(db.catalog_revision(), 1);
+
+        assert!(matches!(
+            db.rename_column("telemetry", "device", "TEMPERATURE"),
+            Err(DbError::ColumnExists(name)) if name == "TEMPERATURE"
+        ));
+        assert!(matches!(
+            db.rename_column("telemetry", "device", "   "),
+            Err(DbError::Type(TypeError::InvalidSchema(_)))
+        ));
+        assert!(matches!(
+            db.rename_column("telemetry", "missing", "renamed"),
+            Err(DbError::ColumnNotFound(_))
+        ));
+        assert!(matches!(
+            db.rename_column("missing_table", "device", "renamed"),
+            Err(DbError::TableNotFound(_))
+        ));
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+        assert_eq!(db.catalog_revision(), 1);
+
+        // Case-only spelling changes are real renames, but retain the same ID.
+        assert_eq!(db.rename_column("telemetry", "device", "Device").unwrap(), device_id);
+        assert_eq!(db.column_id("telemetry", "Device").unwrap(), device_id);
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 2);
+        assert_eq!(db.catalog_revision(), 2);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn reorder_columns_requires_an_exact_complete_permutation() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+
+        // The existing order is a no-op.
+        db.reorder_columns("telemetry", &["timestamp", "device", "temperature"]).unwrap();
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+        assert_eq!(db.catalog_revision(), 1);
+
+        assert!(matches!(
+            db.reorder_columns("telemetry", &["timestamp", "device"]),
+            Err(DbError::InvalidColumnOrder(_))
+        ));
+        assert!(matches!(
+            db.reorder_columns("telemetry", &["timestamp", "device", "device"]),
+            Err(DbError::InvalidColumnOrder(_))
+        ));
+        assert!(matches!(
+            db.reorder_columns("telemetry", &["timestamp", "device", "missing"]),
+            Err(DbError::ColumnNotFound(_))
+        ));
+        assert!(matches!(
+            db.reorder_columns("telemetry", &["timestamp", "device", "temperature", "extra"]),
+            Err(DbError::InvalidColumnOrder(_))
+        ));
+        assert!(matches!(
+            db.reorder_columns("missing_table", &["a"]),
+            Err(DbError::TableNotFound(_))
+        ));
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+        assert_eq!(db.catalog_revision(), 1);
+
+        db.reorder_columns("telemetry", &["temperature", "device", "timestamp"]).unwrap();
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 2);
+        assert_eq!(db.catalog_revision(), 2);
+        assert_eq!(
+            db.schema("telemetry").unwrap().columns().iter()
+                .map(|column| column.name.as_str()).collect::<Vec<_>>(),
+            vec!["temperature", "device", "timestamp"],
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn rename_and_reorder_reject_missing_corrupt_and_inconsistent_snapshots() {
+        for operation in 0..2 {
+            for snapshot_state in 0..3 {
+                let path = temp_path();
+                let mut db = Database::open(&path).unwrap();
+                db.create_table("telemetry", sample_schema()).unwrap();
+                let table_id = db.table_id("telemetry").unwrap();
+                let snapshot_path = SchemaSnapshot::path(&path, table_id, 1).unwrap();
+
+                match snapshot_state {
+                    0 => fs::remove_file(&snapshot_path).unwrap(),
+                    1 => fs::write(&snapshot_path, b"broken snapshot").unwrap(),
+                    _ => {
+                        let ids = ["timestamp", "device", "temperature"]
+                            .map(|name| db.column_id("telemetry", name).unwrap()).to_vec();
+                        let mismatch = Schema::new(vec![
+                            Column::new("timestamp", DataType::TimestampMicros, false),
+                            Column::new("sensor", DataType::Utf8, false),
+                            Column::new("temperature", DataType::Float64, true),
+                        ]).unwrap();
+                        let bad = SchemaSnapshot::new(table_id, 1, &mismatch, &ids).unwrap();
+                        fs::remove_file(&snapshot_path).unwrap();
+                        bad.write_to(&path).unwrap();
+                    }
+                }
+
+                let result = if operation == 0 {
+                    db.rename_column("telemetry", "device", "sensor").map(|_| ())
+                } else {
+                    db.reorder_columns("telemetry", &["temperature", "device", "timestamp"])
+                };
+                assert!(matches!(result, Err(DbError::SchemaCompatibility(_))));
+                assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+                assert_eq!(db.catalog_revision(), 1);
+                assert_eq!(db.schema("telemetry").unwrap().len(), 3);
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn rename_and_reorder_publication_failures_preserve_old_catalog_and_allow_retry() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+
+        let table_id = db.table_id("telemetry").unwrap();
+        let rename_orphan = SchemaSnapshot::path(&path, table_id, 2).unwrap();
+        let catalog_temp = path.join("catalog").join("catalog.anc.tmp");
+        fs::write(&catalog_temp, b"block catalog publish").unwrap();
+
+        assert!(matches!(
+            db.rename_column("telemetry", "device", "sensor"),
+            Err(DbError::Io(_))
+        ));
+        assert_eq!(db.schema("telemetry").unwrap().columns()[1].name, "device");
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+        assert_eq!(db.catalog_revision(), 1);
+        assert!(db.check_schema_snapshot_consistency().unwrap().orphaned_files.contains(&rename_orphan));
+
+        fs::remove_file(&catalog_temp).unwrap();
+        db.rename_column("telemetry", "device", "sensor").unwrap();
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 2);
+        assert!(db.check_schema_snapshot_consistency().unwrap().is_clean());
+
+        let reorder_orphan = SchemaSnapshot::path(&path, table_id, 3).unwrap();
+        fs::write(&catalog_temp, b"block catalog publish").unwrap();
+        assert!(matches!(
+            db.reorder_columns("telemetry", &["temperature", "timestamp", "sensor"]),
+            Err(DbError::Io(_))
+        ));
+        assert_eq!(
+            db.schema("telemetry").unwrap().columns().iter()
+                .map(|column| column.name.as_str()).collect::<Vec<_>>(),
+            vec!["timestamp", "sensor", "temperature"],
+        );
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 2);
+        assert_eq!(db.catalog_revision(), 2);
+        assert!(db.check_schema_snapshot_consistency().unwrap().orphaned_files.contains(&reorder_orphan));
+
+        fs::remove_file(&catalog_temp).unwrap();
+        db.reorder_columns("telemetry", &["temperature", "timestamp", "sensor"]).unwrap();
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 3);
+        assert_eq!(db.catalog_revision(), 3);
+        assert!(db.check_schema_snapshot_consistency().unwrap().is_clean());
+
+        drop(db);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(
+            reopened.schema("telemetry").unwrap().columns().iter()
+                .map(|column| column.name.as_str()).collect::<Vec<_>>(),
+            vec!["temperature", "timestamp", "sensor"],
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn rename_column_refuses_to_overwrite_a_conflicting_orphan_snapshot() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let table_id = db.table_id("telemetry").unwrap();
+        let ids = ["timestamp", "device", "temperature"]
+            .map(|name| db.column_id("telemetry", name).unwrap());
+        let conflicting_schema = Schema::new(vec![
+            Column::new("timestamp", DataType::TimestampMicros, false),
+            Column::new("other", DataType::Utf8, false),
+            Column::new("temperature", DataType::Float64, true),
+        ]).unwrap();
+        let conflicting = SchemaSnapshot::new(table_id, 2, &conflicting_schema, &ids)
+            .unwrap();
+        let conflicting_path = conflicting.write_to(&path).unwrap();
+        let original_bytes = fs::read(&conflicting_path).unwrap();
+
+        assert!(matches!(
+            db.rename_column("telemetry", "device", "sensor"),
+            Err(DbError::CorruptCatalog("immutable schema snapshot conflict"))
+        ));
+        assert_eq!(fs::read(&conflicting_path).unwrap(), original_bytes);
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
+        assert_eq!(db.catalog_revision(), 1);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn rename_and_reorder_reject_revision_counter_overflow() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let definition = db.catalog.tables.get("telemetry").unwrap().clone();
+        SchemaSnapshot::new(
+            definition.id,
+            u64::MAX,
+            &definition.schema,
+            &definition.column_ids,
+        ).unwrap().write_to(&path).unwrap();
+        db.catalog.tables.get_mut("telemetry").unwrap().schema_revision = u64::MAX;
+        assert!(matches!(
+            db.rename_column("telemetry", "device", "sensor"),
+            Err(DbError::LengthOverflow)
+        ));
+        assert_eq!(db.table_schema_revision("telemetry").unwrap(), u64::MAX);
+        fs::remove_dir_all(path).unwrap();
+
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        db.catalog.revision = u64::MAX;
+        let next_snapshot = SchemaSnapshot::path(
+            &path,
+            db.table_id("telemetry").unwrap(),
+            2,
+        ).unwrap();
+        assert!(matches!(
+            db.reorder_columns("telemetry", &["temperature", "device", "timestamp"]),
             Err(DbError::LengthOverflow)
         ));
         assert!(!next_snapshot.exists());

@@ -276,12 +276,22 @@ Specification: `docs/specifications/anf-v0.2-prototype.md`.
 
 Specification: `docs/specifications/nullable-column-ddl-v0.1.md`.
 
-#### M1.2.3.4.2 Rename and reorder columns — next
-- [ ] Define rename/reorder snapshot transition and compatibility rules.
-- [ ] Implement column rename while preserving ColumnId.
-- [ ] Implement column reorder while preserving ColumnIds.
-- [ ] Verify historical segment mapping by ColumnId after rename/reorder.
-- [ ] Add failure-injection tests for snapshot/catalog publication.
+#### M1.2.3.4.2 Rename and reorder columns — complete
+- [x] Define rename/reorder snapshot transition and compatibility rules.
+- [x] Implement `Database::rename_column` while preserving ColumnId.
+- [x] Implement `Database::reorder_columns` while preserving ColumnIds.
+- [x] Verify historical v0.1/v0.2 segment mapping by ColumnId after rename/reorder.
+- [x] Test new v0.2 writes, close/reopen and projection order.
+- [x] Test no-ops, invalid names/permutations, missing/corrupt/inconsistent snapshots, publication failure/retry, immutable conflicts and counter overflow.
+- [x] Pass formatting, workspace tests, Clippy and the native example.
+
+**Implemented in [PR #12](https://github.com/jadhavdurvesh/Ananta/pull/12); CI verification recorded after the final PR run.**
+
+Specification: `docs/specifications/column-rename-reorder-v0.1.md`.
+
+### M1.2.3.5 Column drop and table identity changes — not started
+- [ ] Define tombstone and historical-read semantics before allowing column drops.
+- [ ] Keep table rename/drop disabled until data-directory identity and recovery rules are specified.
 
 Table rename/drop, column drop, type changes and non-null additions remain deferred until path identity, tombstones, backfill and compaction protocols are designed.
 
@@ -834,4 +844,4 @@ Do these in order. Do not skip ahead.
 10. [ ] Mark M0 complete only after all exit criteria pass.
 11. [ ] Start M1 with exactly one small PR: the ANF format/golden-fixture and safety work package.
 
-**Current focus: M1.2.3.4.2 — define safe column rename/reorder semantics while preserving stable ColumnIds. Table/column drops, type changes and non-null additions remain disabled.**
+**Current focus: M1.3 — design and implement bounded read batches. Column/table drops, type changes and non-null additions remain disabled.**
