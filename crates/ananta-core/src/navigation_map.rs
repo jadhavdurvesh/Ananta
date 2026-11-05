@@ -8,10 +8,10 @@ const END: &[u8; 4] = b"NEND";
 const VERSION: u16 = 1;
 const HEADER_LEN: usize = 32;
 const TRAILER_LEN: usize = 12;
-const ENTRY_FIXED_LEN: usize = 156;
+const ENTRY_FIXED_LEN: usize = 164;
 const MAX_MAP_BYTES: usize = 256 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnRangePredicate {
     pub column: String,
     pub lower: Option<Value>,
@@ -32,7 +32,7 @@ impl ColumnRangePredicate {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CapsuleScanRequest {
     pub ranges: Vec<ColumnRangePredicate>,
     pub projection: Option<Vec<String>>,
@@ -152,6 +152,9 @@ impl NavigationMap {
             return Err(DbError::NavigationMapCorrupt("map checksum or end marker mismatch"));
         }
 
+        if entry_count > (trailer_start.saturating_sub(HEADER_LEN)) / (4 + ENTRY_FIXED_LEN) {
+            return Err(DbError::NavigationMapCorrupt("entry count exceeds map size"));
+        }
         let mut entries = Vec::with_capacity(entry_count);
         let mut cursor = HEADER_LEN;
         let mut previous_identity = None;
@@ -183,7 +186,7 @@ impl NavigationMap {
             let payload_sha256 = take_array::<32>(record, &mut position)?;
             let column_count = usize::try_from(take_u32(record, &mut position)?).map_err(|_| DbError::LengthOverflow)?;
             if column_count == 0 || column_count > 4_096
-                || record_len != ENTRY_FIXED_LEN + column_count * 48
+                || record_len != ENTRY_FIXED_LEN.checked_add(column_count.checked_mul(48).ok_or(DbError::LengthOverflow)?).ok_or(DbError::LengthOverflow)?
                 || position != ENTRY_FIXED_LEN
             {
                 return Err(DbError::NavigationMapCorrupt("invalid column descriptor count or entry size"));
