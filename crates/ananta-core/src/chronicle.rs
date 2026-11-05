@@ -1,7 +1,7 @@
 use crate::DbError;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 4] = b"CHR1";
@@ -291,6 +291,20 @@ pub(crate) fn inspect_reader<R: Read + Seek>(
         table_id, batch_id, sequence, schema_revision, row_count, payload_len,
         fingerprint: expected_fingerprint,
     }, HEADER_LEN as u64))
+}
+
+
+pub(crate) fn extract_payload(
+    bytes: &[u8],
+    expected_table_id: u64,
+) -> Result<(ChronicleMetadata, Vec<u8>), DbError> {
+    let mut cursor = Cursor::new(bytes);
+    let (metadata, offset) = inspect_reader(&mut cursor, expected_table_id)?;
+    let start = usize::try_from(offset).map_err(|_| DbError::LengthOverflow)?;
+    let length = usize::try_from(metadata.payload_len).map_err(|_| DbError::LengthOverflow)?;
+    let end = start.checked_add(length).ok_or(DbError::LengthOverflow)?;
+    let payload = bytes.get(start..end).ok_or(DbError::ChronicleCorrupt("payload range is truncated"))?;
+    Ok((metadata, payload.to_vec()))
 }
 
 pub(crate) struct PayloadReader<R> {
