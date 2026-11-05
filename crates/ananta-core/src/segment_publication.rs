@@ -446,14 +446,27 @@ mod tests {
         let unrelated = table.join(".segment-1.tmp");
         let published = table.join("segment-00000000000000000001.anf");
         let nested = table.join(".segment-00000000000000000002.tmp");
+        let capsule_dir = table.join("capsules");
+        fs::create_dir_all(&capsule_dir).unwrap();
+        let orphan_capsule = capsule_dir.join(".capsule-00000000000000000003-g00000000000000000001.tmp");
+        let orphan_map = capsule_dir.join(".navigation-00000000000000000004.tmp");
+        let unrelated_map = capsule_dir.join(".navigation-4.tmp");
         fs::write(&canonical, b"interrupted").unwrap();
         fs::write(&unrelated, b"leave me").unwrap();
         fs::write(&published, b"published").unwrap();
         fs::create_dir(&nested).unwrap();
+        fs::write(&orphan_capsule, b"interrupted capsule").unwrap();
+        fs::write(&orphan_map, b"interrupted map").unwrap();
+        fs::write(&unrelated_map, b"leave map").unwrap();
 
+        let mut expected = vec![canonical.clone(), orphan_capsule.clone(), orphan_map.clone()];
+        expected.sort();
         let removed = cleanup_orphan_segment_temps(&root).unwrap();
-        assert_eq!(removed, vec![canonical.clone()]);
+        assert_eq!(removed, expected);
         assert!(!canonical.exists());
+        assert!(!orphan_capsule.exists());
+        assert!(!orphan_map.exists());
+        assert_eq!(fs::read(unrelated_map).unwrap(), b"leave map");
         assert_eq!(fs::read(unrelated).unwrap(), b"leave me");
         assert_eq!(fs::read(published).unwrap(), b"published");
         assert!(nested.is_dir());
