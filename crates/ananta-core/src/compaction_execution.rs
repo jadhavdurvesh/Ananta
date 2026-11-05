@@ -976,6 +976,26 @@ mod tests {
             assert_eq!(verified, report.output_manifest);
             assert_eq!(verified.layout, layout);
             assert_eq!(verified.expected_row_count, 4);
+            assert!(report.read_latency_micros.is_some());
+            assert!(report.final_storage_bytes >= report.output_bytes);
+            let measured = db.measure_compaction_candidate_read(
+                "telemetry", 100 + offset as u64, 1,
+            ).unwrap();
+            assert_eq!(measured.rows_read, 4);
+            assert!(measured.read_latency_micros > 0);
+
+            if offset == 0 {
+                // Output tampering is detected before a candidate can be promoted.
+                let artifact_path = report.candidate_directory.join(
+                    verified.artifacts[0].data_relative_path()
+                );
+                let original = fs::read(&artifact_path).unwrap();
+                let mut corrupted = original.clone();
+                corrupted[100] ^= 1;
+                fs::write(&artifact_path, &corrupted).unwrap();
+                assert!(db.verify_compaction_candidate("telemetry", &input, 100, 1).is_err());
+                fs::write(&artifact_path, &original).unwrap();
+            }
             assert_eq!(verified.artifacts.iter().map(|a| a.row_count).sum::<u64>(), 4);
             assert_eq!(verified.artifacts.len(), 2);
 
@@ -984,6 +1004,27 @@ mod tests {
                     "telemetry", &input, 100, 1,
                 ).unwrap();
                 assert_eq!(pointer.active.weave_id, 100);
+                assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
+
+                // A cancellation request at the first checkpoint must leave the
+                // active read pointer and its candidate data unchanged.
+                let cancelled_input = CompactionInputManifest {
+                    table_id: table_id.0,
+                    job_id: crate::CompactionJobId::from_bytes([88; 16]).unwrap(),
+                    attempt: 1,
+                    target_schema_revision: 1,
+                    first_sequence: 1,
+                    last_sequence: 2,
+                    expected_row_count: 4,
+                    capsules: capsules.clone(),
+                    receipts: receipts.clone(),
+                };
+                let cancel = std::sync::atomic::AtomicBool::new(true);
+                assert!(db.execute_compaction(
+                    "telemetry", &cancelled_input, 999, 1,
+                    WeaveLayoutProfile::AppendOnly, limits, Some(&cancel),
+                ).is_err());
+                assert_eq!(db.active_weave_pointer("telemetry").unwrap().unwrap().active.weave_id, 100);
                 assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
             }
             if offset == 1 {
