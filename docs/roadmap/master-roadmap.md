@@ -457,7 +457,9 @@ Specification: docs/specifications/navigation-map-v0.1.md.
 - [x] Implement finite resource-budget validation for input/output/temp bytes, working memory, rows, open files and work-unit size.
 - [x] Persist append-only CJE1 job events with file sync and verify the complete journal on read.
 - [x] Recover unfinished attempts by appending one Interrupted event; reject partial/corrupt tails without truncating evidence.
-- [ ] Implement canonical input/output manifest codecs and fingerprint validation.
+- [x] Implement canonical CIM1 input manifest codec, SHA-256 fingerprinting and structural Capsule/Chronicle coverage validation.
+- [x] Implement canonical OWM1 output manifest codec, artifact fingerprints, canonical relative paths and provenance-count checks.
+- [ ] Verify actual source and candidate artifact files against the pinned manifest references.
 - [ ] Add bounded compaction execution, attempt-owned staging and crash-safe candidate publication.
 - [ ] Add database-level compaction correctness and fault-injection tests.
 
