@@ -403,7 +403,8 @@ mod tests {
     fn checksum_is_verified_before_first_batch() {
         let schema = schema();
         let mut encoded = encode_segment(&schema, &rows()).unwrap();
-        encoded[encoded.len() - 13] ^= 0x01;
+        let last_payload_byte = encoded.len() - 13;
+        encoded[last_payload_byte] ^= 0x01;
         assert_eq!(
             SegmentBatchReader::new(Cursor::new(encoded), &schema, &[0], None).err(),
             Some(FormatError::ChecksumMismatch)
