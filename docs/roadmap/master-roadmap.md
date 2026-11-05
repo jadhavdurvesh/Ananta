@@ -5,7 +5,7 @@
 **Owner:** DMJ  
 **Current release target:** 0.1.0 — Native Storage Prototype  
 **Roadmap status:** Active; review this file before starting work outside the current milestone
-**Current focus:** M2.3 Capsule size and scan-behaviour evaluation; M2.2 Chronicle implementation and performance gate are complete
+**Current focus:** M2.3 Capsule size and scan-behaviour evaluation plus M2.4 Navigation Map verification; M2.2 Chronicle implementation and performance gate are complete
 
 ---
 
@@ -412,14 +412,20 @@ Decision: docs/decisions/0009-immutable-capsules-as-derived-chronicle-units.md.
 
 **Scope boundary:** Capsules are derived, explicitly built files. There is no active-generation manifest, Chronicle reclamation, Navigation Map or query pruning in M2.3.
 
-## M2.4 Navigation Map prototype
-- [ ] Define metadata structure separate from data payloads.
-- [ ] Add safe time-range pruning.
-- [ ] Add selected-column metadata.
-- [ ] Verify no false negatives in pruning.
-- [ ] Add tests for inclusive/exclusive time boundaries.
-- [ ] Record capsules considered, skipped and read.
-- [ ] Add explainable pruning diagnostics.
+## M2.4 Navigation Map prototype — correctness-first pruning implemented
+- [x] Define a versioned metadata structure separate from Capsule payloads (NVM1, immutable map generations).
+- [x] Add safe typed range pruning using per-column min/max and explicit temporal metadata.
+- [x] Add selected-column identity and metadata through stable ColumnIds and per-column statistics.
+- [x] Verify no false negatives for available statistics; missing statistics always retain Capsules.
+- [x] Test inclusive/exclusive time/range boundaries.
+- [x] Record Capsules considered, skipped and read.
+- [x] Add explainable diagnostics for rows examined/returned, verified bytes and decoded payload bytes.
+- [x] Reject stale maps when the Capsule file set or fingerprint changes.
+- [x] Reject overlapping source sequence ranges to prevent duplicate logical rows.
+
+Specification: docs/specifications/navigation-map-v0.1.md.
+
+**Scope boundary:** the map verifies complete Capsule file fingerprints before pruning. It can reduce ANF decoding but does not yet guarantee fewer physical bytes read. Generation promotion, active manifests and partial-page reads remain M3 work.
 
 ## M2 exit gate
 - [ ] Ingestion is deterministic and validates whole batches.
