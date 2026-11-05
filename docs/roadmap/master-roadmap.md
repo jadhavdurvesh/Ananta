@@ -366,25 +366,30 @@ Decision: `docs/decisions/0007-idempotent-commit-ordered-ingestion.md`.
 
 **Status boundary:** M2.1 is a design/contract milestone only. Runtime BatchId, receipt persistence, sequence allocation, result types and counters are not implemented yet; they are explicit M2.2 work.
 
-## M2.2 Chronicle prototype
-- [ ] Implement the public 128-bit BatchId and IngestResult types.
-- [ ] Implement deterministic SHA-256 fingerprinting over canonical ANF v0.2 batch bytes.
-- [ ] Define and implement Chronicle commit-record metadata (BatchId, fingerprint, TableId, schema revision, sequence, row count, encoded bytes and data reference).
-- [ ] Make the Chronicle commit record the single durable publication point for data identity and sequence.
-- [ ] Persist per-table next/last committed sequence without gaps from failed or duplicate submissions.
-- [ ] Persist accepted BatchId receipts and resolve identical retries after restart.
-- [ ] Reject accepted BatchId reuse with a different fingerprint.
-- [ ] Expose ingestion result and counter snapshots with the M2.1 semantics.
-- [ ] Define append order and sequence semantics in Chronicle metadata.
-- [ ] Define immutable publication boundary and crash-recovery behavior.
-- [ ] Map incoming batches to Chronicle units.
-- [ ] Add Chronicle reader.
-- [ ] Add Chronicle integrity summary.
-- [ ] Test repeated ingestion and duplicate retry after restart.
-- [ ] Test conflicting BatchId reuse and table-ID scoping.
-- [ ] Test out-of-order timestamps and source row-order preservation.
-- [ ] Test partially failed ingestion and failures on both sides of the durable commit point.
+## M2.2 Chronicle prototype — implementation in progress
+- [x] Implement the public 128-bit BatchId and IngestResult types.
+- [x] Implement deterministic SHA-256 fingerprinting over canonical ANF v0.2 batch bytes and standard known-answer tests.
+- [x] Define and implement Chronicle commit-record metadata (BatchId, fingerprint, TableId, schema revision, sequence, row count, encoded bytes and embedded ANF payload).
+- [x] Make the Chronicle record the single durable publication point for data identity and sequence.
+- [x] Rebuild per-table contiguous sequence state from immutable Chronicle records on open.
+- [x] Persist accepted BatchId receipts and resolve identical retries after restart.
+- [x] Reject accepted BatchId reuse with a different fingerprint.
+- [x] Expose ingestion result and counter snapshots; accepted totals are durable, request counters are process-local.
+- [x] Define append order and sequence semantics in Chronicle metadata, independent of event time.
+- [x] Publish immutable Chronicle records through the M1.4 no-overwrite durable publication protocol.
+- [x] Map incoming batches to Chronicle units while preserving legacy ANF files.
+- [x] Add Chronicle envelope validation and an embedded-payload reader for bounded scans.
+- [x] Test repeated ingestion and duplicate retry after restart.
+- [x] Test conflicting BatchId reuse and TableId scoping.
+- [x] Test out-of-order timestamps, source row-order preservation and mixed legacy/Chronicle scans.
+- [x] Test pre-commit publication failures and post-commit uncertain outcomes at the Chronicle publication primitive.
 - [ ] Test schema changes between calls and sequence overflow.
+- [ ] Benchmark Chronicle startup/index rebuild and ingestion overhead.
+
+Specification: `docs/specifications/chronicle-record-v0.1.md`.
+Decision: `docs/decisions/0008-chronicle-record-commit-point.md`.
+
+**Status boundary:** runtime identity, receipts, sequence, scan compatibility and core failure paths are implemented on this branch; M2.2 is not complete until schema-evolution, overflow and performance tests pass.
 
 ## M2.3 Capsule prototype
 - [ ] Define Capsule identity and generation.
