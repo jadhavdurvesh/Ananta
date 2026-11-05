@@ -10,8 +10,11 @@ pub mod schema_snapshot;
 mod nullable_ddl;
 mod column_rename_reorder;
 mod segment_publication;
+mod chronicle;
+pub use chronicle::{BatchId, IngestOutcome, IngestResult, IngestionStats};
 use schema_snapshot::{SchemaSnapshot, SchemaSnapshotConsistencyReport};
-use segment_publication::{cleanup_orphan_segment_temps, publish_segment, DatabaseLock};
+use segment_publication::{cleanup_orphan_segment_temps, publish_segment, publish_chronicle, DatabaseLock};
+use chronicle::{encode_record, extract_payload, inspect_file as inspect_chronicle_file, scan_table_index, BatchReceipt, PayloadReader, TableChronicleIndex};
 
 const CATALOG_MAGIC: &[u8; 4] = b"ANC1";
 const CATALOG_END: &[u8; 4] = b"CEND";
@@ -52,6 +55,10 @@ pub enum DbError {
     LengthOverflow,
     DatabaseLocked(PathBuf),
     SegmentPublicationUncertain { path: PathBuf, reason: String },
+    InvalidBatchId,
+    EmptyBatch,
+    BatchIdConflict(BatchId),
+    ChronicleCorrupt(&'static str),
 }
 
 impl fmt::Display for DbError {
@@ -73,6 +80,10 @@ impl fmt::Display for DbError {
             Self::LengthOverflow => f.write_str("catalog field exceeds supported limits"),
             Self::DatabaseLocked(path) => write!(f, "database is locked by another writer: {} (verify no process owns it before removing a stale lock)", path.display()),
             Self::SegmentPublicationUncertain { path, reason } => write!(f, "segment publication durability is uncertain for {}: {reason}; inspect the final path before retrying", path.display()),
+            Self::InvalidBatchId => f.write_str("BatchId must be 16 nonzero bytes"),
+            Self::EmptyBatch => f.write_str("an ingestion batch must contain at least one row"),
+            Self::BatchIdConflict(id) => write!(f, "BatchId {id} was already committed with a different payload"),
+            Self::ChronicleCorrupt(message) => write!(f, "corrupt Chronicle record: {message}"),
         }
     }
 }
@@ -124,7 +135,7 @@ impl RecordBatch {
 }
 
 struct ActiveScanSegment {
-    decoder: SegmentBatchReader<File>,
+    decoder: SegmentBatchReader<PayloadReader<File>>,
     output_slots: Vec<Option<usize>>,
 }
 
@@ -149,31 +160,49 @@ impl ScanBatchIter {
         }
         let path = self.segments[self.next_segment].clone();
         self.next_segment += 1;
-        let mut file = File::open(path)?;
+        let mut file = File::open(&path)?;
+        let file_len = file.metadata()?.len();
         file.seek(SeekFrom::Start(0))?;
-        let mut version_bytes = [0_u8; 6];
-        file.read_exact(&mut version_bytes)?;
-        if &version_bytes[..4] != b"ANF1" {
-            return Err(DbError::Format(FormatError::InvalidMagic));
-        }
-        let version = u16::from_le_bytes([version_bytes[4], version_bytes[5]]);
-        let (snapshot_revision, expected_v2) = match version {
-            1 => (1, None),
-            2 => {
-                let mut header = [0_u8; 36];
-                file.seek(SeekFrom::Start(0))?;
-                file.read_exact(&mut header)?;
-                let table_id = u64::from_le_bytes(header[20..28].try_into().map_err(|_| DbError::LengthOverflow)?);
-                let revision = u64::from_le_bytes(header[28..36].try_into().map_err(|_| DbError::LengthOverflow)?);
-                if table_id != self.current.id.0 || table_id == 0 || revision == 0 {
-                    return Err(DbError::SchemaCompatibility("segment table identity or schema revision is invalid"));
-                }
-                if revision > self.current.schema_revision {
-                    return Err(DbError::SchemaCompatibility("segment schema revision is newer than the current catalog schema"));
-                }
-                (revision, Some((table_id, revision)))
+        let mut magic = [0_u8; 4];
+        file.read_exact(&mut magic)?;
+
+        let (snapshot_revision, expected_v2, payload_reader) = if &magic == b"CHR1" {
+            let (metadata, payload_offset) = chronicle::inspect_reader(&mut file, self.current.id.0)?;
+            if metadata.schema_revision > self.current.schema_revision {
+                return Err(DbError::SchemaCompatibility("Chronicle schema revision is newer than the current catalog schema"));
             }
-            other => return Err(DbError::Format(FormatError::UnsupportedVersion(other))),
+            let reader = PayloadReader::new(file, payload_offset, metadata.payload_len);
+            (
+                metadata.schema_revision,
+                Some((metadata.table_id, metadata.schema_revision)),
+                reader,
+            )
+        } else if &magic == b"ANF1" {
+            file.seek(SeekFrom::Start(0))?;
+            let mut version_bytes = [0_u8; 6];
+            file.read_exact(&mut version_bytes)?;
+            let version = u16::from_le_bytes([version_bytes[4], version_bytes[5]]);
+            let (revision, identity) = match version {
+                1 => (1, None),
+                2 => {
+                    let mut header = [0_u8; 36];
+                    file.seek(SeekFrom::Start(0))?;
+                    file.read_exact(&mut header)?;
+                    let table_id = u64::from_le_bytes(header[20..28].try_into().map_err(|_| DbError::LengthOverflow)?);
+                    let revision = u64::from_le_bytes(header[28..36].try_into().map_err(|_| DbError::LengthOverflow)?);
+                    if table_id != self.current.id.0 || table_id == 0 || revision == 0 {
+                        return Err(DbError::SchemaCompatibility("segment table identity or schema revision is invalid"));
+                    }
+                    if revision > self.current.schema_revision {
+                        return Err(DbError::SchemaCompatibility("segment schema revision is newer than the current catalog schema"));
+                    }
+                    (revision, Some((table_id, revision)))
+                }
+                other => return Err(DbError::Format(FormatError::UnsupportedVersion(other))),
+            };
+            (revision, identity, PayloadReader::new(file, 0, file_len))
+        } else {
+            return Err(DbError::Format(FormatError::InvalidMagic));
         };
 
         let snapshot = SchemaSnapshot::read_from(&self.root, self.current.id, snapshot_revision)
@@ -208,13 +237,14 @@ impl ScanBatchIter {
             None => None,
         };
         let decoder = SegmentBatchReader::new(
-            file,
+            payload_reader,
             &physical_schema,
             &physical_projection,
             expected_identity,
         )?;
         self.active = Some(ActiveScanSegment { decoder, output_slots });
         Ok(true)
+    }
     }
 }
 
@@ -309,6 +339,7 @@ fn increment_catalog_revision(catalog: &mut Catalog) -> Result<(), DbError> {
 pub struct Database {
     root: PathBuf,
     catalog: Catalog,
+    chronicle_indices: BTreeMap<ObjectId, TableChronicleIndex>,
     _writer_lock: DatabaseLock,
 }
 
@@ -327,7 +358,12 @@ impl Database {
         };
         ensure_initial_schema_snapshots(&root, &catalog)?;
         cleanup_orphan_segment_temps(&root.join("data"))?;
-        Ok(Self { root, catalog, _writer_lock: writer_lock })
+        let mut chronicle_indices = BTreeMap::new();
+        for (name, definition) in &catalog.tables {
+            let directory = root.join("data").join(name);
+            chronicle_indices.insert(definition.id, scan_table_index(&directory, definition.id.0)?);
+        }
+        Ok(Self { root, catalog, chronicle_indices, _writer_lock: writer_lock })
     }
 
     pub fn create_table(&mut self, name: impl Into<String>, schema: Schema) -> Result<(), DbError> {
@@ -364,6 +400,7 @@ impl Database {
         )?.write_to(&self.root)?;
         save_catalog(&self.root.join("catalog").join("catalog.anc"), &candidate)?;
         self.catalog = candidate;
+        self.chronicle_indices.entry(table_id).or_default();
         Ok(())
     }
 
@@ -553,6 +590,141 @@ impl Database {
         let segment_id = next_segment_id(&table_dir)?;
         let final_path = publish_segment(&table_dir, segment_id, &bytes)?;
         Ok(Some(final_path))
+    }
+
+    /// Atomically ingest one batch using a caller-supplied idempotency identity.
+    ///
+    /// An identical retry returns the original receipt. A reused BatchId with a
+    /// different historical payload is rejected. Data and receipt are published
+    /// together in one immutable Chronicle file.
+    pub fn ingest_batch(
+        &mut self,
+        table: &str,
+        batch_id: BatchId,
+        rows: &[Vec<Value>],
+    ) -> Result<IngestResult, DbError> {
+        if rows.is_empty() {
+            self.chronicle_indices.entry(self.table_id(table)?).or_default().stats.rejected_requests =
+                self.chronicle_indices.get(&self.table_id(table)?).map_or(0, |index| index.stats.rejected_requests)
+                    .checked_add(1).ok_or(DbError::LengthOverflow)?;
+            return Err(DbError::EmptyBatch);
+        }
+
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?
+            .clone();
+        let directory = self.root.join("data").join(table);
+        let index = self.chronicle_indices.entry(definition.id).or_default();
+
+        if let Some(existing) = index.by_batch_id.get(&batch_id).cloned() {
+            let snapshot = SchemaSnapshot::read_from(
+                &self.root,
+                definition.id,
+                existing.metadata.schema_revision,
+            )?;
+            let historical_ids = snapshot.column_ids().map(|id| id.0).collect::<Vec<_>>();
+            let candidate = encode_segment_v2(
+                &snapshot.schema()?,
+                rows,
+                definition.id.0,
+                existing.metadata.schema_revision,
+                &historical_ids,
+            );
+            let fingerprint_matches = candidate
+                .as_ref()
+                .map(|bytes| chronicle::sha256(bytes) == existing.metadata.fingerprint)
+                .unwrap_or(false);
+            if !fingerprint_matches {
+                index.stats.rejected_requests = index.stats.rejected_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                return Err(DbError::BatchIdConflict(batch_id));
+            }
+            index.stats.duplicate_requests = index.stats.duplicate_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+            return Ok(IngestResult {
+                outcome: IngestOutcome::Duplicate,
+                batch_id,
+                table_id: definition.id.0,
+                ingestion_sequence: existing.metadata.sequence,
+                row_count: existing.metadata.row_count,
+                encoded_bytes: existing.metadata.payload_len,
+                chronicle_path: existing.path,
+            });
+        }
+
+        for row in rows {
+            if let Err(error) = definition.schema.validate_row(row) {
+                index.stats.rejected_requests = index.stats.rejected_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                return Err(DbError::Type(error));
+            }
+        }
+        let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let payload = match encode_segment_v2(
+            &definition.schema,
+            rows,
+            definition.id.0,
+            definition.schema_revision,
+            &column_ids,
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                index.stats.rejected_requests = index.stats.rejected_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                return Err(DbError::Format(error));
+            }
+        };
+        let sequence = index.next_sequence()?;
+        let (record_bytes, metadata) = encode_record(
+            definition.id.0,
+            batch_id,
+            sequence,
+            definition.schema_revision,
+            u64::try_from(rows.len()).map_err(|_| DbError::LengthOverflow)?,
+            &payload,
+        )?;
+        fs::create_dir_all(&directory)?;
+        let physical_file_id = next_segment_id(&directory)?;
+        let expected_path = directory.join(format!("segment-{physical_file_id:020}.chr"));
+
+        match publish_chronicle(&directory, physical_file_id, &record_bytes) {
+            Ok(path) => {
+                let receipt = BatchReceipt { metadata: metadata.clone(), path: path.clone() };
+                index.record(receipt)?;
+                Ok(IngestResult {
+                    outcome: IngestOutcome::Accepted,
+                    batch_id,
+                    table_id: definition.id.0,
+                    ingestion_sequence: sequence,
+                    row_count: metadata.row_count,
+                    encoded_bytes: metadata.payload_len,
+                    chronicle_path: path,
+                })
+            }
+            Err(error @ DbError::SegmentPublicationUncertain { .. }) => {
+                if expected_path.is_file() {
+                    let (published_metadata, _) = inspect_chronicle_file(&expected_path, definition.id.0)?;
+                    index.record(BatchReceipt {
+                        metadata: published_metadata,
+                        path: expected_path,
+                    })?;
+                    index.stats.uncertain_publications = index.stats.uncertain_publications.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                } else {
+                    index.stats.publication_failures = index.stats.publication_failures.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                }
+                Err(error)
+            }
+            Err(error) => {
+                index.stats.publication_failures = index.stats.publication_failures.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Durable accepted counters are reconstructed from Chronicle receipts on open.
+    /// Request/failure counters are process-local and reset after restart.
+    pub fn ingestion_stats(&self, table: &str) -> Result<IngestionStats, DbError> {
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        Ok(self.chronicle_indices.get(&definition.id)
+            .map(|index| index.stats.clone())
+            .unwrap_or_default())
     }
 
     pub fn scan(&self, table: &str) -> Result<Vec<Vec<Value>>, DbError> {
