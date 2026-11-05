@@ -734,4 +734,132 @@ mod tests {
         assert_eq!(compare_value(&Value::Int64(-2), &Value::Int64(3)), Ordering::Less);
         assert_eq!(compare_value(&Value::Null, &Value::Utf8("a".into())), Ordering::Less);
     }
+
+    #[test]
+    fn all_three_weave_layouts_preserve_rows_and_verify_exact_provenance() {
+        use crate::compaction_manifest::{CapsuleSourceReference, ChronicleReceiptReference};
+        use crate::{BatchId, Column, DataType, Schema};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("ananta-weave-test-{nonce}"));
+        let mut db = Database::open(&root).unwrap();
+        let schema = Schema::new(vec![
+            Column::new("ts", DataType::TimestampMicros, false),
+            Column::new("entity", DataType::Utf8, false),
+            Column::new("value", DataType::Int64, false),
+        ]).unwrap();
+        db.create_table("telemetry", schema).unwrap();
+
+        let batch_one = BatchId::from_bytes([41; 16]).unwrap();
+        let batch_two = BatchId::from_bytes([42; 16]).unwrap();
+        let rows_one = vec![
+            vec![Value::TimestampMicros(300), Value::Utf8("z".into()), Value::Int64(30)],
+            vec![Value::TimestampMicros(100), Value::Utf8("b".into()), Value::Int64(10)],
+        ];
+        let rows_two = vec![
+            vec![Value::TimestampMicros(200), Value::Utf8("a".into()), Value::Int64(20)],
+            vec![Value::TimestampMicros(400), Value::Utf8("c".into()), Value::Int64(40)],
+        ];
+        db.ingest_batch("telemetry", batch_one, &rows_one).unwrap();
+        db.ingest_batch("telemetry", batch_two, &rows_two).unwrap();
+        db.build_capsule("telemetry", 1, 1, 1, 1, None).unwrap();
+        db.build_capsule("telemetry", 2, 1, 2, 2, None).unwrap();
+
+        let table_id = db.table_id("telemetry").unwrap();
+        let index = db.chronicle_indices.get(&table_id).unwrap();
+        let mut receipts = Vec::new();
+        for batch_id in [batch_one, batch_two] {
+            let receipt = index.by_batch_id.get(&batch_id).unwrap();
+            let bytes = fs::read(&receipt.path).unwrap();
+            receipts.push(ChronicleReceiptReference {
+                sequence: receipt.metadata.sequence,
+                batch_id: *receipt.metadata.batch_id.as_bytes(),
+                payload_sha256: receipt.metadata.fingerprint,
+                row_count: receipt.metadata.row_count,
+                record_file_len: bytes.len() as u64,
+                record_file_sha256: sha256(&bytes),
+            });
+        }
+
+        let mut capsules = Vec::new();
+        for capsule_id in [1_u64, 2_u64] {
+            let metadata = db.validate_capsule("telemetry", capsule_id, 1).unwrap();
+            let path = root.join("data").join("telemetry").join("capsules")
+                .join(format!("capsule-{capsule_id:020}-g{:020}.cap", 1));
+            let bytes = fs::read(path).unwrap();
+            capsules.push(CapsuleSourceReference {
+                capsule_id,
+                generation: 1,
+                schema_revision: metadata.schema_revision,
+                first_sequence: capsule_id,
+                last_sequence: capsule_id,
+                row_count: metadata.row_count,
+                file_len: bytes.len() as u64,
+                file_sha256: sha256(&bytes),
+            });
+        }
+
+        let limits = CompactionResourceLimits {
+            max_input_bytes: 8 * 1024 * 1024,
+            max_output_bytes: 8 * 1024 * 1024,
+            max_temporary_bytes: 16 * 1024 * 1024,
+            max_working_memory_bytes: 64 * 1024 * 1024,
+            max_rows: 100,
+            max_open_files: 4,
+            max_work_unit_rows: 2,
+        };
+
+        let mut first_timestamps = Vec::new();
+        let mut first_entities = Vec::new();
+        for (offset, layout) in [
+            WeaveLayoutProfile::AppendOnly,
+            WeaveLayoutProfile::TimeFirst,
+            WeaveLayoutProfile::EntityFirst,
+        ].into_iter().enumerate() {
+            let mut job_bytes = [0_u8; 16];
+            job_bytes[0] = 60 + offset as u8;
+            let input = CompactionInputManifest {
+                table_id: table_id.0,
+                job_id: crate::CompactionJobId::from_bytes(job_bytes).unwrap(),
+                attempt: 1,
+                target_schema_revision: 1,
+                first_sequence: 1,
+                last_sequence: 2,
+                expected_row_count: 4,
+                capsules: capsules.clone(),
+                receipts: receipts.clone(),
+            };
+            let report = db.execute_compaction(
+                "telemetry", &input, 100 + offset as u64, 1, layout, limits, None,
+            ).unwrap();
+            let verified = db.verify_compaction_candidate(
+                "telemetry", &input, 100 + offset as u64, 1,
+            ).unwrap();
+            assert_eq!(verified, report.output_manifest);
+            assert_eq!(verified.layout, layout);
+            assert_eq!(verified.expected_row_count, 4);
+            assert_eq!(verified.artifacts.iter().map(|a| a.row_count).sum::<u64>(), 4);
+            assert_eq!(verified.artifacts.len(), 2);
+
+            let first_artifact = &verified.artifacts[0];
+            let data = fs::read(report.candidate_directory.join(first_artifact.data_relative_path())).unwrap();
+            let column_ids = db.catalog.tables.get("telemetry").unwrap()
+                .column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+            let decoded = crate::decode_segment_v2(&data, &schema, table_id.0, 1, &column_ids).unwrap();
+            first_timestamps.push(decoded[0][0].clone());
+            first_entities.push(decoded[0][1].clone());
+            assert!(report.elapsed_micros > 0);
+            assert!(report.temporary_bytes >= report.output_bytes);
+        }
+
+        assert_eq!(first_timestamps[0], Value::TimestampMicros(300));
+        assert_eq!(first_timestamps[1], Value::TimestampMicros(100));
+        assert_eq!(first_entities[2], Value::Utf8("a".into()));
+
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+
 }
