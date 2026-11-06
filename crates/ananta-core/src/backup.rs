@@ -53,7 +53,8 @@ pub(crate) fn create_backup(source: &Path, destination: &Path) -> io::Result<Bac
         sync_directory(parent)?;
         fs::rename(&staging, &destination)?;
         sync_directory(parent)?;
-        report(&destination, &entries, &manifest)
+        let (verified_entries, verified_manifest) = verify_backup(&destination)?;
+        report(&destination, &verified_entries, &verified_manifest)
     })();
 
     if result.is_err() {
