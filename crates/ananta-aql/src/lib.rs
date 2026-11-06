@@ -18,9 +18,9 @@ pub use executor::{
 };
 pub use plan::{logical_plan, LogicalPlan, LogicalPlanNode};
 pub use vector::{
-    ExecutionContext, ExecutionError, ExecutionPipeline, ExecutionProfile, FilterOperator,
-    LimitOperator, PhysicalOperator, ProjectionOperator, ResourceLimits, ScanOperator,
-    Vector, VectorBatch, VectorExpr,
+    CapsuleScanOperator, ExecutionContext, ExecutionError, ExecutionPipeline, ExecutionProfile,
+    FilterOperator, LimitOperator, PhysicalOperator, ProjectionOperator, ResourceLimits,
+    ScanOperator, Vector, VectorBatch, VectorExpr,
 };
 pub use aggregate::{aggregate_batches, AggregateKind, AggregateResult, AggregateSpec};
 pub use timeseries::{
