@@ -1,4 +1,4 @@
-use crate::vector::{ExecutionContext, ExecutionError, ResourceLimits, VectorBatch};
+use crate::vector::{ExecutionContext, ExecutionError, VectorBatch};
 use ananta_types::{Column, DataType, Value};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;

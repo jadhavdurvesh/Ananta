@@ -1,6 +1,6 @@
-use crate::{logical_plan, BinaryOperator, ColumnReference, Expr, ExprKind, Identifier, Literal,
+use crate::{logical_plan, BinaryOperator, UnaryOperator, ColumnReference, Expr, ExprKind, Identifier, Literal,
     LogicalPlan, ParameterBindings, ParameterRef, Projection, Query, Statement};
-use ananta_core::{CapsuleScanRequest, ColumnRangePredicate, Database};
+use ananta_core::{ColumnRangePredicate, Database};
 use ananta_types::{Column, DataType, Value};
 use std::collections::BTreeSet;
 
@@ -428,6 +428,7 @@ pub fn explain(
             Some(generation)
         }else{None}
     }else{None};
+    let scan_column_count = columns.len();
     let mut physical=vec![PhysicalPlanNode::Scan{
         table:table.clone(),columns,estimated_rows:statistics.row_count,
         projection_pushed_down,capsule_map_generation,
@@ -484,7 +485,7 @@ pub fn explain(
         let scan_fraction = if all.is_empty() {
             1.0
         } else {
-            columns.len() as f64 / all.len() as f64
+            scan_column_count as f64 / all.len() as f64
         };
         (analysis.estimated_batch_payload_bytes as f64 * scan_fraction)
             .round()

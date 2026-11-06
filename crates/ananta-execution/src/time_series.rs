@@ -5,7 +5,7 @@ use crate::{
     VectorSchema,
 };
 use ananta_types::{Column, DataType, Value};
-use std::collections::{btree_map::IntoIter, BTreeMap, VecDeque};
+use std::collections::{btree_map::IntoIter, BTreeMap};
 use std::mem::size_of;
 
 /// One inclusive or exclusive boundary for a UTC TIMESTAMP_MICROS range.
