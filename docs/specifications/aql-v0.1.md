@@ -144,3 +144,12 @@ The public error code set is InvalidQuery, TableNotFound, ColumnNotFound, TypeMi
 M4.2 also defines a logical plan tree in semantic order: Scan, optional Filter, Project, optional Limit. The initial executor currently compiles that structure directly into a bounded scan plus expression plan; physical predicate pruning, vectorised operators and cost-based planning remain M5 work.
 
 This implementation is single-table and read-only. Timestamp range predicates are ordinary typed TIMESTAMP_MICROS comparisons (for example >= lower AND < upper); there is no timezone parsing or index/Weave-zone-map pruning yet. Execution is native and uses ANANTA's own Database API; it never generates SQL for an external database.
+
+
+## 15. AQL v0.1 native API example
+
+The \`ananta-aql\` crate provides \`parse\`, \`validate_ast\`, \`logical_plan\`, \`execute\` and \`execute_source\`. An \`AqlResultIter\` yields owned \`AqlResultBatch\` column vectors; callers can consume and discard each batch. The example at \`crates/ananta-aql/examples/telemetry_query.rs\` creates an ANANTA table, inserts telemetry rows and executes a parameterised query using only the embedded Rust API.
+
+The M4 CI workflow runs this example along with formatting, workspace tests, Clippy, the existing storage example and storage/compaction benchmarks. This validates that the first AQL vertical slice works without an external query engine or database.
+
+AQL v0.1 completion means the documented read-only single-table SELECT feature set is implemented. It does not imply joins, subqueries, aggregates, ORDER BY, indexes, cost-based optimisation, vectorised operators or a production server protocol; those are later roadmap work.
