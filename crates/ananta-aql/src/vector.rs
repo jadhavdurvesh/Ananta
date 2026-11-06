@@ -461,9 +461,9 @@ impl PhysicalOperator for LimitOperator {
     }
 }
 
-pub struct ExecutionPipeline { root: Box<dyn PhysicalOperator>, context: ExecutionContext }
+pub struct ExecutionPipeline { root: Box<dyn PhysicalOperator>, context: ExecutionContext, terminal: bool }
 impl ExecutionPipeline {
-    pub fn new(root:Box<dyn PhysicalOperator>,context:ExecutionContext)->Self{Self{root,context}}
+    pub fn new(root:Box<dyn PhysicalOperator>,context:ExecutionContext)->Self{Self{root,context,terminal:false}}
     pub fn schema(&self)->&[Column]{self.root.schema()}
     pub fn profile(&self)->ExecutionProfile{self.context.profile()}
     pub fn cancel(&self){self.context.cancel();}
@@ -471,10 +471,11 @@ impl ExecutionPipeline {
 impl Iterator for ExecutionPipeline {
     type Item=Result<VectorBatch,ExecutionError>;
     fn next(&mut self)->Option<Self::Item>{
+        if self.terminal{return None;}
         match self.root.next_batch(&self.context){
             Ok(Some(batch))=>Some(Ok(batch)),
-            Ok(None)=>None,
-            Err(error)=>Some(Err(error)),
+            Ok(None)=>{self.terminal=true;None},
+            Err(error)=>{self.terminal=true;Some(Err(error))},
         }
     }
 }
