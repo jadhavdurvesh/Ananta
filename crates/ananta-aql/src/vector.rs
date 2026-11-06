@@ -651,7 +651,9 @@ mod tests{
         ));
         let project=ProjectionOperator::new(Box::new(filter),vec![0,1]).unwrap();
         let limit=LimitOperator::new(Box::new(project),1);
-        let rows=ExecutionPipeline::new(Box::new(limit),context).flat_map(|b|b.unwrap().rows()).collect::<Vec<_>>();
+        let mut pipeline=ExecutionPipeline::new(Box::new(limit),context);
+        let mut rows=Vec::new();
+        for batch in pipeline.by_ref(){rows.extend(batch.unwrap().rows());}
         assert_eq!(rows,vec![vec![Value::Int64(1),Value::Int64(10)]]);
         drop(db);fs::remove_dir_all(root).unwrap();
     }
