@@ -132,9 +132,10 @@ pub fn execute(
                 } else {
                     format!("expr_{}", index + 1)
                 };
+                let nullable = expression.nullable;
                 compiled.push(CompiledProjection {
                     expression,
-                    column: Column::new(name, data_type, item.expression_nullable()),
+                    column: Column::new(name, data_type, nullable),
                 });
             }
             compiled
@@ -254,24 +255,6 @@ impl AqlResultIter {
     }
 }
 
-impl Expr {
-    fn expression_nullable(&self) -> bool {
-        match &self.kind {
-            ExprKind::Literal(Literal::Null) => true,
-            ExprKind::Literal(_) => false,
-            ExprKind::Column(_) | ExprKind::Parameter(_) => true,
-            ExprKind::Unary { expression, .. } | ExprKind::Cast { expression, .. } => expression.expression_nullable(),
-            ExprKind::IsNull { .. } => false,
-            ExprKind::Binary { left, right, operator } => match operator {
-                BinaryOperator::Equal | BinaryOperator::NotEqual | BinaryOperator::Less
-                | BinaryOperator::LessEqual | BinaryOperator::Greater | BinaryOperator::GreaterEqual
-                | BinaryOperator::And | BinaryOperator::Or | BinaryOperator::Add
-                | BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::Divide
-                | BinaryOperator::Modulo => left.expression_nullable() || right.expression_nullable(),
-            },
-        }
-    }
-}
 
 fn compile_expr(
     expression: &Expr,
@@ -467,7 +450,7 @@ fn evaluate_binary(
         }));
     }
     if matches!(operator, Equal | NotEqual | Less | LessEqual | Greater | GreaterEqual) {
-        if matches!(left, Value::Null) || matches!(right, Value::Null) { return Ok(Value::Null); }
+        if matches!(&left, Value::Null) || matches!(&right, Value::Null) { return Ok(Value::Null); }
         let ordering = compare_values(&left, &right, span)?;
         let result = match operator {
             Equal => ordering == Ordering::Equal,
@@ -566,7 +549,7 @@ fn negate(value: Value, span: crate::Span) -> Result<Value, AqlExecutionError> {
 }
 
 fn cast_value(value: Value, target: DataType, span: crate::Span) -> Result<Value, AqlExecutionError> {
-    if matches!(value, Value::Null) { return Ok(Value::Null); }
+    if matches!(&value, Value::Null) { return Ok(Value::Null); }
     let result = match (value, target) {
         (value, target) if value.data_type() == Some(target) => value,
         (Value::Int32(value), DataType::Int64) => Value::Int64(i64::from(value)),
@@ -658,7 +641,7 @@ fn from_parse_error(error: AqlError) -> AqlExecutionError {
     query_error(code, error.message, error.span)
 }
 fn from_storage_error(error: DbError) -> AqlExecutionError {
-    let code = match error {
+    let code = match &error {
         DbError::TableNotFound(_) => AqlErrorCode::TableNotFound,
         DbError::ColumnNotFound(_) => AqlErrorCode::ColumnNotFound,
         _ => AqlErrorCode::Storage,
@@ -712,7 +695,7 @@ mod tests {
         assert!(output.iter().all(|batch| batch.row_count <= 1));
         let actual = output.iter().flat_map(|batch| (0..batch.row_count).map(|row| batch.row(row).unwrap()))
             .collect::<Vec<_>>();
-        let expected = rows.iter().filter(|row| matches!(row[2], Value::Float64(v) if v >= 25.0))
+        let expected = rows.iter().filter(|row| matches!(&row[2], Value::Float64(v) if *v >= 25.0))
             .take(2).map(|row| vec![row[1].clone(), row[2].clone()]).collect::<Vec<_>>();
         assert_eq!(actual, expected);
         assert_eq!(output[0].schema[0].name, "device");
@@ -742,8 +725,11 @@ mod tests {
     fn cancellation_and_semantic_errors_have_stable_error_codes() {
         let (db, root, _) = fixture();
         let query = crate::parse("SELECT missing FROM telemetry").unwrap();
-        assert_eq!(execute(&db, &query, &ParameterBindings::default(), 10, None).unwrap_err().code,
-            AqlErrorCode::ColumnNotFound);
+        let error = match execute(&db, &query, &ParameterBindings::default(), 10, None) {
+            Ok(_) => panic!("missing column query unexpectedly compiled"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, AqlErrorCode::ColumnNotFound);
 
         let query = crate::parse("SELECT * FROM telemetry").unwrap();
         let cancelled = Arc::new(AtomicBool::new(true));
