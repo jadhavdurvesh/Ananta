@@ -1415,6 +1415,56 @@ impl Database {
         Ok(metadata)
     }
 
+    /// Return independently validated metadata for every canonical Capsule generation.
+    /// The returned entries are sorted by their source Chronicle sequence interval.
+    pub fn verified_capsule_metadata(&self, table: &str) -> Result<Vec<CapsuleMetadata>, DbError> {
+        let directory = self.root.join("data").join(table).join("capsules");
+        match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Err(DbError::CapsuleCorrupt("Capsule directory is not a real directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(DbError::Io(error)),
+        }
+        let paths = list_capsule_paths(&directory)?;
+        let mut metadata = Vec::with_capacity(paths.len());
+        for (capsule_id, generation, _) in paths {
+            metadata.push(self.validate_capsule(table, capsule_id, generation)?);
+        }
+        metadata.sort_by_key(|item| (
+            item.first_ingestion_sequence, item.last_ingestion_sequence,
+            item.capsule_id, item.generation,
+        ));
+        Ok(metadata)
+    }
+
+    /// True only when validated, non-overlapping Capsules account for every
+    /// accepted Chronicle sequence and every accepted row. This proof is required
+    /// before an analytical query may replace the authoritative scan with a
+    /// materialised Navigation Map Capsule path.
+    pub fn capsules_cover_chronicle(&self, table: &str) -> Result<bool, DbError> {
+        let stats = self.ingestion_stats(table)?;
+        if stats.accepted_batches == 0 {
+            return Ok(false);
+        }
+        let capsules = self.verified_capsule_metadata(table)?;
+        if capsules.is_empty() {
+            return Ok(false);
+        }
+        let mut next_sequence = 1_u64;
+        let mut total_rows = 0_u64;
+        for capsule in capsules {
+            if capsule.first_ingestion_sequence != next_sequence
+                || capsule.last_ingestion_sequence < capsule.first_ingestion_sequence
+            {
+                return Ok(false);
+            }
+            total_rows = total_rows.checked_add(capsule.row_count).ok_or(DbError::LengthOverflow)?;
+            next_sequence = capsule.last_ingestion_sequence.checked_add(1).ok_or(DbError::LengthOverflow)?;
+        }
+        Ok(next_sequence.checked_sub(1) == Some(stats.accepted_batches)
+            && total_rows == stats.accepted_rows)
+    }
+
     /// Durable accepted counters are reconstructed from Chronicle receipts on open.
     /// Request/failure counters are process-local and reset after restart.
     pub fn ingestion_stats(&self, table: &str) -> Result<IngestionStats, DbError> {

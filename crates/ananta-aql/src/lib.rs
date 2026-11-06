@@ -2,6 +2,11 @@ mod lexer;
 mod parser;
 mod executor;
 mod plan;
+mod vector;
+mod aggregate;
+mod timeseries;
+mod planner;
+mod vectorized;
 
 pub use ananta_types::DataType;
 pub use lexer::{lex, Token, TokenKind};
@@ -13,6 +18,20 @@ pub use executor::{
     AqlExecutionMetrics, AqlPhysicalPlan, AqlResultBatch, AqlResultIter,
 };
 pub use plan::{logical_plan, LogicalPlan, LogicalPlanNode};
+pub use vector::{
+    CapsuleScanOperator, ExecutionContext, ExecutionError, ExecutionPipeline, ExecutionProfile,
+    FilterOperator, LimitOperator, PhysicalOperator, ProjectionOperator, ResourceLimits,
+    ScanOperator, Vector, VectorBatch, VectorExpr,
+};
+pub use aggregate::{aggregate_batches, AggregateKind, AggregateResult, AggregateSpec};
+pub use timeseries::{
+    bucketed_aggregate, filter_time_range, latest_per_series, time_bucket_start, TimeRange,
+};
+pub use planner::{
+    explain, extract_timestamp_range, ExplainPlan, PhysicalPlanNode, PlannerOptions,
+    ColumnStatistics, TableStatistics,
+};
+pub use vectorized::{execute_vectorized, execute_vectorized_source, execute_vectorized_source_with_options, execute_vectorized_with_options};
 
 pub const AQL_VERSION: &str = "0.1";
 
