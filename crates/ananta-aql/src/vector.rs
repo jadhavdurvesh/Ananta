@@ -63,10 +63,11 @@ impl VectorBatch {
         Ok(Self { schema, columns, row_count })
     }
     pub fn empty(schema: Vec<Column>) -> Self {
-        let columns = schema.iter().cloned().map(|field| Vector {
+        let columns: Vec<Vector> = schema.iter().cloned().map(|field| Vector {
             field, values: Arc::from(Vec::<Value>::new()),
         }).collect();
-        Self { schema: columns.iter().map(|column| column.field.clone()).collect(), columns, row_count: 0 }
+        let output_schema: Vec<Column> = columns.iter().map(|column| column.field.clone()).collect();
+        Self { schema: output_schema, columns, row_count: 0 }
     }
     pub fn estimated_bytes(&self) -> usize {
         self.columns.iter().fold(0_usize, |total, column| total.saturating_add(column.estimated_bytes()))
