@@ -162,7 +162,15 @@ pub(crate) fn prune_superseded_checkpoint_manifests(
     for entry in entries {
         let name = entry.file_name();
         let Some(text) = name.to_str() else { continue; };
-        if text == current_name || !is_canonical_checkpoint_name(text) {
+        if text == current_name {
+            continue;
+        }
+        if text.starts_with("checkpoint-") && text.ends_with(".anck")
+            && !is_canonical_checkpoint_name(text)
+        {
+            return Err(invalid("checkpoint archive filename is not canonical"));
+        }
+        if !is_canonical_checkpoint_name(text) {
             continue;
         }
         let metadata = entry.file_type()?;
