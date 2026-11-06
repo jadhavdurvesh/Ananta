@@ -2608,7 +2608,13 @@ fn save_catalog(path: &Path, catalog: &Catalog) -> Result<(), DbError> {
         file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterCanonicalCatalogTempSynced,
+        );
         fs::rename(&temp, path)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterCanonicalCatalogRenamedBeforeDirectorySync,
+        );
         if let Some(parent) = path.parent() {
             sync_recovery_directory(parent)?;
         }
@@ -3424,6 +3430,8 @@ mod tests {
             AfterWalCommit,
             AfterSchemaSnapshotPublished,
             AfterCatalogSnapshotPublished,
+            AfterCanonicalCatalogTempSynced,
+            AfterCanonicalCatalogRenamedBeforeDirectorySync,
             AfterCanonicalCatalogPublished,
         ] {
             let path = temp_path();
@@ -5518,6 +5526,8 @@ mod tests {
             "AfterSchemaSnapshotPublished" => AfterSchemaSnapshotPublished,
             "AfterCatalogSnapshotPublished" => AfterCatalogSnapshotPublished,
             "AfterCanonicalCatalogPublished" => AfterCanonicalCatalogPublished,
+            "AfterCanonicalCatalogTempSynced" => AfterCanonicalCatalogTempSynced,
+            "AfterCanonicalCatalogRenamedBeforeDirectorySync" => AfterCanonicalCatalogRenamedBeforeDirectorySync,
             _ => panic!("unsupported subprocess crash point: {point_name}"),
         };
         let path = PathBuf::from(std::env::var_os("ANANTA_WAL_CRASH_DATABASE").unwrap());
@@ -5672,6 +5682,8 @@ mod tests {
             "AfterWalCommit",
             "AfterSchemaSnapshotPublished",
             "AfterCatalogSnapshotPublished",
+            "AfterCanonicalCatalogTempSynced",
+            "AfterCanonicalCatalogRenamedBeforeDirectorySync",
             "AfterCanonicalCatalogPublished",
         ] {
             exercise_catalog_ddl_subprocess_crash(point);
