@@ -1,7 +1,7 @@
 # ANANTA WAL Recovery and Publication Protocol v0.1
 
 **Milestone:** M6.2 — startup recovery and redo  
-**Status:** Design contract plus tested mutation-intent/recovery-plan primitives; not yet connected to Database mutation paths
+**Status:** Initial ANF/Chronicle Database integration implemented; deterministic crash-boundary tests are being expanded. General ACID semantics remain out of scope.
 
 ## 1. Guarantee boundary
 
@@ -11,7 +11,7 @@ This document specifies the first safe database integration. Until implementatio
 
 ## 2. Recovery model
 
-The first database integration is redo-only for immutable data-file publication:
+The current database integration is redo-only for immutable ANF/Chronicle data-file publication:
 
 - A committed WAL transaction is authoritative intent to make each listed immutable artifact visible at its canonical final name.
 - An uncommitted transaction has no committed data effect. Any staging files owned by its intents are discarded.
@@ -179,3 +179,17 @@ Before a committed artifact is accepted as published, replay verifies its SHA-25
 - Chronicle intent is checked by the streaming Chronicle inspector, including record framing, whole-record checksum, embedded payload fingerprint, TableId and schema revision.
 
 An ANF identity mismatch is a WAL file conflict and fails open. A committed Chronicle record checksum/identity failure retains the public `DbError::ChronicleCorrupt` classification for compatibility with existing callers. The Database unit suite exercises an ANF schema-revision mismatch.
+
+
+## 11. Deterministic recovery interruption coverage
+
+The core test build exposes one-shot interruption checkpoints after each operation boundary in the ANF/Chronicle write path:
+
+- Staging file creation, payload write, flush, file sync and table-directory sync.
+- WAL BEGIN, MUTATION and durable COMMIT.
+- Final-name hard-link publication and the first directory sync.
+- Staging-name removal and the post-cleanup directory sync.
+
+The Database-level tests run both `insert_batch` and `ingest_batch` through every checkpoint. Pre-COMMIT interruptions must reopen with no visible row or receipt and no canonical staging file. Post-COMMIT interruptions must reopen with exactly one immutable artifact; Chronicle receipts must be rebuilt and an identical BatchId retry must resolve as a duplicate. Every case is opened a second time to check replay idempotence.
+
+These checkpoints are deterministic in-process panic injections at the same code boundaries. They prove that recovery handles the resulting filesystem/WAL states, but they are not a substitute for subprocess-kill tests, block-device fault injection, or real power-loss testing. Those remain part of the M6.2 validation backlog.
