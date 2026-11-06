@@ -802,9 +802,21 @@ impl Database {
                 "checkpoint WAL replacement was uncertain: {error}",
             )));
         }
-        let rotated = read_wal(&wal_path)
-            .map_err(|error| DbError::Wal(error.to_string()))?;
-        validate_checkpoint_records(&self.root, &rotated, &self.catalog)?;
+        let rotated = match read_wal(&wal_path) {
+            Ok(report) => report,
+            Err(error) => {
+                self.recovery_required = true;
+                return Err(DbError::RecoveryRequired(format!(
+                    "checkpoint WAL was replaced but could not be re-read: {error}",
+                )));
+            }
+        };
+        if let Err(error) = validate_checkpoint_records(&self.root, &rotated, &self.catalog) {
+            self.recovery_required = true;
+            return Err(DbError::RecoveryRequired(format!(
+                "checkpoint WAL anchor failed validation after replacement: {error}",
+            )));
+        }
         if rotated.records.len() != 1
             || rotated.last_sequence != current.last_sequence.saturating_add(1)
             || !rotated.is_clean()
@@ -6888,10 +6900,14 @@ mod tests {
         ).unwrap();
         drop(db);
 
+        let mut reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap(), vec![first_rows[0].clone(), second_rows[0].clone()]);
         let second_checkpoint = reopened.create_checkpoint().unwrap();
         assert_eq!(second_checkpoint.pruned_manifest_count, 1);
         assert!(!checkpoint.manifest_path.exists());
         assert!(second_checkpoint.manifest_path.is_file());
+        drop(reopened);
+
         let reopened = Database::open(&path).unwrap();
         assert_eq!(reopened.scan("telemetry").unwrap(), vec![first_rows[0].clone(), second_rows[0].clone()]);
         let consistency = reopened.check_consistency(1).unwrap();
