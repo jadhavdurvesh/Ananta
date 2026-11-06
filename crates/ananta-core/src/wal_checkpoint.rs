@@ -145,7 +145,11 @@ pub(crate) fn create_checkpoint(
 /// Validate the manifest selected by the checkpoint marker and every immutable
 /// file that existed when the snapshot was installed. Later mutable catalog and
 /// active-pointer replacement paths are intentionally excluded from the manifest.
-pub(crate) fn validate_checkpoint(root: &Path, payload: &[u8]) -> io::Result<CheckpointReport> {
+pub(crate) fn validate_checkpoint(
+    root: &Path,
+    payload: &[u8],
+    permitted_changed_paths: &BTreeSet<String>,
+) -> io::Result<CheckpointReport> {
     let reference = CheckpointReference::decode(payload)?;
     if reference.manifest_len > MAX_MANIFEST_BYTES as u64 {
         return Err(invalid("checkpoint manifest exceeds size limit"));
@@ -164,6 +168,9 @@ pub(crate) fn validate_checkpoint(root: &Path, payload: &[u8]) -> io::Result<Che
         return Err(invalid("checkpoint manifest identity differs from WAL marker"));
     }
     for entry in &entries {
+        if permitted_changed_paths.contains(&entry.path) {
+            continue;
+        }
         let relative = checked_relative_path(&entry.path)?;
         let artifact_path = root.join(relative);
         let metadata = fs::symlink_metadata(&artifact_path)?;
@@ -247,9 +254,6 @@ fn should_exclude(relative: &Path, name: &std::ffi::OsStr) -> bool {
     if text == ".ananta.lock" || text.starts_with("wal/") || text == "wal" {
         return true;
     }
-    if text == "catalog/catalog.anc" || name == "active.awp" {
-        return true;
-    }
     if name.to_str().is_some_and(|value| {
         value.starts_with(".stage-") || value.starts_with(".candidate-")
             || value.starts_with(".active-") || value.ends_with(".tmp")
@@ -270,8 +274,8 @@ fn is_checkpoint_artifact(path: &Path) -> bool {
     let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("");
     match extension {
         "anf" | "chr" | "cap" | "nvm" | "ans" | "wvf" | "pvm" | "cim" => true,
-        "anc" => filename.starts_with("catalog-"),
-        "awp" => filename.starts_with("pointer-"),
+        "anc" => filename.starts_with("catalog-") || filename == "catalog.anc",
+        "awp" => filename.starts_with("pointer-") || filename == "active.awp",
         "owm" => filename.starts_with("candidate-") || filename == "manifest.owm",
         _ => false,
     }
