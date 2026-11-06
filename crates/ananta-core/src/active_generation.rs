@@ -234,6 +234,17 @@ impl Database {
         read_pointer(&self.root.join("data").join(table).join("weaves"), definition.id.0)
     }
 
+    pub(crate) fn validate_active_weave_integrity(&self, table: &str) -> Result<(), DbError> {
+        let Some(pointer) = self.active_weave_pointer(table)? else {
+            return Ok(());
+        };
+        self.verify_generation(table, pointer.active)?;
+        if let Some(previous) = pointer.previous {
+            self.verify_generation(table, previous)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn install_recovered_pointer(
         root: &Path,
         pointer: &ActiveWeavePointer,
