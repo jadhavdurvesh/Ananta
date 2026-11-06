@@ -33,7 +33,7 @@ pub enum PhysicalPlanNode {
     Project { columns:Vec<String> },
     Limit { rows:u64 },
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExplainPlan {
     pub language_version:String,
     pub logical:LogicalPlan,
