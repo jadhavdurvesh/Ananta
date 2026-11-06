@@ -5515,11 +5515,16 @@ mod tests {
             "AfterWalMutation" => AfterWalMutation,
             "AfterWalCommit" => AfterWalCommit,
             "AfterFinalNameLinked" => AfterFinalNameLinked,
+            "AfterSchemaSnapshotPublished" => AfterSchemaSnapshotPublished,
+            "AfterCatalogSnapshotPublished" => AfterCatalogSnapshotPublished,
+            "AfterCanonicalCatalogPublished" => AfterCanonicalCatalogPublished,
             _ => panic!("unsupported subprocess crash point: {point_name}"),
         };
         let path = PathBuf::from(std::env::var_os("ANANTA_WAL_CRASH_DATABASE").unwrap());
-        crate::wal_recovery::arm_wal_recovery_crash_point(point);
+        // Open and replay pre-existing transactions before arming the hook:
+        // the checkpoint must target the operation under test, not startup.
         let mut database = Database::open(path).unwrap();
+        crate::wal_recovery::arm_wal_recovery_crash_point(point);
         let rows = vec![vec![
             Value::TimestampMicros(9_000),
             Value::Utf8(format!("subprocess-{operation}-{point_name}")),
@@ -5535,6 +5540,9 @@ mod tests {
                     BatchId::from_bytes([0xD4; 16]).unwrap(),
                     &rows,
                 ).unwrap();
+            }
+            "ddl" => {
+                database.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
             }
             _ => panic!("unsupported subprocess operation: {operation}"),
         }
@@ -5609,6 +5617,65 @@ mod tests {
         assert_recovered_artifact_inventory(&table_dir, extension, committed);
         drop(recovered_again);
         fs::remove_dir_all(path).unwrap();
+    }
+
+    fn exercise_catalog_ddl_subprocess_crash(point: &str) {
+        use std::process::Command;
+
+        let path = temp_path();
+        let mut setup = Database::open(&path).unwrap();
+        setup.create_table("telemetry", sample_schema()).unwrap();
+        drop(setup);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::wal_recovery_process_crash_worker")
+            .arg("--nocapture")
+            .env("ANANTA_WAL_CRASH_OPERATION", "ddl")
+            .env("ANANTA_WAL_CRASH_POINT", point)
+            .env("ANANTA_WAL_CRASH_DATABASE", &path)
+            .env("ANANTA_WAL_CRASH_EXIT", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86), "DDL worker did not terminate at {point}");
+
+        // The child exited without running DatabaseLock::drop.
+        fs::remove_file(path.join(".ananta.lock")).unwrap();
+
+        let recovered = Database::open(&path).unwrap();
+        assert_eq!(recovered.catalog_revision(), 2, "at {point}");
+        assert_eq!(recovered.table_schema_revision("telemetry").unwrap(), 2, "at {point}");
+        assert_eq!(recovered.schema("telemetry").unwrap().len(), 4, "at {point}");
+        assert_eq!(recovered.column_id("telemetry", "humidity").unwrap().0, 5);
+        assert!(recovered.scan("telemetry").unwrap().is_empty());
+        assert!(recovered.check_schema_snapshot_consistency().unwrap().is_clean());
+        assert!(SchemaSnapshot::path(
+            &path,
+            recovered.table_id("telemetry").unwrap(),
+            2,
+        ).unwrap().is_file());
+        assert!(path.join("catalog").join("catalog-00000000000000000002.anc").is_file());
+        drop(recovered);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.catalog_revision(), 2);
+        assert_eq!(reopened.table_schema_revision("telemetry").unwrap(), 2);
+        assert_eq!(reopened.schema("telemetry").unwrap().len(), 4);
+        assert!(reopened.check_schema_snapshot_consistency().unwrap().is_clean());
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn catalog_ddl_recovery_survives_subprocess_termination_at_publication_boundaries() {
+        for point in [
+            "AfterWalCommit",
+            "AfterSchemaSnapshotPublished",
+            "AfterCatalogSnapshotPublished",
+            "AfterCanonicalCatalogPublished",
+        ] {
+            exercise_catalog_ddl_subprocess_crash(point);
+        }
     }
 
     #[test]
