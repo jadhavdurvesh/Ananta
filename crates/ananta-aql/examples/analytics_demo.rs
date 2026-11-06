@@ -1,7 +1,7 @@
 use ananta_aql::{
     aggregate_batches, bucketed_aggregate, execute_vectorized_source,
     execute_vectorized_source_with_options, explain_plan, latest_per_series,
-    AggregateKind, AggregateSpec, ParameterBindings, PlannerOptions,
+    analyze_table_and_persist, AggregateKind, AggregateSpec, ParameterBindings, PlannerOptions,
     ResourceLimits,
 };
 use ananta_core::{BatchId, Database};
@@ -45,6 +45,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             (index + 1) as u64, Some("event_time"))?;
     }
     database.build_navigation_map(TABLE, 1)?;
+    let analysis = analyze_table_and_persist(&database, TABLE, 2)?;
+    println!(
+        "ANALYZE rows={} estimated_batch_payload_bytes={} columns={}",
+        analysis.scanned_rows,
+        analysis.estimated_batch_payload_bytes,
+        analysis.columns.len(),
+    );
 
     let source = "SELECT device, event_time, temperature FROM telemetry \
         WHERE event_time >= :start AND event_time < :end AND temperature >= :minimum LIMIT 20";
@@ -79,6 +86,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(AtomicBool::new(false)), reference_options,
     )?;
     let reference_batches = reference.by_ref().collect::<Result<Vec<_>, _>>()?;
+    let reference_profile = reference.profile();
+    let reference_output_rows = reference_batches.iter()
+        .map(|batch| batch.row_count as u64)
+        .sum::<u64>();
+    let estimated_output_rows = plan.cost.estimated_output_rows;
+    println!("=== COST CALIBRATION ===");
+    println!(
+        "scan rows: estimated={:?}, reference_measured={}",
+        plan.cost.estimated_scan_rows,
+        reference_profile.input_rows,
+    );
+    println!(
+        "output rows: estimated={:?}, reference_measured={}",
+        estimated_output_rows,
+        reference_output_rows,
+    );
+    println!(
+        "projected payload bytes: estimated={:?}, full_scan_decoded_estimate={}",
+        plan.cost.estimated_scan_payload_bytes,
+        reference_profile.decoded_value_bytes_estimate,
+    );
+    println!("reference profile: {reference_profile:#?}");
     let mut optimized_keys = optimized_rows.iter().map(|row| format!("{row:?}")).collect::<Vec<_>>();
     let mut reference_keys = reference_batches.iter().flat_map(|batch| batch.rows())
         .map(|row| format!("{row:?}")).collect::<Vec<_>>();
@@ -87,7 +116,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if optimized_keys != reference_keys {
         return Err("optimized Capsule/Navigation Map results differ from the reference scan".into());
     }
-    println!("=== PROFILE ===\n{optimized_profile:#?}");
+    println!("=== OPTIMIZED PROFILE ===\n{optimized_profile:#?}");
     println!("optimized/reference result rows: {}", optimized_rows.len());
 
     let grouped = aggregate_batches(

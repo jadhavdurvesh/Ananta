@@ -634,7 +634,8 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 - [x] Automatically invalidate and discard stale/corrupt analysis caches after writes, schema changes or Weave promotion; expose explicit re-analysis via analyze_table_and_persist.
 - [x] Add transparent weighted physical plan cost estimates for scanned rows, estimated projected payload, filter evaluations and output cells, with explicit assumptions and unknown-value propagation.
 - [x] Expose configurable milli-unit cost weights via PlannerOptions and report the exact weights used by each EXPLAIN result.
-- [ ] Persist additional analysis metadata in the catalog and calibrate cost weights against representative runtime profiles.
+- [x] Add a reproducible analytics demo that compares estimated scan/output rows and projected payload with measured reference scan/profile counters.
+- [ ] Calibrate default cost weights with a broader benchmark matrix and persist additional analysis metadata in the catalog.
 - [x] Integrate time/Capsule pruning and exact-row reporting behind verified Chronicle sequence/row coverage, legacy-ANF exclusion, map-generation and materialisation-limit gates.
 - [x] Add optimizer-disabled reference execution and compare simple optimized query results.
 - [x] Test aliases/repeated projections, NULL predicates, computed-expression fallback and safe LIMIT decisions.

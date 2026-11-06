@@ -112,3 +112,8 @@ These weights are deterministic comparison heuristics, not milliseconds, a calib
 ## Configurable cost weights
 
 `PlannerOptions::cost_weights` exposes four integer-scaled milli-unit weights: scan row, scan KiB, filter row, and projection cell. The default values are 1000, 1000, 250 and 50 respectively. Each `ExplainPlan` embeds the weights used and renders them alongside the component costs. This makes the heuristic reproducible and tunable; it does not automatically learn weights or claim calibration until benchmark profiles are collected across representative data sizes and query shapes.
+
+
+## Calibration workload
+
+The `analytics_demo` example runs an explicit bounded ANALYZE before EXPLAIN, then reports estimated scan/output rows and projected payload next to measured full-scan reference input rows, returned result rows, decoded value-byte estimate and the optimized Capsule/Navigation Map profile. This is a repeatable comparison fixture, not a statistically broad benchmark matrix; default weights remain tunable until additional workload profiles are collected.
