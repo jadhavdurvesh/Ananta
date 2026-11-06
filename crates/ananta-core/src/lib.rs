@@ -476,7 +476,7 @@ impl Database {
         sync_recovery_directory(&wal_dir)?;
         let wal_report = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
-        validate_checkpoint_records(&root, &wal_report, catalog.revision)?;
+        validate_checkpoint_records(&root, &wal_report, &catalog)?;
         let committed_catalog_revisions = build_recovery_plan(&wal_report)
             .map_err(|error| DbError::Wal(error.to_string()))?
             .committed
@@ -671,7 +671,7 @@ impl Database {
         let wal_path = self.root.join("wal").join("database.anwl");
         let wal_report = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
-        validate_checkpoint_records(&self.root, &wal_report, self.catalog.revision)?;
+        validate_checkpoint_records(&self.root, &wal_report, &self.catalog)?;
         let recovery_plan = build_recovery_plan(&wal_report)
             .map_err(|error| DbError::Wal(error.to_string()))?;
         if !wal_report.is_clean() || !recovery_plan.incomplete.is_empty() {
@@ -793,7 +793,7 @@ impl Database {
             })?;
         let rotated = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
-        validate_checkpoint_records(&self.root, &rotated, self.catalog.revision)?;
+        validate_checkpoint_records(&self.root, &rotated, &self.catalog)?;
         if rotated.records.len() != 1 || rotated.last_sequence != 1 || !rotated.is_clean() {
             self.recovery_required = true;
             return Err(DbError::RecoveryRequired(
@@ -2804,7 +2804,7 @@ fn cleanup_stale_checkpoint_temp(wal_directory: &Path) -> Result<(), DbError> {
 fn validate_checkpoint_records(
     root: &Path,
     report: &WalReadReport,
-    current_catalog_revision: u64,
+    catalog: &Catalog,
 ) -> Result<(), DbError> {
     let checkpoints = report.records.iter()
         .filter(|record| record.kind == WalRecordKind::Checkpoint)
@@ -2820,9 +2820,38 @@ fn validate_checkpoint_records(
             "checkpoint must be the unique first frame in a rotated WAL".into(),
         ));
     }
-    let checkpoint = crate::wal_checkpoint::validate_checkpoint(root, &checkpoints[0].payload)
-        .map_err(|error| DbError::Wal(format!("checkpoint validation failed: {error}")))?;
-    if checkpoint.catalog_revision > current_catalog_revision {
+    let plan = build_recovery_plan(report)
+        .map_err(|error| DbError::Wal(error.to_string()))?;
+    let mut permitted_changed_paths = BTreeSet::new();
+    for transaction in &plan.committed {
+        for intent in &transaction.intents {
+            match intent.artifact_kind {
+                WalArtifactKind::CatalogSnapshot => {
+                    permitted_changed_paths.insert("catalog/catalog.anc".to_owned());
+                }
+                WalArtifactKind::ActiveWeavePointer => {
+                    let Some((table_name, _)) = catalog.tables.iter()
+                        .find(|(_, definition)| definition.id.0 == intent.table_id)
+                    else {
+                        return Err(DbError::Wal(format!(
+                            "checkpoint post-commit pointer has unknown TableId {}",
+                            intent.table_id,
+                        )));
+                    };
+                    permitted_changed_paths.insert(format!(
+                        "data/{table_name}/weaves/active.awp",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    let checkpoint = crate::wal_checkpoint::validate_checkpoint(
+        root,
+        &checkpoints[0].payload,
+        &permitted_changed_paths,
+    ).map_err(|error| DbError::Wal(format!("checkpoint validation failed: {error}")))?;
+    if checkpoint.catalog_revision > catalog.revision {
         return Err(DbError::Wal(
             "checkpoint catalog revision is newer than the loaded database catalog".into(),
         ));
