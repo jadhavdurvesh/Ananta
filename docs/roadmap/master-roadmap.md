@@ -709,7 +709,7 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [ ] Integrate Capsule and Navigation Map publication with explicit WAL intents.
 - [ ] Add checkpoint installation, WAL rotation and retention only after replay coverage is proven.
 
-**Guarantee boundary:** ANF insert, Chronicle ingest, table creation, nullable-column addition, column rename and column reorder use WAL-backed redo. Compaction candidate/OWM publication and Capsule/Navigation Map publication, plus general multi-operation application transactions, remain outside this boundary; do not claim general ACID semantics.
+**Guarantee boundary:** ANF insert, Chronicle ingest, table creation, nullable-column addition, column rename, column reorder, and active Weave promotion/rollback/fallback pointers use WAL-backed redo. Immutable compaction candidate-directory/OWM publication and Capsule/Navigation Map publication, plus general multi-operation application transactions, remain outside this boundary; do not claim general ACID semantics.
 
 Specification: docs/specifications/wal-recovery-v0.1.md.
 
