@@ -49,9 +49,15 @@ pub(crate) fn create_backup(source: &Path, destination: &Path) -> io::Result<Bac
         file.write_all(&manifest)?;
         file.flush()?;
         file.sync_all()?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterBackupManifestSynced,
+        );
         sync_tree_directories(&staging)?;
         sync_directory(parent)?;
         fs::rename(&staging, &destination)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterBackupDirectoryRenamedBeforeSync,
+        );
         sync_directory(parent)?;
         let (verified_entries, verified_manifest) = verify_backup(&destination)?;
         report(&destination, &verified_entries, &verified_manifest)
@@ -197,6 +203,9 @@ fn copy_tree(
             }
             fs::copy(&source_path, &target_path)?;
             File::open(&target_path)?.sync_all()?;
+            crate::wal_recovery::maybe_crash_after(
+                crate::wal_recovery::WalRecoveryCrashPoint::AfterBackupFileSynced,
+            );
             let length = fs::metadata(&target_path)?.len();
             let sha256 = crate::chronicle::sha256_file(&target_path)?;
             let path_text = child_relative.to_str().ok_or_else(|| invalid("database path is not valid UTF-8"))?
