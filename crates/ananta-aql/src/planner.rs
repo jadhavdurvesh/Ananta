@@ -515,7 +515,15 @@ pub fn explain(
         } else {
             scan_column_count as f64 / all.len() as f64
         };
-        (analysis.estimated_batch_payload_bytes as f64 * scan_fraction)
+        let row_fraction = if analysis.scanned_rows == 0 {
+            0.0
+        } else {
+            estimated_scan_rows.unwrap_or(analysis.scanned_rows) as f64
+                / analysis.scanned_rows as f64
+        };
+        (analysis.estimated_batch_payload_bytes as f64
+            * scan_fraction
+            * row_fraction.clamp(0.0, 1.0))
             .round()
             .min(u64::MAX as f64) as u64
     });
@@ -856,6 +864,12 @@ mod tests{
     #[test]
     fn cost_model_prices_projection_pushdown_and_safe_limit_scan_reduction(){
         let(mut db,root)=fixture();
+        let additional_rows=(0..9_i64).map(|index|vec![
+            Value::TimestampMicros(20+index),
+            Value::Utf8(format!("device-{index}")),
+            Value::Float64(index as f64),
+        ]).collect::<Vec<_>>();
+        db.insert_batch("telemetry",&additional_rows).unwrap();
         ananta_execution::analyze_table_and_persist(&db,"telemetry",2).unwrap();
         let query=crate::parse("SELECT device FROM telemetry").unwrap();
         let pushed=explain(&db,&query,&ParameterBindings::default(),PlannerOptions::default()).unwrap();
@@ -863,19 +877,22 @@ mod tests{
             enable_projection_pushdown:false,
             ..PlannerOptions::default()
         }).unwrap();
-        assert_eq!(pushed.cost.estimated_scan_rows,Some(1));
-        assert_eq!(pushed.cost.estimated_output_rows,Some(1));
+        assert_eq!(pushed.cost.estimated_scan_rows,Some(10));
+        assert_eq!(pushed.cost.estimated_output_rows,Some(10));
         assert!(pushed.cost.estimated_scan_payload_bytes.unwrap()
             < unpushed.cost.estimated_scan_payload_bytes.unwrap());
         assert!(pushed.cost.total_cost_units.unwrap()
             < unpushed.cost.total_cost_units.unwrap());
         assert!(pushed.render().contains("COST weights="));
-        assert!(pushed.render().contains("scan_rows=1 output_rows=1"));
+        assert!(pushed.render().contains("scan_rows=10 output_rows=10"));
 
         let limited=crate::parse("SELECT device FROM telemetry LIMIT 1").unwrap();
         let limited_plan=explain(&db,&limited,&ParameterBindings::default(),PlannerOptions::default()).unwrap();
         assert_eq!(limited_plan.cost.estimated_scan_rows,Some(1));
-        assert_eq!(limited_plan.cost.total_cost_units,pushed.cost.total_cost_units);
+        assert!(limited_plan.cost.estimated_scan_payload_bytes.unwrap()
+            < pushed.cost.estimated_scan_payload_bytes.unwrap());
+        assert!(limited_plan.cost.total_cost_units.unwrap()
+            < pushed.cost.total_cost_units.unwrap());
         drop(db);
         fs::remove_dir_all(root).unwrap();
     }
