@@ -1334,6 +1334,15 @@ impl Database {
         let capsule_bytes = encode_capsule(metadata, &payload)?;
         let capsule_directory = self.root.join("data").join(table).join("capsules");
         fs::create_dir_all(&capsule_directory)?;
+        let final_path = capsule_directory.join(format!(
+            "capsule-{capsule_id:020}-g{generation:020}.cap",
+        ));
+        if final_path.exists() {
+            return Err(DbError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "immutable Capsule generation already exists",
+            )));
+        }
         let intent = WalMutationIntent {
             artifact_kind: WalArtifactKind::Capsule,
             table_id: definition.id.0,
@@ -1346,7 +1355,7 @@ impl Database {
             sha256: chronicle::sha256(&capsule_bytes),
         };
         stage_wal_artifact(&capsule_directory, &intent, &capsule_bytes)
-            .map_err(|error| DbError::Wal(error.to_string()))?;
+            .map_err(Self::map_precommit_stage_error)?;
         self.commit_wal_intent(&intent, b"Capsule build_capsule")?;
         self.publish_wal_intent(&capsule_directory, &intent)
     }
@@ -1689,6 +1698,13 @@ impl Database {
             entries,
         };
         let bytes = map.encode()?;
+        let final_path = capsule_directory.join(map_filename(map_generation));
+        if final_path.exists() {
+            return Err(DbError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "immutable Navigation Map generation already exists",
+            )));
+        }
         let intent = WalMutationIntent {
             artifact_kind: WalArtifactKind::NavigationMap,
             table_id: definition.id.0,
@@ -1698,7 +1714,7 @@ impl Database {
             sha256: chronicle::sha256(&bytes),
         };
         stage_wal_artifact(&capsule_directory, &intent, &bytes)
-            .map_err(|error| DbError::Wal(error.to_string()))?;
+            .map_err(Self::map_precommit_stage_error)?;
         self.commit_wal_intent(&intent, b"Navigation Map build_navigation_map")?;
         self.publish_wal_intent(&capsule_directory, &intent)
     }
