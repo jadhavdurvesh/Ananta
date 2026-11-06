@@ -697,6 +697,7 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Test incomplete intent cleanup and durable ABORT on startup.
 - [x] Test torn COMMIT frame truncation followed by incomplete-intent cleanup.
 - [x] Test Database::open fails closed and preserves a conflicting final artifact.
+- [x] Verify ANF embedded TableId/schema revision and Chronicle record TableId/schema revision against each committed intent before publication.
 - [x] Preserve `DbError::Io` for pre-commit staging conflicts and `DbError::ChronicleCorrupt` for checksum failures in committed Chronicle records.
 - [ ] Inject process interruption at every publication/fsync boundary and verify replay idempotence across repeated crashes.
 - [ ] Integrate catalog DDL, compaction manifests and active-Weave publication with explicit WAL intents.

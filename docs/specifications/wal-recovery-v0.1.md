@@ -170,3 +170,12 @@ A committed Chronicle file that fails the WAL intent SHA-256/length validation i
 The Database test suite now simulates a torn COMMIT frame by appending a valid frame-length prefix and only a partial body after a durable BEGIN/MUTATION. Database::open truncates the WAL tail to the last verified record, classifies the transaction as incomplete, removes its staged ANF file, appends ABORT, and opens with no row visible.
 
 A second test simulates a committed intent whose final ANF filename is occupied by different bytes while the matching staging file remains. Database::open fails closed, does not replace or delete the conflicting final file, and does not claim the committed row is available.
+
+
+## Artifact identity validation
+
+Before a committed artifact is accepted as published, replay verifies its SHA-256 and format identity against AMUT:
+- ANF intent requires a valid v2 header with matching TableId and schema revision.
+- Chronicle intent is checked by the streaming Chronicle inspector, including record framing, whole-record checksum, embedded payload fingerprint, TableId and schema revision.
+
+An ANF identity mismatch is a WAL file conflict and fails open. A committed Chronicle record checksum/identity failure retains the public `DbError::ChronicleCorrupt` classification for compatibility with existing callers. The Database unit suite exercises an ANF schema-revision mismatch.

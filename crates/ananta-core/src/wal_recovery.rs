@@ -9,7 +9,7 @@ use crate::wal::{WalReadReport, WalRecordKind, WalWriter};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const INTENT_MAGIC: &[u8; 4] = b"AMUT";
@@ -445,6 +445,58 @@ fn verify_intent_file(
             WalRecoveryError::FileConflict("artifact SHA-256 differs from committed WAL intent")
         });
     }
+    verify_artifact_identity(path, intent)?;
+    Ok(())
+}
+
+fn verify_artifact_identity(
+    path: &Path,
+    intent: &WalMutationIntent,
+) -> Result<(), WalRecoveryError> {
+    match intent.artifact_kind {
+        WalArtifactKind::AnfSegment => {
+            let mut file = File::open(path).map_err(io_error)?;
+            let mut header = [0_u8; 36];
+            file.read_exact(&mut header)
+                .map_err(|_| WalRecoveryError::FileConflict("ANF segment header is truncated"))?;
+            let version = ananta_format::segment_version(&header)
+                .map_err(|_| WalRecoveryError::FileConflict("ANF segment header is invalid"))?;
+            if version != 2 || header[6] != 0 || header[7] != 0 {
+                return Err(WalRecoveryError::FileConflict(
+                    "WAL ANF intent requires an ANF v2 header with no mandatory feature flags",
+                ));
+            }
+            let table_id = u64::from_le_bytes(header[20..28].try_into()
+                .map_err(|_| WalRecoveryError::FileConflict("ANF table identity is truncated"))?);
+            let schema_revision = u64::from_le_bytes(header[28..36].try_into()
+                .map_err(|_| WalRecoveryError::FileConflict("ANF schema revision is truncated"))?);
+            if table_id != intent.table_id {
+                return Err(WalRecoveryError::FileConflict(
+                    "ANF TableId differs from committed WAL intent",
+                ));
+            }
+            if schema_revision != intent.schema_revision {
+                return Err(WalRecoveryError::FileConflict(
+                    "ANF schema revision differs from committed WAL intent",
+                ));
+            }
+        }
+        WalArtifactKind::ChronicleRecord => {
+            let (metadata, _) = crate::chronicle::inspect_file(path, intent.table_id)
+                .map_err(|error| match error {
+                    crate::DbError::ChronicleCorrupt(message) => {
+                        WalRecoveryError::ChronicleCorrupt(message)
+                    }
+                    crate::DbError::Io(error) => WalRecoveryError::Io(error.to_string()),
+                    _ => WalRecoveryError::ChronicleCorrupt("invalid Chronicle record metadata"),
+                })?;
+            if metadata.schema_revision != intent.schema_revision {
+                return Err(WalRecoveryError::ChronicleCorrupt(
+                    "record schema revision differs from committed WAL intent",
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -478,6 +530,7 @@ fn io_error(error: std::io::Error) -> WalRecoveryError {
 mod tests {
     use super::*;
     use crate::wal::{read_wal, WalSyncPolicy, WalWriter};
+    use ananta_types::{Column, DataType, Schema, Value};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -485,6 +538,19 @@ mod tests {
     fn path(label: &str) -> PathBuf {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("ananta-wal-plan-{label}-{nonce}.wal"))
+    }
+
+    fn valid_anf_bytes(table_id: u64, schema_revision: u64) -> Vec<u8> {
+        let schema = Schema::new(vec![
+            Column::new("value", DataType::Int64, false),
+        ]).unwrap();
+        ananta_format::encode_segment_v2(
+            &schema,
+            &[vec![Value::Int64(42)]],
+            table_id,
+            schema_revision,
+            &[table_id + 100],
+        ).unwrap()
     }
 
     fn intent(file_id: u64) -> WalMutationIntent {
@@ -567,7 +633,7 @@ mod tests {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
         ));
         fs::create_dir_all(&root).unwrap();
-        let bytes = b"immutable ANF payload".to_vec();
+        let bytes = valid_anf_bytes(4, 2);
         let intent = WalMutationIntent {
             artifact_kind: WalArtifactKind::AnfSegment,
             table_id: 4,
@@ -599,14 +665,14 @@ mod tests {
         let wal_path = path("replay");
         let table_dir = wal_path.with_extension("table");
         fs::create_dir_all(&table_dir).unwrap();
-        let committed_bytes = b"committed payload";
+        let committed_bytes = valid_anf_bytes(71, 1);
         let committed_intent = WalMutationIntent {
             artifact_kind: WalArtifactKind::AnfSegment,
             table_id: 71,
             schema_revision: 1,
             file_id: 101,
             file_len: committed_bytes.len() as u64,
-            sha256: crate::chronicle::sha256(committed_bytes),
+            sha256: crate::chronicle::sha256(&committed_bytes),
         };
         let incomplete_bytes = b"incomplete payload";
         let incomplete_intent = WalMutationIntent {
@@ -690,6 +756,32 @@ mod tests {
         drop(writer);
         fs::remove_file(wal_path).unwrap();
         fs::remove_dir_all(table_dir).unwrap();
+    }
+
+    #[test]
+    fn publication_rejects_an_anf_schema_revision_that_disagrees_with_the_intent() {
+        let root = std::env::temp_dir().join(format!(
+            "ananta-wal-schema-mismatch-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let bytes = valid_anf_bytes(91, 1);
+        let intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::AnfSegment,
+            table_id: 91,
+            schema_revision: 2,
+            file_id: 92,
+            file_len: bytes.len() as u64,
+            sha256: crate::chronicle::sha256(&bytes),
+        };
+        stage_wal_artifact(&root, &intent, &bytes).unwrap();
+        assert_eq!(
+            publish_staged_wal_artifact(&root, &intent),
+            Err(WalRecoveryError::FileConflict(
+                "ANF schema revision differs from committed WAL intent"
+            )),
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

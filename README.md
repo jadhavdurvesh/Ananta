@@ -198,3 +198,6 @@ The WAL-backed insert/ingest path preserves legacy error classifications: pre-co
 
 
 Database-level recovery tests also cover torn COMMIT truncation and preservation of a conflicting final artifact; the engine fails closed rather than overwriting mismatched bytes.
+
+
+WAL replay also verifies each committed ANF/Chronicle file's embedded TableId and schema revision against the mutation intent before publication; Chronicle record integrity failures preserve the existing ChronicleCorrupt error classification.
