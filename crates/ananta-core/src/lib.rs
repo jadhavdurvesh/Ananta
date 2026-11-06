@@ -765,8 +765,8 @@ impl Database {
     ///
     /// The checkpoint manifest is synced first and fingerprints the immutable
     /// storage/schema artifacts that form the database state at this boundary.
-    /// The replacement WAL contains a single sequence-1 CHECKPOINT frame that
-    /// references the manifest; subsequent transactions are replayed after it.
+    /// The replacement WAL begins with a CHECKPOINT frame at the previous
+    /// high-water sequence plus one; future transactions retain monotonic IDs.
     /// Full replay is retained for every transaction written after the marker.
     pub fn create_checkpoint(&mut self) -> Result<CheckpointReport, DbError> {
         #[cfg(not(unix))]
@@ -814,6 +814,12 @@ impl Database {
                 "rotated WAL did not reopen as a clean checkpoint anchor".into(),
             ));
         }
+        report.pruned_manifest_count = crate::wal_checkpoint::prune_superseded_checkpoint_manifests(
+            &self.root,
+            &report.manifest_path,
+        ).map_err(|error| DbError::Wal(format!(
+            "checkpoint is durable but superseded-manifest pruning failed: {error}",
+        )))?;
         Ok(report)
     }
 
@@ -6814,6 +6820,10 @@ mod tests {
         ).unwrap();
         drop(db);
 
+        let second_checkpoint = reopened.create_checkpoint().unwrap();
+        assert_eq!(second_checkpoint.pruned_manifest_count, 1);
+        assert!(!checkpoint.manifest_path.exists());
+        assert!(second_checkpoint.manifest_path.is_file());
         let reopened = Database::open(&path).unwrap();
         assert_eq!(reopened.scan("telemetry").unwrap(), vec![first_rows[0].clone(), second_rows[0].clone()]);
         let consistency = reopened.check_consistency(1).unwrap();
