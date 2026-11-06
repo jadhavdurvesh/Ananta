@@ -1023,10 +1023,21 @@ mod tests {
             assert_eq!(verified.artifacts.len(), 2);
 
             if offset == 0 {
-                let pointer = db.promote_compaction_candidate(
-                    "telemetry", &input, 100, 1,
-                ).unwrap();
+                // A durable pointer COMMIT followed by interruption before the
+                // canonical active.awp replacement must be replayed on open.
+                crate::wal_recovery::arm_wal_recovery_crash_point(
+                    crate::wal_recovery::WalRecoveryCrashPoint::AfterActiveWeavePointerVersionedPublished,
+                );
+                let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    db.promote_compaction_candidate("telemetry", &input, 100, 1)
+                }));
+                assert!(interrupted.is_err());
+                drop(db);
+                let mut db = Database::open(&root).unwrap();
+                let pointer = db.active_weave_pointer("telemetry").unwrap().unwrap();
                 assert_eq!(pointer.active.weave_id, 100);
+                assert!(root.join("data").join("telemetry").join("weaves")
+                    .join("pointer-00000000000000000001.awp").is_file());
                 assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
 
                 // A cancellation request at the first checkpoint must leave the
