@@ -679,7 +679,7 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 
 **M6.1 boundary:** ANWL v1 framing is now used by the M6.2 ANF insert and Chronicle ingest publication paths. Catalog DDL, compaction/Weave publication, checkpoint installation and general transaction semantics remain outside this boundary; no general ACID guarantee is claimed.
 
-## M6.2 Recovery — initial ANF/Chronicle WAL replay integrated
+## M6.2 Recovery — ANF/Chronicle and catalog DDL WAL replay integrated (validation outstanding)
 - [x] Define startup recovery algorithm for immutable ANF/Chronicle artifacts.
 - [x] Define committed-only redo semantics and handling of incomplete transactions.
 - [x] Define versioned AMUT v1 mutation-intent envelope with canonical file names, size and SHA-256.
