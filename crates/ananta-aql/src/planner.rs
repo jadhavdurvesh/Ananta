@@ -47,6 +47,22 @@ pub enum PhysicalPlanNode {
     Project { columns:Vec<String> },
     Limit { rows:u64, estimated_rows:Option<u64> },
 }
+/// Transparent, deliberately simple relative cost estimate.
+///
+/// Units are not milliseconds or money. The default model uses one unit per
+/// scanned row, one unit per 4 KiB of estimated scan payload, 0.25 units per
+/// predicate evaluation and 0.05 units per projected output cell.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanCostEstimate {
+    pub estimated_scan_rows: Option<u64>,
+    pub estimated_output_rows: Option<u64>,
+    pub estimated_scan_payload_bytes: Option<u64>,
+    pub scan_cost_units: Option<f64>,
+    pub filter_cost_units: Option<f64>,
+    pub projection_cost_units: Option<f64>,
+    pub total_cost_units: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExplainPlan {
     pub language_version:String,
@@ -55,6 +71,7 @@ pub struct ExplainPlan {
     pub table_statistics:TableStatistics,
     pub required_columns:Vec<String>,
     pub timestamp_range:Option<ColumnRangePredicate>,
+    pub cost:PlanCostEstimate,
     pub notes:Vec<String>,
 }
 impl ExplainPlan {
@@ -73,6 +90,16 @@ impl ExplainPlan {
                 display_option(column.approximate_distinct_count),
                 column.histogram_bucket_count));
         }
+        lines.push(format!(
+            "COST scan_rows={} output_rows={} scan_payload_bytes={} scan_units={} filter_units={} projection_units={} total_units={}",
+            display_option(self.cost.estimated_scan_rows),
+            display_option(self.cost.estimated_output_rows),
+            display_option(self.cost.estimated_scan_payload_bytes),
+            display_float(self.cost.scan_cost_units),
+            display_float(self.cost.filter_cost_units),
+            display_float(self.cost.projection_cost_units),
+            display_float(self.cost.total_cost_units),
+        ));
         for node in &self.physical{
             lines.push(match node{
                 PhysicalPlanNode::Scan{table,columns,estimated_rows,projection_pushed_down,capsule_map_generation}=>{
@@ -91,6 +118,10 @@ impl ExplainPlan {
         lines.extend(self.notes.iter().map(|note|format!("NOTE {note}")));
         lines.join("\n")
     }
+}
+
+fn display_float(value: Option<f64>) -> String {
+    value.map_or_else(|| "unknown".into(), |value| format!("{value:.3}"))
 }
 
 fn estimate_rows(rows:u64,selectivity:f64)->u64{
@@ -441,10 +472,67 @@ pub fn explain(
     }
     if !options.enable_projection_pushdown{notes.push("projection pushdown disabled; scan decodes the full logical row".into());}
     if !options.enable_predicate_pushdown{notes.push("predicate pushdown disabled; filter remains above scan".into());}
+
+    let estimated_scan_rows = statistics.row_count.map(|rows| {
+        if select.selection.is_none() {
+            select.limit.map_or(rows, |limit| rows.min(limit))
+        } else {
+            rows
+        }
+    });
+    let estimated_scan_payload_bytes = analyzed_statistics.as_ref().map(|analysis| {
+        let scan_fraction = if all.is_empty() {
+            1.0
+        } else {
+            columns.len() as f64 / all.len() as f64
+        };
+        (analysis.estimated_batch_payload_bytes as f64 * scan_fraction)
+            .round()
+            .min(u64::MAX as f64) as u64
+    });
+    let output_columns = match &select.projection {
+        Projection::All => all.len(),
+        Projection::Items(items) => items.len(),
+    };
+    let scan_cost_units = estimated_scan_rows.map(|rows| {
+        rows as f64 + estimated_scan_payload_bytes.unwrap_or(0) as f64 / 4096.0
+    });
+    let filter_cost_units = if select.selection.is_some() {
+        estimated_scan_rows.map(|rows| rows as f64 * 0.25)
+    } else {
+        Some(0.0)
+    };
+    let projection_cost_units = estimated_rows_after_filter.map(|rows| {
+        rows as f64 * output_columns as f64 * 0.05
+    });
+    let total_cost_units = match (
+        scan_cost_units,
+        filter_cost_units,
+        projection_cost_units,
+    ) {
+        (Some(scan), Some(filter), Some(project)) => Some(scan + filter + project),
+        _ => None,
+    };
+    let cost = PlanCostEstimate {
+        estimated_scan_rows,
+        estimated_output_rows: estimated_rows_after_filter,
+        estimated_scan_payload_bytes,
+        scan_cost_units,
+        filter_cost_units,
+        projection_cost_units,
+        total_cost_units,
+    };
+    notes.push(
+        "relative cost units use 1 per scanned row, 1 per 4 KiB estimated scan payload, 0.25 per filter evaluation and 0.05 per projected cell; they are not latency predictions".into()
+    );
+    if estimated_scan_payload_bytes.is_none() {
+        notes.push("scan payload cost is unknown until a fresh ANALYZE snapshot is available".into());
+    }
+
     Ok(ExplainPlan{
         language_version:crate::AQL_VERSION.into(),
         logical:logical_plan(query),physical,table_statistics:statistics,
-        required_columns,timestamp_range,notes,
+        required_columns,timestamp_range,cost,notes,
     })
 }
 
@@ -692,6 +780,32 @@ mod tests{
         assert_eq!(estimate("SELECT id FROM readings WHERE value <= 2"),2);
         assert_eq!(estimate("SELECT id FROM readings WHERE value < 2"),1);
 
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cost_model_prices_projection_pushdown_and_safe_limit_scan_reduction(){
+        let(mut db,root)=fixture();
+        ananta_execution::analyze_table_and_persist(&db,"telemetry",2).unwrap();
+        let query=crate::parse("SELECT device FROM telemetry").unwrap();
+        let pushed=explain(&db,&query,&ParameterBindings::default(),PlannerOptions::default()).unwrap();
+        let unpushed=explain(&db,&query,&ParameterBindings::default(),PlannerOptions{
+            enable_projection_pushdown:false,
+            ..PlannerOptions::default()
+        }).unwrap();
+        assert_eq!(pushed.cost.estimated_scan_rows,Some(1));
+        assert_eq!(pushed.cost.estimated_output_rows,Some(1));
+        assert!(pushed.cost.estimated_scan_payload_bytes.unwrap()
+            < unpushed.cost.estimated_scan_payload_bytes.unwrap());
+        assert!(pushed.cost.total_cost_units.unwrap()
+            < unpushed.cost.total_cost_units.unwrap());
+        assert!(pushed.render().contains("COST scan_rows=1 output_rows=1"));
+
+        let limited=crate::parse("SELECT device FROM telemetry LIMIT 1").unwrap();
+        let limited_plan=explain(&db,&limited,&ParameterBindings::default(),PlannerOptions::default()).unwrap();
+        assert_eq!(limited_plan.cost.estimated_scan_rows,Some(1));
+        assert_eq!(limited_plan.cost.total_cost_units,pushed.cost.total_cost_units);
         drop(db);
         fs::remove_dir_all(root).unwrap();
     }

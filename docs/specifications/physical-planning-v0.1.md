@@ -95,3 +95,15 @@ Tests compare native execution with optimizer-disabled reference execution on su
 ## Stale/corrupt cache handling
 
 The database-managed statistics cache is disposable. A missing, corrupt, unsupported or stale cache is removed and treated as unavailable; EXPLAIN falls back to unknown cardinality/payload estimates instead of failing a query. A fresh analysis is produced only by an explicit `analyze_table_and_persist` call, avoiding an unexpected full-table scan on the query path.
+
+
+## Relative physical-plan cost model
+
+The vectorized EXPLAIN result includes a cost breakdown:
+- Scan work: one relative unit per estimated row scanned, plus one unit per 4 KiB of estimated decoded scan payload.
+- Filter work: 0.25 units per estimated row predicate evaluation.
+- Projection work: 0.05 units per estimated output cell.
+
+The payload estimate uses the fresh ANALYZE decoded-batch-payload estimate scaled by the fraction of columns selected for the scan; it remains unknown without fresh analysis. A storage-level LIMIT reduces estimated scan rows only when there is no WHERE predicate; with a filter, all candidate rows must still be read. Unknown cardinality propagates to unknown total cost instead of substituting Chronicle ingestion counters for full logical row counts.
+
+These weights are deterministic comparison heuristics, not milliseconds, a calibrated cost model, or a promise that the selected physical plan is optimal. They are surfaced as separate components so later benchmark data can refine the weights without obscuring their assumptions.

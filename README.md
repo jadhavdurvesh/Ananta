@@ -155,3 +155,6 @@ The Capsule size benchmark compared 512-row, 2,048-row and 8,192-row Capsules ov
 
 
 The AQL crate re-exports `analyze_table`, `analyze_table_and_persist` and `load_table_statistics` for explicit table analysis and cache management. `EXPLAIN` reuses only fresh cached analysis and never starts an implicit full-table scan.
+
+
+The vectorized `EXPLAIN` plan includes a transparent relative cost breakdown (scan rows, estimated projected payload, filter evaluations, projected cells and total cost units). The units are documented heuristics, not measured latency.
