@@ -3599,6 +3599,8 @@ mod tests {
         assert_eq!(consistency.capsules_checked, 8);
         assert_eq!(consistency.navigation_maps_checked, 1);
 
+        let checkpoint = db.create_checkpoint().unwrap();
+        assert!(checkpoint.manifest_path.is_file());
         let backup_report = db.backup_to(&backup).unwrap();
         assert!(backup_report.file_count > 40);
         assert!(backup_report.total_bytes > 0);
