@@ -147,6 +147,7 @@ pub enum WalRecoveryError {
     TransactionClassification(&'static str),
     Io(String),
     FileConflict(&'static str),
+    ChronicleCorrupt(&'static str),
     MissingCommittedArtifact,
     MissingTableId(u64),
     Wal(String),
@@ -165,6 +166,7 @@ impl fmt::Display for WalRecoveryError {
             }
             Self::Io(message) => write!(formatter, "WAL recovery I/O error: {message}"),
             Self::FileConflict(message) => write!(formatter, "WAL recovery file conflict: {message}"),
+            Self::ChronicleCorrupt(message) => write!(formatter, "corrupt committed Chronicle record: {message}"),
             Self::MissingCommittedArtifact => formatter.write_str(
                 "committed WAL artifact has neither a valid staging file nor a valid final file",
             ),
@@ -420,21 +422,28 @@ fn verify_intent_file(
     intent: &WalMutationIntent,
 ) -> Result<(), WalRecoveryError> {
     let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+    let chronicle = intent.artifact_kind == WalArtifactKind::ChronicleRecord;
     if !metadata.file_type().is_file() {
-        return Err(WalRecoveryError::FileConflict(
-            "artifact path is not a regular file",
-        ));
+        return Err(if chronicle {
+            WalRecoveryError::ChronicleCorrupt("record path is not a regular file")
+        } else {
+            WalRecoveryError::FileConflict("artifact path is not a regular file")
+        });
     }
     if metadata.len() != intent.file_len {
-        return Err(WalRecoveryError::FileConflict(
-            "artifact length differs from committed WAL intent",
-        ));
+        return Err(if chronicle {
+            WalRecoveryError::ChronicleCorrupt("record length mismatch")
+        } else {
+            WalRecoveryError::FileConflict("artifact length differs from committed WAL intent")
+        });
     }
     let checksum = crate::chronicle::sha256_file(path).map_err(io_error)?;
     if checksum != intent.sha256 {
-        return Err(WalRecoveryError::FileConflict(
-            "artifact SHA-256 differs from committed WAL intent",
-        ));
+        return Err(if chronicle {
+            WalRecoveryError::ChronicleCorrupt("record checksum mismatch")
+        } else {
+            WalRecoveryError::FileConflict("artifact SHA-256 differs from committed WAL intent")
+        });
     }
     Ok(())
 }

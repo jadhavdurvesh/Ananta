@@ -192,3 +192,6 @@ M6.2 now connects the WAL to initial immutable ANF inserts and Chronicle ingests
 
 
 The M6.2 write path also synchronises the WAL parent directory after header creation and the data/table directories before staged artifact publication, on platforms that support directory fsync.
+
+
+The WAL-backed insert/ingest path preserves legacy error classifications: pre-commit staging conflicts remain I/O errors with no ingestion sequence consumed, and committed Chronicle checksum failures remain Chronicle corruption errors during startup recovery.

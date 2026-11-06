@@ -443,7 +443,10 @@ impl Database {
                 intent.schema_revision,
             ).map_err(|error| WalRecoveryError::SchemaSnapshot(error.to_string()))?;
             Ok(root.join("data").join(table_name))
-        }).map_err(|error| DbError::Wal(error.to_string()))?;
+        }).map_err(|error| match error {
+            WalRecoveryError::ChronicleCorrupt(message) => DbError::ChronicleCorrupt(message),
+            other => DbError::Wal(other.to_string()),
+        })?;
 
         // Anything left here has no verified committed intent (for example a
         // process stopped while writing the staging file before BEGIN).
@@ -473,6 +476,16 @@ impl Database {
             ))
         } else {
             Ok(())
+        }
+    }
+
+    fn map_precommit_stage_error(error: WalRecoveryError) -> DbError {
+        match error {
+            WalRecoveryError::Io(message) => DbError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                message,
+            )),
+            other => DbError::Wal(other.to_string()),
         }
     }
 
@@ -773,7 +786,7 @@ impl Database {
             sha256: chronicle::sha256(&bytes),
         };
         stage_wal_artifact(&table_dir, &intent, &bytes)
-            .map_err(|error| DbError::Wal(error.to_string()))?;
+            .map_err(Self::map_precommit_stage_error)?;
         self.commit_wal_intent(&intent, b"ANF insert_batch")?;
         let final_path = self.publish_wal_intent(&table_dir, &intent)?;
         Ok(Some(final_path))
@@ -901,8 +914,13 @@ impl Database {
             file_len: u64::try_from(record_bytes.len()).map_err(|_| DbError::LengthOverflow)?,
             sha256: chronicle::sha256(&record_bytes),
         };
-        stage_wal_artifact(&directory, &intent, &record_bytes)
-            .map_err(|error| DbError::Wal(error.to_string()))?;
+        if let Err(error) = stage_wal_artifact(&directory, &intent, &record_bytes) {
+            let index = self.chronicle_indices.get_mut(&table_id)
+                .ok_or(DbError::ChronicleCorrupt("table has no Chronicle receipt index"))?;
+            index.stats.publication_failures = index.stats.publication_failures
+                .checked_add(1).ok_or(DbError::LengthOverflow)?;
+            return Err(Self::map_precommit_stage_error(error));
+        }
         self.commit_wal_intent(&intent, b"Chronicle ingest_batch")?;
 
         let path = match self.publish_wal_intent(&directory, &intent) {

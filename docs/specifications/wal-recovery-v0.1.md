@@ -156,3 +156,10 @@ Integration tests cover normal ANF/Chronicle close/reopen, fault injection after
 
 
 The current Database integration also synchronises the WAL directory after header creation, and synchronises both the data root and newly-created table directory during table creation. This closes the parent-directory entry durability gap for the initial ANF/Chronicle write path on platforms where directory fsync is supported.
+
+
+## Error compatibility at recovery boundaries
+
+Failures before the WAL COMMIT (for example, a canonical staging filename already owned by another operation) remain ordinary I/O errors. They do not consume the Chronicle ingestion sequence or advance the receipt index; Chronicle publication-failure diagnostics are incremented.
+
+A committed Chronicle file that fails the WAL intent SHA-256/length validation is reported as `DbError::ChronicleCorrupt`, preserving the existing Chronicle integrity error contract even though recovery detects the mismatch before the receipt-index scan. ANF committed-artifact conflicts remain WAL recovery errors and fail open.
