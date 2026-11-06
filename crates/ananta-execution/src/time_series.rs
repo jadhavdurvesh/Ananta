@@ -479,7 +479,7 @@ impl LatestPerSeriesOperator {
                     .map(|index| batch.columns[*index].values[row_index].clone())
                     .collect::<Vec<_>>();
                 let key = encode_group_key(&key_values)?;
-                let should_replace = latest.get(&key).is_none_or(|current| {
+                let should_replace = latest.get(&key).map_or(true, |current| {
                     timestamp > current.timestamp
                         || (timestamp == current.timestamp
                             && current_ordinal > current.ordinal)

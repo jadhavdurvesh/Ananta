@@ -1250,6 +1250,27 @@ mod tests {
     }
 
     #[test]
+    fn native_projection_preserves_aliases_and_repeated_columns() {
+        let (db, root, _) = fixture();
+        let query = crate::parse(
+            "SELECT device AS primary_device, device AS duplicate_device FROM telemetry WHERE reading >= 25.0"
+        ).unwrap();
+        let mut iterator = execute(&db, &query, &ParameterBindings::default(), 2, None).unwrap();
+        assert!(iterator.used_native_execution());
+        let output = iterator.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].schema[0].name, "primary_device");
+        assert_eq!(output[0].schema[1].name, "duplicate_device");
+        assert_eq!(output[0].columns[0], output[0].columns[1]);
+        assert_eq!(
+            output[0].columns[0],
+            vec![Value::Utf8("b".into()), Value::Utf8("d".into())]
+        );
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn timestamp_range_and_three_valued_null_filtering_work() {
         let (db, root, _) = fixture();
         let query = crate::parse(

@@ -1,6 +1,8 @@
 pub mod aggregation;
+pub mod statistics;
 pub mod time_series;
 pub use aggregation::{AggregateFunction, AggregateSpec, GroupByOperator};
+pub use statistics::{analyze_table, ColumnStatistics, TableStatistics};
 pub use time_series::{
     LatestPerSeriesOperator, TimeBucketOperator, TimestampBound, TimestampRangeOperator,
 };

@@ -615,21 +615,24 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 
 **Validation boundary:** time-series operators reuse the M5.2 group-state and resource controls. Timezone conversion, calendar buckets, gap filling, windows, watermarks and AQL integration remain deferred.
 
-## M5.4 Planner and optimisation — native AQL path submitted for CI validation
+## M5.4 Planner and optimisation — partial implementation, validation pending
 - [x] Define logical plan.
 - [x] Define initial physical operator pipeline.
 - [x] Implement direct-column projection pushdown into storage scan.
 - [x] Implement supported WHERE predicate execution through native filter.
 - [x] Implement safe LIMIT pushdown when no filter can discard rows.
-- [ ] Implement explain output.
-- [ ] Add table/column statistics and cardinality estimates.
-- [ ] Add cost estimates for projected scans and filters.
+- [x] Add physical EXPLAIN output.
+- [x] Add table/column analysis statistics (explicit bounded scan; exact null/min/max, approximate distinct).
+- [x] Add initial heuristic cardinality and projected-byte estimates with explicit provenance.
+- [ ] Persist statistics and use histograms for cost-based selectivity.
 - [ ] Integrate time/Capsule pruning only with verified complete-coverage semantics.
-- [x] Add optimiser-disabled reference execution and compare simple optimized query results.
-- [ ] Expand optimizer equivalence tests across all supported expression forms.
-- [ ] Compare actual rows/bytes with planned estimates.
+- [x] Add optimizer-disabled reference execution and compare simple optimized query results.
+- [x] Test aliases/repeated projections, NULL predicates, computed-expression fallback and safe LIMIT decisions.
+- [ ] Compare planned estimates against runtime input/bytes for representative workloads.
 
-**M5.4 scope note:** AQL direct-column projections and supported predicates use the native scan/filter/project/limit operators. Unsupported computed projection expressions fall back to the existing evaluator. Capsule pruning is not enabled for general table scans because derived Capsule coverage is not yet proven complete for every table; correctness takes precedence over pruning.
+Specification: docs/specifications/physical-planning-v0.1.md.
+
+**M5.4 scope note:** AQL direct-column projections and supported predicates use native scan/filter/project/limit operators. Computed projection expressions fall back to the original evaluator. Cardinality/byte figures are heuristic, while analyze_table performs an explicit bounded full scan. Capsule pruning is not enabled for ordinary AQL table queries because full coverage of derived Capsules cannot yet be proven.
 
 ## M5 exit gate
 - [ ] First AQL queries execute through native operators.
@@ -914,11 +917,10 @@ A task is done only when all applicable items are true:
 
 # 15. Immediate next actions
 
-1. Run and fix the M5.4 native AQL integration workflow.
-2. Add physical EXPLAIN output with the chosen operator tree and pushdown decisions.
-3. Add table and per-column statistics with explicit exact/estimated provenance.
-4. Add cardinality and projected-scan cost estimates; compare estimates with measured rows/bytes.
-5. Add optimiser-on/off equivalence tests for predicates, NULLs, projections, aliases, limits and cancellation.
-6. Only add Capsule/Navigation Map pruning to table queries when full coverage can be proven.
+1. Complete M5.4 CI validation for native AQL execution, EXPLAIN and table analysis.
+2. Compare physical estimates against runtime rows/bytes on representative tables.
+3. Persist table/column statistics and use them for better selectivity estimates.
+4. Prove Capsule coverage semantics before integrating Navigation Map pruning with full table scans.
+5. Expand optimizer-on/off equivalence tests; keep unsupported expressions on the reference evaluator until lowered.
 
-**Current focus: M5.4 — explain output and statistics.**
+**Current focus: M5.4 — CI validation and estimate accuracy.**

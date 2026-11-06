@@ -9,8 +9,8 @@ pub use parser::{parse, BinaryOperator, ColumnReference, Expr, ExprKind, Identif
     ParameterRef, Projection, Query, SelectItem, SelectStatement, Statement, UnaryOperator};
 
 pub use executor::{
-    execute, execute_source, execute_with_options, AqlErrorCode, AqlExecutionError,
-    AqlExecutionMetrics, AqlResultBatch, AqlResultIter,
+    execute, execute_source, execute_with_options, explain, AqlErrorCode, AqlExecutionError,
+    AqlExecutionMetrics, AqlPhysicalPlan, AqlResultBatch, AqlResultIter,
 };
 pub use plan::{logical_plan, LogicalPlan, LogicalPlanNode};
 
