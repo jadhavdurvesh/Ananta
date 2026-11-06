@@ -117,3 +117,17 @@ These weights are deterministic comparison heuristics, not milliseconds, a calib
 ## Calibration workload
 
 The `analytics_demo` example runs an explicit bounded ANALYZE before EXPLAIN, then reports estimated scan/output rows and projected payload next to measured full-scan reference input rows, returned result rows, decoded value-byte estimate and the optimized Capsule/Navigation Map profile. This is a repeatable comparison fixture, not a statistically broad benchmark matrix; default weights remain tunable until additional workload profiles are collected.
+
+
+## Cost calibration workload matrix
+
+The `cost_calibration` example is a reproducible, deterministic benchmark harness. It creates a 2,048-row, five-column telemetry table with variable-width text, 32 device values, a numeric temperature distribution and a boolean filter. It runs six workload shapes: narrow full scan, wide full scan, equality predicate, numeric range predicate, unfiltered LIMIT, and filtered LIMIT.
+
+For each workload it emits:
+- Planned scan rows and measured decoded input rows.
+- Planned output rows and measured output rows.
+- Estimated projected scan payload and measured decoded input value bytes.
+- Scan, filter, projection and total relative cost units using the configured weights.
+- Output-row estimate percentage error and observed elapsed microseconds.
+
+Run with `cargo run -p ananta-aql --example cost_calibration`. Compare CSV output across hardware/software environments before changing default weights. Timing is observational and should be collected over repeated runs for stable calibration; the relative cost units are not calibrated latency until such benchmark evidence is reviewed.

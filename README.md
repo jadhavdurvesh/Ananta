@@ -165,4 +165,12 @@ Planner cost weights are configurable through `PlannerOptions::cost_weights`. Th
 The `analytics_demo` example explicitly analyzes its fixture and reports estimated-versus-measured scan rows, output rows, projected payload and optimized/reference execution profiles as a reproducible cost-calibration workload.
 
 
-M6.1 adds the standalone versioned ANWL write-ahead log framing and append primitives. The WAL reader/writer is not yet connected to database mutations or startup replay; do not treat this as a crash-recovery or transaction guarantee. See [the WAL v0.1 specification](docs/specifications/wal-v0.1.md).
+### Planner cost calibration
+
+Run the reproducible workload matrix with:
+
+```bash
+cargo run -p ananta-aql --example cost_calibration
+```
+
+The example creates a deterministic 2,048-row telemetry dataset, persists ANALYZE statistics, and emits CSV comparing estimated scan/output rows and projected payload with measured decoded input/output profiles across six workloads. It reports the current configurable cost weights and elapsed time as observations; it does not automatically rewrite defaults or claim that relative cost units are milliseconds.
