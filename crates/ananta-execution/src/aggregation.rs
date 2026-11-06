@@ -879,15 +879,34 @@ mod tests {
 
     #[test]
     fn group_state_respects_memory_budget() {
+        struct UnmeteredSource {
+            schema: VectorSchema,
+            batches: VecDeque<VectorBatch>,
+        }
+        impl ExecutionOperator for UnmeteredSource {
+            fn schema(&self) -> &VectorSchema {
+                &self.schema
+            }
+
+            fn next_batch(
+                &mut self,
+                context: &mut ExecutionContext,
+            ) -> Result<Option<VectorBatch>, ExecutionError> {
+                context.check_cancelled()?;
+                Ok(self.batches.pop_front())
+            }
+        }
+
         let input_schema = VectorSchema::new(vec![
             Column::new("key", DataType::Utf8, true),
         ]).unwrap();
-        let input = MockOperator::new(
-            input_schema.clone(),
-            vec![batch(&input_schema, vec![
-                vec![Value::Utf8("x".repeat(128))],
-            ])],
-        );
+        let source_batch = batch(&input_schema, vec![
+            vec![Value::Utf8("x".repeat(128))],
+        ]);
+        let input = UnmeteredSource {
+            schema: input_schema,
+            batches: VecDeque::from([source_batch]),
+        };
         let mut operator = GroupByOperator::new(
             Box::new(input),
             vec![0],
@@ -899,7 +918,7 @@ mod tests {
         let mut context = ExecutionContext::new(ExecutionConfig {
             max_batch_rows: 10,
             max_batch_cells: 100,
-            max_working_set_bytes: 320,
+            max_working_set_bytes: 64,
         }).unwrap();
         assert!(matches!(
             operator.next_batch(&mut context),
