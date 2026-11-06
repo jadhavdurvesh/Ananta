@@ -503,18 +503,27 @@ impl Database {
                 "could not append WAL BEGIN: {error}"
             )));
         }
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterWalBegin,
+        );
         if let Err(error) = self.wal.append_mutation(transaction_id, &payload) {
             self.recovery_required = true;
             return Err(DbError::RecoveryRequired(format!(
                 "could not append WAL mutation intent: {error}"
             )));
         }
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterWalMutation,
+        );
         if let Err(error) = self.wal.commit_transaction(transaction_id) {
             self.recovery_required = true;
             return Err(DbError::RecoveryRequired(format!(
                 "WAL COMMIT durability is uncertain: {error}"
             )));
         }
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterWalCommit,
+        );
         Ok(())
     }
 
@@ -5076,6 +5085,156 @@ mod tests {
         assert_eq!(reopened_again.ingestion_stats("telemetry").unwrap().accepted_batches, 1);
         drop(reopened_again);
         fs::remove_dir_all(path).unwrap();
+    }
+
+
+    fn assert_recovered_artifact_inventory(
+        table_dir: &Path,
+        extension: &str,
+        committed: bool,
+    ) {
+        let mut final_count = 0_usize;
+        let mut staging_count = 0_usize;
+        for entry in fs::read_dir(table_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let filename = entry.file_name();
+            let filename = filename.to_string_lossy();
+            if filename.ends_with(".tmp") {
+                staging_count += 1;
+            }
+            if path.extension().and_then(|value| value.to_str()) == Some(extension) {
+                final_count += 1;
+            }
+        }
+        assert_eq!(final_count, if committed { 1 } else { 0 });
+        assert_eq!(staging_count, 0, "staging files must be removed after recovery");
+    }
+
+    fn exercise_anf_wal_crash_point(
+        point: crate::wal_recovery::WalRecoveryCrashPoint,
+        committed: bool,
+    ) {
+        let path = temp_path();
+        let mut database = Database::open(&path).unwrap();
+        database.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(7_000),
+            Value::Utf8(format!("anf-crash-{point:?}")),
+            Value::Float64(27.5),
+        ]];
+
+        crate::wal_recovery::arm_wal_recovery_crash_point(point);
+        let interruption = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = database.insert_batch("telemetry", &rows);
+        }));
+        assert!(interruption.is_err(), "crash point {point:?} was not reached");
+        drop(database);
+
+        let table_dir = path.join("data").join("telemetry");
+        let expected = if committed { rows.clone() } else { Vec::new() };
+        let recovered = Database::open(&path).unwrap();
+        assert_eq!(recovered.scan("telemetry").unwrap(), expected, "at {point:?}");
+        assert_recovered_artifact_inventory(&table_dir, "anf", committed);
+        drop(recovered);
+
+        // A second restart must not publish a duplicate file or duplicate rows.
+        let recovered_again = Database::open(&path).unwrap();
+        assert_eq!(recovered_again.scan("telemetry").unwrap(), expected, "second open at {point:?}");
+        assert_recovered_artifact_inventory(&table_dir, "anf", committed);
+        drop(recovered_again);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    fn exercise_chronicle_wal_crash_point(
+        point: crate::wal_recovery::WalRecoveryCrashPoint,
+        committed: bool,
+    ) {
+        let path = temp_path();
+        let mut database = Database::open(&path).unwrap();
+        database.create_table("telemetry", sample_schema()).unwrap();
+        let batch_id = BatchId::from_bytes([0xC3; 16]).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(8_000),
+            Value::Utf8(format!("chronicle-crash-{point:?}")),
+            Value::Float64(28.5),
+        ]];
+
+        crate::wal_recovery::arm_wal_recovery_crash_point(point);
+        let interruption = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = database.ingest_batch("telemetry", batch_id, &rows);
+        }));
+        assert!(interruption.is_err(), "crash point {point:?} was not reached");
+        drop(database);
+
+        let table_dir = path.join("data").join("telemetry");
+        let expected = if committed { rows.clone() } else { Vec::new() };
+        let mut recovered = Database::open(&path).unwrap();
+        assert_eq!(recovered.scan("telemetry").unwrap(), expected, "at {point:?}");
+        let stats = recovered.ingestion_stats("telemetry").unwrap();
+        assert_eq!(stats.accepted_batches, if committed { 1 } else { 0 });
+        assert_eq!(stats.accepted_rows, if committed { 1 } else { 0 });
+        assert_recovered_artifact_inventory(&table_dir, "chr", committed);
+
+        if committed {
+            let duplicate = recovered.ingest_batch("telemetry", batch_id, &rows).unwrap();
+            assert_eq!(duplicate.outcome, IngestOutcome::Duplicate);
+            assert_eq!(duplicate.ingestion_sequence, 1);
+        }
+        drop(recovered);
+
+        // Receipt reconstruction and duplicate resolution must survive another restart.
+        let recovered_again = Database::open(&path).unwrap();
+        assert_eq!(recovered_again.scan("telemetry").unwrap(), expected);
+        assert_eq!(
+            recovered_again.ingestion_stats("telemetry").unwrap().accepted_batches,
+            if committed { 1 } else { 0 },
+        );
+        assert_recovered_artifact_inventory(&table_dir, "chr", committed);
+        drop(recovered_again);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn database_wal_recovery_survives_every_anf_write_and_publication_interruption() {
+        use crate::wal_recovery::WalRecoveryCrashPoint::*;
+        for (point, committed) in [
+            (AfterStagingFileCreated, false),
+            (AfterStagingBytesWritten, false),
+            (AfterStagingFlush, false),
+            (AfterStagingFileSync, false),
+            (AfterStagingDirectorySync, false),
+            (AfterWalBegin, false),
+            (AfterWalMutation, false),
+            (AfterWalCommit, true),
+            (AfterFinalNameLinked, true),
+            (AfterPublishDirectorySync, true),
+            (AfterStagingNameRemoved, true),
+            (AfterCleanupDirectorySync, true),
+        ] {
+            exercise_anf_wal_crash_point(point, committed);
+        }
+    }
+
+    #[test]
+    fn database_wal_recovery_survives_every_chronicle_write_and_publication_interruption() {
+        use crate::wal_recovery::WalRecoveryCrashPoint::*;
+        for (point, committed) in [
+            (AfterStagingFileCreated, false),
+            (AfterStagingBytesWritten, false),
+            (AfterStagingFlush, false),
+            (AfterStagingFileSync, false),
+            (AfterStagingDirectorySync, false),
+            (AfterWalBegin, false),
+            (AfterWalMutation, false),
+            (AfterWalCommit, true),
+            (AfterFinalNameLinked, true),
+            (AfterPublishDirectorySync, true),
+            (AfterStagingNameRemoved, true),
+            (AfterCleanupDirectorySync, true),
+        ] {
+            exercise_chronicle_wal_crash_point(point, committed);
+        }
     }
 
     #[test]
