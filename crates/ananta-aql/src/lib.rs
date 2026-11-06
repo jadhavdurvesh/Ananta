@@ -1,10 +1,17 @@
 mod lexer;
 mod parser;
+mod executor;
+mod plan;
 
 pub use ananta_types::DataType;
 pub use lexer::{lex, Token, TokenKind};
 pub use parser::{parse, BinaryOperator, ColumnReference, Expr, ExprKind, Identifier, Literal,
     ParameterRef, Projection, Query, SelectItem, SelectStatement, Statement, UnaryOperator};
+
+pub use executor::{
+    execute, execute_source, AqlErrorCode, AqlExecutionError, AqlResultBatch, AqlResultIter,
+};
+pub use plan::{logical_plan, LogicalPlan, LogicalPlanNode};
 
 pub const AQL_VERSION: &str = "0.1";
 
@@ -72,9 +79,120 @@ fn collect_parameters(expression: &Expr, out: &mut std::collections::BTreeSet<Pa
     }
 }
 
+
+/// Validate the public AST shape before planning or execution. Catalog name/type
+/// resolution is performed against a Database by the executor.
+pub fn validate_ast(query: &Query) -> Result<(), AqlError> {
+    let Statement::Select(select) = &query.statement;
+    validate_identifier(&select.source)?;
+    if let Projection::Items(items) = &select.projection {
+        if items.is_empty() {
+            return Err(AqlError::new(AqlErrorKind::Semantic,
+                "SELECT projection cannot be empty", select.span));
+        }
+        for item in items {
+            validate_expr(&item.expression)?;
+            if let Some(alias) = &item.alias { validate_identifier(alias)?; }
+        }
+    }
+    if let Some(predicate) = &select.selection { validate_expr(predicate)?; }
+    Ok(())
+}
+
+fn validate_identifier(identifier: &Identifier) -> Result<(), AqlError> {
+    if identifier.value.is_empty() {
+        return Err(AqlError::new(AqlErrorKind::Semantic,
+            "identifier cannot be empty", identifier.span));
+    }
+    if !identifier.quoted {
+        let mut chars = identifier.value.chars();
+        let valid_start = chars.next().is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
+        if !valid_start || !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+            return Err(AqlError::new(AqlErrorKind::Semantic,
+                "unquoted identifier has invalid characters", identifier.span));
+        }
+    }
+    Ok(())
+}
+
+fn validate_expr(expression: &Expr) -> Result<(), AqlError> {
+    if expression.span.start.offset > expression.span.end.offset {
+        return Err(AqlError::new(AqlErrorKind::Semantic,
+            "expression source span is reversed", expression.span));
+    }
+    match &expression.kind {
+        ExprKind::Column(reference) => {
+            if !(1..=2).contains(&reference.parts.len()) {
+                return Err(AqlError::new(AqlErrorKind::Semantic,
+                    "column reference must contain one or two identifiers", reference.span));
+            }
+            for part in &reference.parts { validate_identifier(part)?; }
+        }
+        ExprKind::Literal(Literal::Float64(value)) if !value.is_finite() => {
+            return Err(AqlError::new(AqlErrorKind::InvalidLiteral,
+                "FLOAT64 literal must be finite", expression.span));
+        }
+        ExprKind::Parameter(ParameterRef::Named(name)) => {
+            if name.is_empty() || !name.chars().next().is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+                || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                return Err(AqlError::new(AqlErrorKind::InvalidParameter,
+                    "named parameter must be an ASCII identifier", expression.span));
+            }
+        }
+        ExprKind::Parameter(ParameterRef::Positional(0)) => {
+            return Err(AqlError::new(AqlErrorKind::InvalidParameter,
+                "positional parameters are one-based", expression.span));
+        }
+        ExprKind::Unary { expression, .. } | ExprKind::IsNull { expression, .. }
+        | ExprKind::Cast { expression, .. } => validate_expr(expression)?,
+        ExprKind::Binary { left, right, .. } => {
+            validate_expr(left)?;
+            validate_expr(right)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn structural_ast_validation_rejects_invalid_unquoted_identifiers_and_zero_parameters() {
+        let zero = Position::default();
+        let span = Span { start: zero, end: zero };
+        let invalid_identifier = Query {
+            statement: Statement::Select(SelectStatement {
+                projection: Projection::All,
+                source: Identifier { value: "bad table".into(), quoted: false, span },
+                selection: None,
+                limit: None,
+                span,
+            }),
+        };
+        assert_eq!(validate_ast(&invalid_identifier).unwrap_err().kind, AqlErrorKind::Semantic);
+
+        let invalid_parameter = Query {
+            statement: Statement::Select(SelectStatement {
+                projection: Projection::Items(vec![SelectItem {
+                    expression: Expr {
+                        kind: ExprKind::Parameter(ParameterRef::Positional(0)),
+                        span,
+                    },
+                    alias: None,
+                    span,
+                }]),
+                source: Identifier { value: "telemetry".into(), quoted: false, span },
+                selection: None,
+                limit: None,
+                span,
+            }),
+        };
+        assert_eq!(validate_ast(&invalid_parameter).unwrap_err().kind, AqlErrorKind::InvalidParameter);
+    }
+
     #[test]
     fn version_and_named_parameter_validation_are_explicit() {
         assert_eq!(AQL_VERSION, "0.1");

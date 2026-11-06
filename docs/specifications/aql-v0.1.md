@@ -129,3 +129,27 @@ Rejected:
 ## 13. Implementation boundaries
 
 The first implementation provides a standalone Rust lexer/parser and AST. It does not yet execute queries or resolve column names/types against a catalog. Those belong to M4.3 semantic validation and execution. The engine remains single-writer; query cancellation and result batches must use the existing bounded scan API. AQL never executes by constructing SQL for another database.
+
+
+## 14. Native execution contract — initial M4.3 implementation
+
+The Rust crate exposes execute and execute_source. A query is resolved against the open ANANTA Database catalog before the first batch is read. Unquoted table/column identifiers resolve case-insensitively; quoted identifiers resolve exactly. A qualified column is accepted only when the qualifier matches the one source table. Unknown names are rejected before iteration.
+
+The executor consumes Database::scan_batches and evaluates its compiled expression tree over one owned input RecordBatch at a time. It does not implement another file reader and does not collect the complete table. Output is an owned AqlResultBatch with one typed value vector per output column. Every output batch contains no more than the requested scan batch size; LIMIT is applied globally after filtering. The iterator yields one error and then stops.
+
+The first evaluator supports projection expressions, literals, typed named/positional parameters, unary signs and NOT, arithmetic, strict comparisons, AND/OR, IS NULL/IS NOT NULL and the initial explicit numeric casts. It uses three-valued boolean logic. A WHERE predicate retains only Boolean TRUE; FALSE and NULL/UNKNOWN are filtered. Integer overflow, division/modulo by zero, non-finite FLOAT64 arithmetic, invalid casts and operand type mismatches are execution errors.
+
+The public error code set is InvalidQuery, TableNotFound, ColumnNotFound, TypeMismatch, InvalidParameter, InvalidCast, Arithmetic, Cancelled and Storage. Source spans are preserved for parser/semantic errors where available. Cancellation uses an optional shared atomic flag and is checked between input batches and rows.
+
+M4.2 also defines a logical plan tree in semantic order: Scan, optional Filter, Project, optional Limit. The initial executor currently compiles that structure directly into a bounded scan plus expression plan; physical predicate pruning, vectorised operators and cost-based planning remain M5 work.
+
+This implementation is single-table and read-only. Timestamp range predicates are ordinary typed TIMESTAMP_MICROS comparisons (for example >= lower AND < upper); there is no timezone parsing or index/Weave-zone-map pruning yet. Execution is native and uses ANANTA's own Database API; it never generates SQL for an external database.
+
+
+## 15. AQL v0.1 native API example
+
+The \`ananta-aql\` crate provides \`parse\`, \`validate_ast\`, \`logical_plan\`, \`execute\` and \`execute_source\`. An \`AqlResultIter\` yields owned \`AqlResultBatch\` column vectors; callers can consume and discard each batch. The example at \`crates/ananta-aql/examples/telemetry_query.rs\` creates an ANANTA table, inserts telemetry rows and executes a parameterised query using only the embedded Rust API.
+
+The M4 CI workflow runs this example along with formatting, workspace tests, Clippy, the existing storage example and storage/compaction benchmarks. This validates that the first AQL vertical slice works without an external query engine or database.
+
+AQL v0.1 completion means the documented read-only single-table SELECT feature set is implemented. It does not imply joins, subqueries, aggregates, ORDER BY, indexes, cost-based optimisation, vectorised operators or a production server protocol; those are later roadmap work.
