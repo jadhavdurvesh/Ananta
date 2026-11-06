@@ -27,6 +27,8 @@ pub struct ColumnStatistics {
     pub null_count:Option<u64>,
     pub minimum:Option<Value>,
     pub maximum:Option<Value>,
+    pub approximate_distinct_count:Option<u64>,
+    pub histogram_bucket_count:usize,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableStatistics {
@@ -34,6 +36,7 @@ pub struct TableStatistics {
     pub ingestion_batches:Option<u64>,
     pub encoded_bytes:Option<u64>,
     pub capsule_coverage_complete:bool,
+    pub analyzed_snapshot_available:bool,
     pub columns:Vec<ColumnStatistics>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,15 +60,18 @@ pub struct ExplainPlan {
 impl ExplainPlan {
     pub fn render(&self)->String{
         let mut lines=vec![format!("AQL {}",self.language_version)];
-        lines.push(format!("Statistics: rows={}, batches={}, encoded_bytes={}, capsule_coverage_complete={}",
+        lines.push(format!("Statistics: rows={}, batches={}, encoded_bytes={}, capsule_coverage_complete={}, analyzed_snapshot={}",
             display_option(self.table_statistics.row_count),
             display_option(self.table_statistics.ingestion_batches),
             display_option(self.table_statistics.encoded_bytes),
-            self.table_statistics.capsule_coverage_complete));
+            self.table_statistics.capsule_coverage_complete,
+            self.table_statistics.analyzed_snapshot_available));
         for column in &self.table_statistics.columns {
-            lines.push(format!("COLUMN_STATS {} type={} nulls={} min={:?} max={:?}",
+            lines.push(format!("COLUMN_STATS {} type={} nulls={} min={:?} max={:?} ndv~={} histogram_buckets={}",
                 column.name,column.data_type,display_option(column.null_count),
-                column.minimum,column.maximum));
+                column.minimum,column.maximum,
+                display_option(column.approximate_distinct_count),
+                column.histogram_bucket_count));
         }
         for node in &self.physical{
             lines.push(match node{
@@ -129,8 +135,23 @@ pub fn explain(
     };
     let stats=database.ingestion_stats(&table).map_err(|e|e.to_string())?;
     let capsule_coverage_complete=database.capsules_cover_chronicle(&table).map_err(|e|e.to_string())?;
+    let analyzed_statistics=ananta_execution::load_table_statistics(database,&table)
+        .map_err(|error|error.to_string())?;
     let mut column_statistics=Vec::new();
-    if capsule_coverage_complete {
+
+    if let Some(analyzed)=analyzed_statistics.as_ref() {
+        for column in &analyzed.columns {
+            column_statistics.push(ColumnStatistics {
+                name:column.column.name.clone(),
+                data_type:column.column.data_type,
+                null_count:Some(column.null_count),
+                minimum:column.min_value.clone(),
+                maximum:column.max_value.clone(),
+                approximate_distinct_count:Some(column.approximate_distinct_count),
+                histogram_bucket_count:column.histogram.len(),
+            });
+        }
+    } else if capsule_coverage_complete {
         let capsules=database.verified_capsule_metadata(&table).map_err(|e|e.to_string())?;
         for column in &all {
             let column_id=database.column_id(&table,&column.name).map_err(|e|e.to_string())?.0;
@@ -157,19 +178,39 @@ pub fn explain(
                 }
             }
             column_statistics.push(ColumnStatistics {
-                name:column.name.clone(),data_type:column.data_type,
-                null_count,minimum,maximum,
+                name:column.name.clone(),
+                data_type:column.data_type,
+                null_count,
+                minimum,
+                maximum,
+                approximate_distinct_count:None,
+                histogram_bucket_count:0,
+            });
+        }
+    } else {
+        for column in &all {
+            column_statistics.push(ColumnStatistics {
+                name:column.name.clone(),
+                data_type:column.data_type,
+                null_count:None,
+                minimum:None,
+                maximum:None,
+                approximate_distinct_count:None,
+                histogram_bucket_count:0,
             });
         }
     }
+
     let statistics=TableStatistics{
-        // Chronicle counters omit legacy ANF segments. Only advertise an exact
-        // logical table cardinality when verified Capsule coverage proves every
-        // accepted Chronicle sequence and there are no standalone ANF segments.
-        row_count:if capsule_coverage_complete{Some(stats.accepted_rows)}else{None},
+        // Chronicle counters omit legacy ANF segments. Prefer a fresh analyzed
+        // snapshot; otherwise only advertise exact cardinality when Capsule
+        // coverage proves the full logical table is Chronicle-backed.
+        row_count:analyzed_statistics.as_ref().map(|analysis|analysis.scanned_rows)
+            .or_else(||if capsule_coverage_complete{Some(stats.accepted_rows)}else{None}),
         ingestion_batches:if stats.accepted_batches==0{None}else{Some(stats.accepted_batches)},
         encoded_bytes:if stats.accepted_batches==0{None}else{Some(stats.accepted_encoded_bytes)},
         capsule_coverage_complete,
+        analyzed_snapshot_available:analyzed_statistics.is_some(),
         columns:column_statistics,
     };
     let timestamp_range=select.selection.as_ref().and_then(|expr|extract_timestamp_range(expr,schema,&table,bindings).ok().flatten());
@@ -196,6 +237,13 @@ pub fn explain(
     if let Some(rows)=select.limit{physical.push(PhysicalPlanNode::Limit{rows});}
     let mut notes=Vec::new();
     if statistics.row_count.is_none(){notes.push("table statistics unavailable; cardinality is unknown".into());}
+    if statistics.analyzed_snapshot_available {
+        notes.push("fresh database-managed analyzed statistics supplied row/null/NDV/histogram estimates".into());
+    } else if statistics.capsule_coverage_complete {
+        notes.push("exact Capsule statistics supplied row/null/min/max values; no analyzed histogram snapshot is cached".into());
+    } else {
+        notes.push("no fresh ANALYZE cache or complete Capsule coverage; cardinality and column distributions remain unknown".into());
+    }
     if timestamp_range.is_some()&&capsule_map_generation.is_none(){
         notes.push("time range is exact at the row evaluator; Capsule pruning unavailable (no complete coverage, no map generation, or materialisation cap)".into());
     }
@@ -415,6 +463,7 @@ mod tests{
 
         drop(db);fs::remove_dir_all(root).unwrap();
     }
+
 
     #[test]
     fn explain_keeps_unknown_statistics_unknown(){
