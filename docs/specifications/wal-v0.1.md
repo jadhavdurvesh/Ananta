@@ -94,7 +94,7 @@ This ordering is a design target, not an implemented guarantee in M6.1. M6.2 mus
 
 ## 8. Validation coverage
 
-The WAL tests cover header creation and transaction/commit/checkpoint round trip, mutation count and rolling digest validation, sequence progression and invalid transaction order, manual and automatic sync policies, truncated final length prefix, retained valid offset and writer truncation, open transaction reporting and explicit abort after reopen, and rejection of a complete frame with a corrupted checksum.
+The WAL tests cover header creation and transaction/commit/checkpoint round trip, mutation count and rolling digest validation, sequence progression and invalid transaction order, manual and automatic sync policies, truncated final length prefix, retained valid offset and writer truncation, open transaction reporting and explicit abort after reopen, rejection of a complete frame with a corrupted checksum, truncated frame-body repair, non-contiguous sequence rejection, and commit count/digest mismatch rejection.
 
 ## 9. M6.1 non-goals
 

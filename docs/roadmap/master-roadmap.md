@@ -665,16 +665,19 @@ Specification: docs/specifications/physical-planning-v0.1.md.
 
 This milestone is a hard prerequisite for production use. Do not imply transactional safety before it passes.
 
-## M6.1 Write-ahead log
-- [ ] Define WAL record format and version.
-- [ ] Define record checksums.
-- [ ] Define sequence and commit markers.
-- [ ] Define flush/sync policy.
-- [ ] Define segment/catalog relationship to WAL.
-- [ ] Implement WAL writer.
-- [ ] Implement WAL reader.
-- [ ] Test truncated WAL records.
-- [ ] Test corrupt WAL records.
+## M6.1 Write-ahead log — standalone framing and append primitives implemented
+- [x] Define WAL record format and version.
+- [x] Define record checksums (SHA-256 over record content).
+- [x] Define sequence and transaction commit/abort markers.
+- [x] Define flush/sync policy (manual, on commit, every record).
+- [x] Define segment/catalog relationship to WAL and the future M6.2 replay/publication boundary.
+- [x] Implement WAL writer with append-only frames and transaction digest tracking.
+- [x] Implement WAL reader with header, length, checksum, sequence and transaction-state validation.
+- [x] Test truncated final length prefixes and frame bodies; retain the last verified byte offset.
+- [x] Test complete corrupt frames, checksum mismatch, sequence gaps and bad commit digests.
+- [x] Test open transaction reporting, explicit abort after reopen, sync modes and invalid transaction ordering.
+
+**M6.1 boundary:** The ANWL v1 reader/writer is standalone. Database insert/ingest/catalog/compaction mutations are not yet routed through it, and there is no startup replay or rollback. These are M6.2 deliverables; no crash-recovery or ACID guarantee is claimed.
 
 ## M6.2 Recovery
 - [ ] Define startup recovery algorithm.

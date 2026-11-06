@@ -174,3 +174,6 @@ cargo run -p ananta-aql --example cost_calibration
 ```
 
 The example creates a deterministic 2,048-row telemetry dataset, persists ANALYZE statistics, and emits CSV comparing estimated scan/output rows and projected payload with measured decoded input/output profiles across six workloads. It reports the current configurable cost weights and elapsed time as observations; it does not automatically rewrite defaults or claim that relative cost units are milliseconds.
+
+
+The standalone ANWL WAL reader additionally tests truncated frame-body recovery, sequence-gap rejection and transaction commit-digest validation. Database write-path integration and startup replay remain M6.2 work.

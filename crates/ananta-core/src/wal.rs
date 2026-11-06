@@ -628,6 +628,105 @@ mod tests {
     }
 
     #[test]
+    fn wal_reader_reports_a_truncated_frame_body_without_discarding_prior_records() {
+        let path = path("truncated-body");
+        let mut writer = WalWriter::open(&path, WalSyncPolicy::Manual).unwrap();
+        writer.begin_transaction(41, b"metadata").unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        let valid_record = WalRecord {
+            sequence: 2,
+            transaction_id: 41,
+            kind: WalRecordKind::Mutation,
+            payload: b"partially-written-body".to_vec(),
+        };
+        let encoded = encode_record(&valid_record).unwrap();
+        let valid_end = fs::metadata(&path).unwrap().len();
+        {
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&encoded[..encoded.len() - 7]).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let report = read_wal(&path).unwrap();
+        assert!(report.truncated_tail);
+        assert_eq!(report.records.len(), 1);
+        assert_eq!(report.last_sequence, 1);
+        assert_eq!(report.valid_bytes, valid_end);
+        assert_eq!(report.incomplete_transaction_ids, vec![41]);
+
+        let repaired = WalWriter::open(&path, WalSyncPolicy::Manual).unwrap();
+        drop(repaired);
+        let after_open = read_wal(&path).unwrap();
+        assert!(!after_open.truncated_tail);
+        assert_eq!(after_open.records.len(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn wal_reader_rejects_a_complete_frame_with_a_sequence_gap() {
+        let path = path("sequence-gap");
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(FILE_MAGIC).unwrap();
+            file.write_all(&FILE_VERSION.to_le_bytes()).unwrap();
+            file.write_all(&(FILE_HEADER_LEN as u16).to_le_bytes()).unwrap();
+            let record = WalRecord {
+                sequence: 2,
+                transaction_id: 51,
+                kind: WalRecordKind::Begin,
+                payload: b"metadata".to_vec(),
+            };
+            file.write_all(&encode_record(&record).unwrap()).unwrap();
+            file.sync_all().unwrap();
+        }
+        assert!(matches!(
+            read_wal(&path),
+            Err(WalError::Corrupt("sequence is not contiguous"))
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn wal_reader_rejects_a_commit_with_a_recomputed_bad_transaction_digest() {
+        let path = path("commit-digest");
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(FILE_MAGIC).unwrap();
+            file.write_all(&FILE_VERSION.to_le_bytes()).unwrap();
+            file.write_all(&(FILE_HEADER_LEN as u16).to_le_bytes()).unwrap();
+            let begin = WalRecord {
+                sequence: 1,
+                transaction_id: 61,
+                kind: WalRecordKind::Begin,
+                payload: b"metadata".to_vec(),
+            };
+            let mutation = WalRecord {
+                sequence: 2,
+                transaction_id: 61,
+                kind: WalRecordKind::Mutation,
+                payload: b"real mutation".to_vec(),
+            };
+            let bad_commit = WalRecord {
+                sequence: 3,
+                transaction_id: 61,
+                kind: WalRecordKind::Commit,
+                payload: [99_u64.to_le_bytes().as_slice(), &[0_u8; 32]].concat(),
+            };
+            for record in [&begin, &mutation, &bad_commit] {
+                file.write_all(&encode_record(record).unwrap()).unwrap();
+            }
+            file.sync_all().unwrap();
+        }
+        assert!(matches!(
+            read_wal(&path),
+            Err(WalError::Corrupt("COMMIT mutation digest/count mismatch"))
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn wal_rejects_invalid_transaction_ordering() {
         let path = path("ordering");
         let mut writer = WalWriter::open(&path, WalSyncPolicy::Manual).unwrap();
