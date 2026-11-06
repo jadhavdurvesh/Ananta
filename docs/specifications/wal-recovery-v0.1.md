@@ -1,13 +1,13 @@
 # ANANTA WAL Recovery and Publication Protocol v0.1
 
 **Milestone:** M6.2 — startup recovery and redo  
-**Status:** Initial ANF/Chronicle Database integration implemented; deterministic crash-boundary tests are being expanded. General ACID semantics remain out of scope.
+**Status:** WAL replay is integrated for ANF, Chronicle, catalog DDL, active-Weave pointers, immutable compaction candidates, Capsules and Navigation Maps. Crash-boundary validation remains outstanding. General ACID semantics remain out of scope.
 
 ## 1. Guarantee boundary
 
 M6.1 supplies an ANWL v1 append log with checksummed frames, contiguous sequence validation, BEGIN/MUTATION/COMMIT/ABORT state tracking, sync policies and torn-tail truncation.
 
-This document specifies the first safe database integration. Until implementation and fault-injection tests are complete, the database does NOT claim WAL-backed crash recovery, transaction atomicity, or ACID semantics. The first integration scope is immutable ANF inserts and Chronicle ingests. Catalog DDL, compaction publication, active Weave swaps, Capsule/Navigation Map publication and multi-table transactions remain separate operations until their own intents and replay rules are implemented.
+This document specifies the first safe database integration. Until implementation and fault-injection tests are complete, the database does NOT claim WAL-backed crash recovery, transaction atomicity, or ACID semantics. The integration scope includes immutable ANF inserts and Chronicle ingests, supported catalog DDL, active-Weave pointer snapshots, immutable compaction candidate manifests, Capsules and Navigation Maps. Multi-operation application transactions remain outside the replay boundary.
 
 ## 2. Recovery model
 
@@ -28,7 +28,7 @@ Each WAL MUTATION payload uses a versioned binary envelope. Version 1 contains:
 | Field | Meaning |
 |---|---|
 | Magic and version | AMUT, version 1 |
-| Artifact kind | ANF segment or Chronicle record |
+| Artifact kind | ANF segment, Chronicle record, schema/catalog snapshot, Active Weave pointer, compaction output manifest, Capsule or Navigation Map |
 | Stable table identity | TableId, not only a user-supplied table name |
 | Schema revision | Historical schema snapshot used to encode the artifact |
 | Physical file identity | Preallocated non-zero segment/file ID |
@@ -237,3 +237,18 @@ The OWM1 body supplies the exact TableId, schema revision, job/attempt, input fi
 Incomplete intents have their staged manifest removed by generic WAL recovery; the existing compaction-job recovery then marks the Publishing attempt Interrupted and removes its uncommitted stage directory. Canonical unowned manifest temp files are also cleaned after WAL replay. Fully published historical candidates remain immutable across later schema revisions; an unfinished committed candidate for an obsolete schema fails closed.
 
 The existing compaction execution fixture injects interruptions after durable WAL COMMIT, after versioned OWM publication, and after the candidate-directory rename but before parent-directory sync. Reopen must reconstruct the final candidate, verify its full input/output/provenance identity, and preserve the logical table scan. These tests are committed but have not been executed in this environment. Candidate execution/promotion remains separate: this WAL intent publishes an immutable candidate only and does not make it active.
+
+
+## 16. Capsule and Navigation Map WAL integration
+
+Capsule and Navigation Map files are derived immutable artifacts stored under each table's `capsules/` directory. Both now follow the ANWL staged-file -> durable COMMIT -> no-replace final publication protocol. Their names remain native to their formats: `capsule-{capsule_id}-g{generation}.cap` and `navigation-{generation}.nvm`.
+
+AMUT v1 has a fixed-size identity envelope. For a Capsule intent, `table_id` is the stable TableId, `file_id` is the CapsuleId, and the envelope's `schema_revision` slot carries the Capsule generation. The Capsule's own checked header continues to contain the actual logical schema revision and is decoded/validated during both normal publication and recovery. This avoids changing existing AMUT v1 record sizes while preserving both Capsule identity values.
+
+For a Navigation Map intent, `table_id` is the stable TableId, `file_id` is the map generation, and `schema_revision` remains the current logical schema revision. Recovery decodes the map against the logged TableId/generation, then checks every referenced Capsule is a regular file of the recorded length, matches its SHA-256, decodes successfully, and has metadata identical to the map entry. Missing or conflicting dependencies fail open; the map is never treated as authoritative data.
+
+Both builders reject an already-existing immutable generation before committing another intent. Crash/reopen tests cover interruption immediately after durable COMMIT for each artifact type and verify successful replay. The wider subprocess and filesystem-sync interruption matrix for these two builders remains outstanding; the tests have been added but were not executed in this environment.
+
+## 17. Checkpoint and retention boundary
+
+ANWL checkpoint frame support exists at the framing layer, but database checkpoint installation, replay truncation, WAL rotation and retention are not enabled. The database continues to retain its complete WAL history and replays it from the beginning. This is deliberate: log truncation is not safe until a durable checkpoint captures every replay-relevant state transition (including DDL, data, Weave/OWM, Capsule and Navigation Map references) and recovery validates the checkpoint before discarding any prefix. No checkpoint or WAL-retention guarantee is claimed.

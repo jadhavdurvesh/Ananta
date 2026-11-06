@@ -26,6 +26,9 @@ pub enum WalArtifactKind {
     CatalogSnapshot = 4,
     ActiveWeavePointer = 5,
     CompactionOutputManifest = 6,
+    /// Derived immutable Capsule. For this kind, intent.schema_revision stores the Capsule generation.
+    Capsule = 7,
+    NavigationMap = 8,
 }
 
 impl WalArtifactKind {
@@ -37,6 +40,8 @@ impl WalArtifactKind {
             4 => Ok(Self::CatalogSnapshot),
             5 => Ok(Self::ActiveWeavePointer),
             6 => Ok(Self::CompactionOutputManifest),
+            7 => Ok(Self::Capsule),
+            8 => Ok(Self::NavigationMap),
             _ => Err(WalRecoveryError::CorruptIntent("unknown artifact kind")),
         }
     }
@@ -49,6 +54,18 @@ impl WalArtifactKind {
             Self::CatalogSnapshot => format!("catalog-{file_id:020}.anc"),
             Self::ActiveWeavePointer => format!("pointer-{file_id:020}.awp"),
             Self::CompactionOutputManifest => format!("candidate-{file_id:020}.owm"),
+            Self::Capsule => format!("capsule-{file_id:020}.cap"),
+            Self::NavigationMap => format!("navigation-{file_id:020}.nvm"),
+        }
+    }
+
+    /// Derive the canonical immutable name using the complete intent identity.
+    /// Capsule uses file_id=capsule_id and schema_revision=generation so both
+    /// values remain represented without changing the AMUT v1 envelope size.
+    pub fn final_file_name_for(self, file_id: u64, schema_revision: u64) -> String {
+        match self {
+            Self::Capsule => format!("capsule-{file_id:020}-g{schema_revision:020}.cap"),
+            _ => self.final_file_name(file_id),
         }
     }
 
@@ -60,6 +77,15 @@ impl WalArtifactKind {
             Self::CatalogSnapshot => format!(".catalog-{file_id:020}.tmp"),
             Self::ActiveWeavePointer => format!(".pointer-{file_id:020}.tmp"),
             Self::CompactionOutputManifest => format!(".candidate-{file_id:020}.tmp"),
+            Self::Capsule => format!(".capsule-{file_id:020}.tmp"),
+            Self::NavigationMap => format!(".navigation-{file_id:020}.tmp"),
+        }
+    }
+
+    pub fn staging_file_name_for(self, file_id: u64, schema_revision: u64) -> String {
+        match self {
+            Self::Capsule => format!(".capsule-{file_id:020}-g{schema_revision:020}.tmp"),
+            _ => self.staging_file_name(file_id),
         }
     }
 }
@@ -403,7 +429,9 @@ pub fn stage_wal_artifact(
         ));
     }
 
-    let staging_path = directory.join(intent.artifact_kind.staging_file_name(intent.file_id));
+    let staging_path = directory.join(intent.artifact_kind.staging_file_name_for(
+        intent.file_id, intent.schema_revision,
+    ));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -439,8 +467,12 @@ pub fn publish_staged_wal_artifact(
     intent.validate()?;
     let directory = directory.as_ref();
     require_recovery_directory(directory)?;
-    let staging_path = directory.join(intent.artifact_kind.staging_file_name(intent.file_id));
-    let final_path = directory.join(intent.artifact_kind.final_file_name(intent.file_id));
+    let staging_path = directory.join(intent.artifact_kind.staging_file_name_for(
+        intent.file_id, intent.schema_revision,
+    ));
+    let final_path = directory.join(intent.artifact_kind.final_file_name_for(
+        intent.file_id, intent.schema_revision,
+    ));
 
     if final_path.exists() {
         verify_intent_file(&final_path, intent)?;
@@ -487,7 +519,9 @@ pub fn discard_staged_wal_artifact(
     intent.validate()?;
     let directory = directory.as_ref();
     require_recovery_directory(directory)?;
-    let staging_path = directory.join(intent.artifact_kind.staging_file_name(intent.file_id));
+    let staging_path = directory.join(intent.artifact_kind.staging_file_name_for(
+        intent.file_id, intent.schema_revision,
+    ));
     match fs::symlink_metadata(&staging_path) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() {
@@ -642,6 +676,61 @@ fn verify_artifact_identity(
                 return Err(WalRecoveryError::FileConflict(
                     "active Weave pointer identity differs from committed WAL intent",
                 ));
+            }
+        }
+        WalArtifactKind::Capsule => {
+            let metadata = fs::metadata(path).map_err(io_error)?;
+            if metadata.len() > crate::capsule::MAX_CAPSULE_BYTES as u64 {
+                return Err(WalRecoveryError::FileConflict("Capsule exceeds size limit"));
+            }
+            let bytes = fs::read(path).map_err(io_error)?;
+            let (capsule, _) = crate::capsule::decode_capsule(&bytes)
+                .map_err(|_| WalRecoveryError::FileConflict("Capsule artifact is invalid"))?;
+            if capsule.table_id != intent.table_id
+                || capsule.capsule_id != intent.file_id
+                || capsule.generation != intent.schema_revision
+            {
+                return Err(WalRecoveryError::FileConflict(
+                    "Capsule identity differs from committed WAL intent",
+                ));
+            }
+        }
+        WalArtifactKind::NavigationMap => {
+            let metadata = fs::metadata(path).map_err(io_error)?;
+            if metadata.len() > 256 * 1024 * 1024 {
+                return Err(WalRecoveryError::FileConflict("Navigation Map exceeds size limit"));
+            }
+            let bytes = fs::read(path).map_err(io_error)?;
+            let map = crate::navigation_map::NavigationMap::decode(
+                &bytes, intent.table_id, intent.file_id,
+            ).map_err(|_| WalRecoveryError::FileConflict("Navigation Map artifact is invalid"))?;
+            let directory = path.parent().ok_or(WalRecoveryError::FileConflict(
+                "Navigation Map has no containing directory",
+            ))?;
+            for entry in &map.entries {
+                let capsule_path = directory.join(format!(
+                    "capsule-{:020}-g{:020}.cap",
+                    entry.metadata.capsule_id, entry.metadata.generation,
+                ));
+                let capsule_stat = fs::symlink_metadata(&capsule_path).map_err(io_error)?;
+                if !capsule_stat.file_type().is_file() || capsule_stat.len() != entry.file_len {
+                    return Err(WalRecoveryError::FileConflict(
+                        "Navigation Map references a missing or length-mismatched Capsule",
+                    ));
+                }
+                let capsule_bytes = fs::read(&capsule_path).map_err(io_error)?;
+                if crate::chronicle::sha256(&capsule_bytes) != entry.capsule_sha256 {
+                    return Err(WalRecoveryError::FileConflict(
+                        "Navigation Map Capsule fingerprint differs from the committed file",
+                    ));
+                }
+                let (capsule, _) = crate::capsule::decode_capsule(&capsule_bytes)
+                    .map_err(|_| WalRecoveryError::FileConflict("Navigation Map Capsule is invalid"))?;
+                if capsule != entry.metadata {
+                    return Err(WalRecoveryError::FileConflict(
+                        "Navigation Map Capsule metadata differs from the committed file",
+                    ));
+                }
             }
         }
         WalArtifactKind::CompactionOutputManifest => {

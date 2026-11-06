@@ -679,7 +679,7 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 
 **M6.1 boundary:** ANWL v1 framing is now used by the M6.2 ANF insert and Chronicle ingest publication paths. Catalog DDL, compaction/Weave publication, checkpoint installation and general transaction semantics remain outside this boundary; no general ACID guarantee is claimed.
 
-## M6.2 Recovery — ANF/Chronicle and catalog DDL WAL replay integrated (validation outstanding)
+## M6.2 Recovery — immutable data, metadata, Capsule and Navigation Map WAL replay integrated (validation outstanding)
 - [x] Define startup recovery algorithm for immutable ANF/Chronicle artifacts.
 - [x] Define committed-only redo semantics and handling of incomplete transactions.
 - [x] Define versioned AMUT v1 mutation-intent envelope with canonical file names, size and SHA-256.
@@ -706,18 +706,26 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Add in-process pre-COMMIT DDL interruption coverage for staging and incomplete WAL intents, plus in-process and subprocess crash/reopen coverage after WAL COMMIT, schema publication, versioned catalog publication, canonical replacement-temp sync, atomic rename before directory sync, and completed canonical catalog replacement.
 - [x] WAL-protect immutable compaction candidate-directory/OWM publication with a versioned manifest intent; recover staged-to-final directory rename before compaction journal reconciliation.
 - [x] WAL-protect active Weave promotion, rollback and damaged-generation fallback using immutable versioned AWP snapshots; replay committed pointers before active-generation validation.
-- [ ] Integrate Capsule and Navigation Map publication with explicit WAL intents.
+- [x] Integrate Capsule publication with explicit WAL intent, immutable Capsule ID/generation naming, format/identity verification and startup redo.
+- [x] Integrate Navigation Map publication with explicit WAL intent, map identity verification, and referenced Capsule length/SHA-256/metadata validation during redo.
+- [x] Add post-COMMIT interruption/reopen/idempotence coverage for Capsule and Navigation Map publication.
 - [ ] Add checkpoint installation, WAL rotation and retention only after replay coverage is proven.
+- [ ] Complete subprocess termination coverage for every Capsule/Navigation Map stage, sync, publication and cleanup boundary; add broader filesystem fault injection.
 
-**Guarantee boundary:** ANF insert, Chronicle ingest, table creation, nullable-column addition, column rename, column reorder, active Weave promotion/rollback/fallback pointers, and immutable compaction candidate-directory/OWM publication use WAL-backed redo. Capsule/Navigation Map publication and general multi-operation application transactions remain outside this boundary; do not claim general ACID semantics.
+**Guarantee boundary:** ANF insert, Chronicle ingest, table creation, nullable-column addition, column rename, column reorder, active Weave promotion/rollback/fallback pointers, immutable compaction candidate-directory/OWM publication, Capsule publication and Navigation Map publication use WAL-backed redo. Capsule intent uses the AMUT v1 revision field for its independent generation; the embedded Capsule header retains and validates the logical schema revision. Navigation Map redo verifies all referenced immutable Capsule files before accepting the map. General multi-operation application transactions remain outside this boundary; do not claim general ACID semantics.
 
 Specification: docs/specifications/wal-recovery-v0.1.md.
 
 ## M6.3 Transactions and concurrency
-- [ ] Define transaction scope and isolation goals.
-- [ ] Define atomicity boundary.
-- [ ] Implement one-writer lock and lock diagnostics.
+- [x] Define current transaction scope: each WAL-backed immutable publication or catalog DDL operation commits as one atomic redo unit; callers cannot group multiple API calls into one transaction.
+- [x] Define current isolation boundary: one exclusive database owner process/handle; no simultaneous writer handles; reads through the owning handle may be concurrent where the Rust API permits shared access.
+- [x] Enforce a database-wide exclusive writer lock and reject a second opener.
+- [ ] Add public lock diagnostics and stale-lock recovery guidance/API.
 - [ ] Add concurrent reader tests.
+- [ ] Define schema/catalog concurrency.
+- [ ] Design MVCC only if workload requirements justify it.
+- [ ] Add conflict tests.
+- [ ] Add transaction timeout/cancellation.
 - [ ] Define schema/catalog concurrency.
 - [ ] Design MVCC only if workload requirements justify it.
 - [ ] Add conflict tests.
