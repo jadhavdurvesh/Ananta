@@ -627,7 +627,8 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 - [x] Add initial heuristic cardinality and projected-byte estimates with explicit provenance.
 - [x] Refine equality, NULL and numeric range selectivity using analyzed NDV, null fraction and min/max statistics.
 - [x] Add versioned, checksummed statistics snapshot encode/decode and caller-managed save/load.
-- [ ] Persist statistics automatically in the database catalog and add histograms for cost-based selectivity.
+- [x] Build bounded deterministic sample histograms (256-value sample, up to 16 buckets) and use them for numeric/timestamp range selectivity.
+- [ ] Persist statistics automatically in the database catalog and implement a broader cost-based physical planner.
 - [ ] Integrate time/Capsule pruning only with verified complete-coverage semantics.
 - [x] Add optimizer-disabled reference execution and compare simple optimized query results.
 - [x] Test aliases/repeated projections, NULL predicates, computed-expression fallback and safe LIMIT decisions.

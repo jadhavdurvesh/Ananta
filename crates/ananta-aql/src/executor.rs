@@ -6,7 +6,7 @@ use ananta_core::{Database, DbError, ScanBatchIter};
 use ananta_execution::{
     ComparisonOperator as NativeComparison, ExecutionContext, ExecutionError, ExecutionOperator,
     FilterOperator, FilterPredicate, LimitOperator, Operand, ProjectionField, ProjectionOperator,
-    ScanOperator, TableStatistics,
+    ScanOperator, TableStatistics, ColumnStatistics,
 };
 use ananta_types::{Column, DataType, Schema, Value};
 use std::cmp::Ordering;
@@ -592,6 +592,19 @@ fn estimate_column_comparison(
         });
     }
 
+    if column.histogram_sample_count > 0 && !column.histogram.is_empty() {
+        let less_than = histogram_less_than(column, &value, false)?;
+        let less_equal = histogram_less_than(column, &value, true)?;
+        let fraction = match operator {
+            BinaryOperator::Less => less_than,
+            BinaryOperator::LessEqual => less_equal,
+            BinaryOperator::Greater => 1.0 - less_equal,
+            BinaryOperator::GreaterEqual => 1.0 - less_than,
+            _ => return None,
+        };
+        return Some(non_null_fraction * fraction.clamp(0.0, 1.0));
+    }
+
     let minimum = column.min_value.as_ref()?;
     let maximum = column.max_value.as_ref()?;
     let min_numeric = statistics_numeric_value(minimum)?;
@@ -619,6 +632,72 @@ fn estimate_column_comparison(
         _ => return None,
     };
     Some(non_null_fraction * fraction)
+}
+
+fn histogram_less_than(
+    column: &ColumnStatistics,
+    target: &Value,
+    inclusive: bool,
+) -> Option<f64> {
+    let sample_total = column.histogram_sample_count as f64;
+    if sample_total <= 0.0 {
+        return None;
+    }
+    let mut matched = 0.0_f64;
+    for bucket in &column.histogram {
+        let lower_order = compare_statistics_values(target, &bucket.lower_bound)?;
+        let upper_order = compare_statistics_values(target, &bucket.upper_bound)?;
+        let bucket_count = bucket.sample_count as f64;
+
+        if upper_order == Ordering::Greater {
+            matched += bucket_count;
+            continue;
+        }
+        if upper_order == Ordering::Equal {
+            if inclusive {
+                matched += bucket_count;
+            } else if lower_order == Ordering::Greater {
+                let equality_mass = (bucket_count
+                    / column.approximate_distinct_count.max(1) as f64)
+                    .min(bucket_count);
+                matched += (bucket_count - equality_mass).max(0.0);
+            }
+            break;
+        }
+        if lower_order == Ordering::Less {
+            break;
+        }
+        if lower_order == Ordering::Equal {
+            if inclusive {
+                let equality_mass = if compare_statistics_values(
+                    &bucket.lower_bound,
+                    &bucket.upper_bound,
+                )? == Ordering::Equal {
+                    bucket_count
+                } else {
+                    (bucket_count
+                        / column.approximate_distinct_count.max(1) as f64)
+                        .min(bucket_count)
+                };
+                matched += equality_mass;
+            }
+            break;
+        }
+
+        let fraction = match (
+            statistics_numeric_value(&bucket.lower_bound),
+            statistics_numeric_value(&bucket.upper_bound),
+            statistics_numeric_value(target),
+        ) {
+            (Some(lower), Some(upper), Some(value)) if upper > lower => {
+                ((value - lower) / (upper - lower)).clamp(0.0, 1.0)
+            }
+            _ => 0.5,
+        };
+        matched += bucket_count * fraction;
+        break;
+    }
+    Some((matched / sample_total).clamp(0.0, 1.0))
 }
 
 fn compiled_scalar_value(

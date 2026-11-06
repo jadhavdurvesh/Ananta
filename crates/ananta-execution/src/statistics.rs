@@ -5,13 +5,23 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 use std::cmp::Ordering;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, BTreeMap};
 use std::hash::{Hash, Hasher};
 
 const HLL_REGISTERS: usize = 64;
+const HISTOGRAM_SAMPLE_SIZE: usize = 256;
+const HISTOGRAM_BUCKETS: usize = 16;
 
 /// Per-column statistics collected from a full bounded scan. Distinct counts
 /// are approximate; NULL counts and min/max are exact for the scanned snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramBucket {
+    pub lower_bound: Value,
+    pub upper_bound: Value,
+    /// Number of deterministic sample values represented by this bucket.
+    pub sample_count: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnStatistics {
     pub column: Column,
@@ -20,6 +30,8 @@ pub struct ColumnStatistics {
     pub approximate_distinct_count: u64,
     pub min_value: Option<Value>,
     pub max_value: Option<Value>,
+    pub histogram_sample_count: u64,
+    pub histogram: Vec<HistogramBucket>,
 }
 
 /// Snapshot statistics for one table. scanned_rows is exact for this scan;
@@ -140,22 +152,28 @@ fn compare_stat_values(left: &Value, right: &Value) -> Result<Ordering, Executio
 
 struct ColumnAccumulator {
     column: Column,
+    column_index: u64,
     null_count: u64,
     non_null_count: u64,
     distinct: HyperLogLog,
     min_value: Option<Value>,
     max_value: Option<Value>,
+    sample_ordinal: u64,
+    sample: BTreeMap<(u64, u64), Value>,
 }
 
 impl ColumnAccumulator {
-    fn new(column: Column) -> Self {
+    fn new(column: Column, column_index: u64) -> Self {
         Self {
             column,
+            column_index,
             null_count: 0,
             non_null_count: 0,
             distinct: HyperLogLog::default(),
             min_value: None,
             max_value: None,
+            sample_ordinal: 0,
+            sample: BTreeMap::new(),
         }
     }
 
@@ -185,19 +203,72 @@ impl ColumnAccumulator {
         if replace_max {
             self.max_value = Some(value.clone());
         }
+
+        let ordinal = self.sample_ordinal;
+        self.sample_ordinal = self.sample_ordinal
+            .checked_add(1)
+            .ok_or(ExecutionError::ArithmeticOverflow)?;
+        let priority = splitmix64(
+            ordinal ^ self.column_index.wrapping_mul(0x9e3779b97f4a7c15),
+        );
+        let key = (priority, ordinal);
+        if self.sample.len() < HISTOGRAM_SAMPLE_SIZE {
+            self.sample.insert(key, value.clone());
+        } else if self.sample.last_key_value().is_some_and(|(largest, _)| key < *largest) {
+            self.sample.pop_last();
+            self.sample.insert(key, value.clone());
+        }
         Ok(())
     }
 
-    fn finish(self) -> ColumnStatistics {
-        ColumnStatistics {
+    fn finish(self) -> Result<ColumnStatistics, ExecutionError> {
+        let mut sample = self.sample.into_values().collect::<Vec<_>>();
+        sample.sort_by(|left, right| {
+            compare_stat_values(left, right).unwrap_or(Ordering::Equal)
+        });
+        let histogram_sample_count = u64::try_from(sample.len())
+            .map_err(|_| ExecutionError::ArithmeticOverflow)?;
+        let histogram = build_histogram(&sample)?;
+        Ok(ColumnStatistics {
             column: self.column,
             null_count: self.null_count,
             non_null_count: self.non_null_count,
             approximate_distinct_count: self.distinct.estimate(),
             min_value: self.min_value,
             max_value: self.max_value,
-        }
+            histogram_sample_count,
+            histogram,
+        })
     }
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
+
+fn build_histogram(sample: &[Value]) -> Result<Vec<HistogramBucket>, ExecutionError> {
+    if sample.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bucket_count = sample.len().min(HISTOGRAM_BUCKETS);
+    let mut buckets = Vec::with_capacity(bucket_count);
+    for bucket_index in 0..bucket_count {
+        let start = bucket_index * sample.len() / bucket_count;
+        let end = (bucket_index + 1) * sample.len() / bucket_count;
+        if start == end {
+            continue;
+        }
+        buckets.push(HistogramBucket {
+            lower_bound: sample[start].clone(),
+            upper_bound: sample[end - 1].clone(),
+            sample_count: u64::try_from(end - start)
+                .map_err(|_| ExecutionError::ArithmeticOverflow)?,
+        });
+    }
+    Ok(buckets)
 }
 
 /// Collect exact row/null/min/max counts and approximate distinct counts using
@@ -218,7 +289,10 @@ pub fn analyze_table(
     let schema_revision = database.table_schema_revision(table)?;
     let snapshot_token = database.table_scan_snapshot_token(table)?;
     let mut columns = schema.columns().iter().cloned()
-        .map(ColumnAccumulator::new)
+        .enumerate()
+        .map(|(index, column)| {
+            ColumnAccumulator::new(column, u64::try_from(index).unwrap_or(u64::MAX))
+        })
         .collect::<Vec<_>>();
     let mut scanned_rows = 0_u64;
     let mut estimated_batch_payload_bytes = 0_u64;
@@ -254,7 +328,9 @@ pub fn analyze_table(
         estimated_batch_payload_bytes,
         chronicle_accepted_rows: ingestion.accepted_rows,
         chronicle_accepted_encoded_bytes: ingestion.accepted_encoded_bytes,
-        columns: columns.into_iter().map(ColumnAccumulator::finish).collect(),
+        columns: columns.into_iter()
+            .map(ColumnAccumulator::finish)
+            .collect::<Result<Vec<_>, _>>()?,
     })
 }
 
@@ -290,6 +366,11 @@ mod tests {
         assert_eq!(stats.columns[1].non_null_count, 3);
         assert_eq!(stats.columns[1].min_value, Some(Value::Int64(10)));
         assert_eq!(stats.columns[1].max_value, Some(Value::Int64(30)));
+        assert_eq!(stats.columns[1].histogram_sample_count, 3);
+        assert_eq!(
+            stats.columns[1].histogram.iter().map(|bucket| bucket.sample_count).sum::<u64>(),
+            3
+        );
         assert!(stats.columns[0].approximate_distinct_count >= 2);
         assert!(stats.columns[0].approximate_distinct_count <= 4);
         assert!(stats.estimated_batch_payload_bytes > 0);
@@ -332,7 +413,7 @@ mod tests {
 
 
 const STATS_MAGIC: &[u8; 4] = b"AST1";
-const STATS_VERSION: u16 = 1;
+const STATS_VERSION: u16 = 2;
 const MAX_STATS_FILE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STATS_COLUMNS: usize = 65_536;
 const MAX_STATS_STRING_BYTES: usize = 1_048_576;
@@ -403,6 +484,14 @@ impl TableStatistics {
             body.u64(column.approximate_distinct_count);
             body.optional_value(column.min_value.as_ref())?;
             body.optional_value(column.max_value.as_ref())?;
+            body.u64(column.histogram_sample_count);
+            body.u32(u32::try_from(column.histogram.len())
+                .map_err(|_| StatisticsFormatError::LimitExceeded("histogram bucket count"))?);
+            for bucket in &column.histogram {
+                body.value(&bucket.lower_bound)?;
+                body.value(&bucket.upper_bound)?;
+                body.u64(bucket.sample_count);
+            }
         }
 
         let body = body.finish();
@@ -437,7 +526,7 @@ impl TableStatistics {
             return Err(StatisticsFormatError::Corrupt("invalid header"));
         }
         let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if version != STATS_VERSION {
+        if version != 1 && version != STATS_VERSION {
             return Err(StatisticsFormatError::Corrupt("unsupported version"));
         }
         let body_len_u64 = u64::from_le_bytes(bytes[6..14].try_into()
@@ -490,6 +579,25 @@ impl TableStatistics {
             let approximate_distinct_count = reader.u64()?;
             let min_value = reader.optional_value()?;
             let max_value = reader.optional_value()?;
+            let (histogram_sample_count, histogram) = if version >= 2 {
+                let sample_count = reader.u64()?;
+                let bucket_count = usize::try_from(reader.u32()?)
+                    .map_err(|_| StatisticsFormatError::LimitExceeded("histogram bucket count"))?;
+                if bucket_count > HISTOGRAM_BUCKETS {
+                    return Err(StatisticsFormatError::LimitExceeded("histogram bucket count"));
+                }
+                let mut buckets = Vec::with_capacity(bucket_count);
+                for _ in 0..bucket_count {
+                    buckets.push(HistogramBucket {
+                        lower_bound: reader.value()?,
+                        upper_bound: reader.value()?,
+                        sample_count: reader.u64()?,
+                    });
+                }
+                (sample_count, buckets)
+            } else {
+                (0, Vec::new())
+            };
             columns.push(ColumnStatistics {
                 column: Column::new(name, data_type, nullable),
                 null_count,
@@ -497,6 +605,8 @@ impl TableStatistics {
                 approximate_distinct_count,
                 min_value,
                 max_value,
+                histogram_sample_count,
+                histogram,
             });
         }
         if !reader.is_finished() {
@@ -579,6 +689,37 @@ fn validate_statistics(statistics: &TableStatistics) -> Result<(), StatisticsFor
         }
         if column.min_value.is_some() != column.max_value.is_some() {
             return Err(StatisticsFormatError::Corrupt("only one of minimum/maximum is present"));
+        }
+        if column.histogram.len() > HISTOGRAM_BUCKETS
+            || column.histogram_sample_count > column.non_null_count
+        {
+            return Err(StatisticsFormatError::Corrupt("invalid histogram sample bounds"));
+        }
+        let histogram_total = column.histogram.iter().try_fold(0_u64, |total, bucket| {
+            if bucket.lower_bound.data_type() != Some(column.column.data_type)
+                || bucket.upper_bound.data_type() != Some(column.column.data_type)
+                || bucket.sample_count == 0
+                || compare_stat_values(&bucket.lower_bound, &bucket.upper_bound)
+                    .map_err(|_| StatisticsFormatError::Corrupt("histogram value type mismatch"))?
+                    == Ordering::Greater
+            {
+                return Err(StatisticsFormatError::Corrupt("invalid histogram bucket bounds"));
+            }
+            total.checked_add(bucket.sample_count)
+                .ok_or(StatisticsFormatError::Corrupt("histogram sample count overflow"))
+        })?;
+        if histogram_total != column.histogram_sample_count
+            || (column.histogram_sample_count == 0) != column.histogram.is_empty()
+        {
+            return Err(StatisticsFormatError::Corrupt("histogram sample count does not match buckets"));
+        }
+        for pair in column.histogram.windows(2) {
+            if compare_stat_values(&pair[0].upper_bound, &pair[1].lower_bound)
+                .map_err(|_| StatisticsFormatError::Corrupt("histogram bucket type mismatch"))?
+                == Ordering::Greater
+            {
+                return Err(StatisticsFormatError::Corrupt("histogram buckets are not ordered"));
+            }
         }
     }
     Ok(())

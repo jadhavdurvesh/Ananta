@@ -39,7 +39,7 @@ The first estimator uses a documented heuristic, not histograms:
 - NOT: one minus child selectivity.
 - Unknown expression: 50%.
 
-Estimated filtered rows are rounded from analyzed scanned rows times selectivity. LIMIT caps the estimated output count. With explicit table statistics, equality/inequality selectivity uses approximate distinct counts and the non-NULL fraction; IS NULL / IS NOT NULL uses the exact observed NULL fraction. Numeric and timestamp range predicates use a uniform interpolation between exact min/max bounds and add an approximate equality mass for inclusive boundaries. These estimates remain approximate for skewed or clustered data and must not be presented as measured cardinality. When no analyzed statistics are supplied, the fixed fallback heuristics are used.
+Estimated filtered rows are rounded from analyzed scanned rows times selectivity. LIMIT caps the estimated output count. With explicit table statistics, equality/inequality selectivity uses approximate distinct counts and the non-NULL fraction; IS NULL / IS NOT NULL uses the exact observed NULL fraction. Numeric and timestamp range predicates use the sampled histogram, interpolating within a bucket and using exact observed min/max as the fallback when no histogram is available. These estimates remain approximate for skewed or clustered data and must not be presented as measured cardinality. When no analyzed statistics are supplied, the fixed fallback heuristics are used.
 
 ## 4. Runtime query profile
 
@@ -58,10 +58,11 @@ analyze_table(database, table, batch_rows) performs an explicit bounded full-tab
 - Exact per-column NULL and non-NULL counts.
 - Exact per-column minimum and maximum for supported scalar types (FLOAT64 uses total ordering).
 - Approximate per-column distinct count using a fixed-memory 64-register HyperLogLog estimator.
+- A deterministic bottom-hash sample of up to 256 non-NULL values per column, emitted as up to 16 ordered histogram buckets.
 - Sum of estimated owned batch payload sizes.
 - Chronicle accepted row and encoded-byte counters.
 
-The analysis scan can read the full table. TableStatistics supports a versioned AST1 binary encoding with a checksum and caller-managed save_to/load_from persistence. It captures table identity, schema revision and a lightweight fingerprint of the immutable scan-file inventory plus active Weave identity before and after the scan. If the inventory changes during analysis, the analysis fails and must be rerun. EXPLAIN checks the fingerprint and rejects statistics after new data files or an active Weave generation change. It is not run automatically before a query and these statistics are not yet persisted automatically in the database catalog in v0.3. The application-managed snapshot is a disposable cache; a corrupt or stale file must be regenerated. Histogram-based selectivity remains future work. The planner does not yet consume HLL/min/max statistics for selectivity; persisted statistics and histogram-based estimates remain future work.
+The analysis scan can read the full table. TableStatistics supports a versioned AST1 binary encoding with a checksum and caller-managed save_to/load_from persistence. Version 2 stores histogram buckets; the decoder remains able to read version-1 snapshots that contain no histogram. It captures table identity, schema revision and a lightweight fingerprint of the immutable scan-file inventory plus active Weave identity before and after the scan. If the inventory changes during analysis, the analysis fails and must be rerun. EXPLAIN checks the fingerprint and rejects statistics after new data files or an active Weave generation change. It is not run automatically before a query and these statistics are not yet persisted automatically in the database catalog in v0.3. The application-managed snapshot is a disposable cache; a corrupt or stale file must be regenerated. Histogram-based selectivity remains future work. The planner does not yet consume HLL/min/max statistics for selectivity; persisted statistics and histogram-based estimates remain future work.
 
 ## 7. Capsule / Navigation Map pruning boundary
 
