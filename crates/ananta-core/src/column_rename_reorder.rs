@@ -1,4 +1,4 @@
-//! Snapshot-first schema operations that preserve stable column identities.
+//! WAL-backed schema operations that preserve stable column identities.
 
 use super::{
     increment_catalog_revision, Database, DbError, ObjectId, TableDefinition,
