@@ -712,7 +712,7 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Add subprocess crash/reopen coverage for Capsule and Navigation Map at WAL MUTATION, durable COMMIT and final-name link; verify data, artifacts, consistency and a second reopen.
 - [x] Add ANCP v1 immutable checkpoint manifests with SHA-256 inventory of stable database artifacts and a WAL checkpoint reference.
 - [x] Validate checkpoint references and recorded artifacts on startup; validate mutable catalog/active-pointer fingerprints unless a committed post-checkpoint intent owns the update.
-- [x] Atomically rotate ANWL on Unix to a sequence-1 checkpoint anchor after manifest publication; preserve redo for all later WAL transactions.
+- [x] Atomically rotate ANWL on Unix to a checkpoint anchor at previous high-water sequence + 1 after manifest publication; preserve monotonic IDs and redo for all later WAL transactions.
 - [x] Add subprocess crash/reopen coverage at checkpoint-manifest temp sync/publication and WAL temp sync/rename/directory-sync boundaries.
 - [x] Extend Capsule/Navigation Map subprocess crash coverage to all 12 staging, WAL, final-publication and cleanup checkpoints for both artifact types.
 - [ ] Define checkpoint-manifest archive retention/pruning and Windows atomic-replacement support; do not use delete-then-rename.
