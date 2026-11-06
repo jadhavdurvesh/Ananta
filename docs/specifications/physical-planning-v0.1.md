@@ -100,7 +100,7 @@ The database-managed statistics cache is disposable. A missing, corrupt, unsuppo
 ## Relative physical-plan cost model
 
 The vectorized EXPLAIN result includes a cost breakdown:
-- Scan work: one relative unit per estimated row scanned, plus one unit per 4 KiB of estimated decoded scan payload.
+- Scan work: one relative unit per estimated row scanned, plus one unit per KiB of estimated decoded scan payload.
 - Filter work: 0.25 units per estimated row predicate evaluation.
 - Projection work: 0.05 units per estimated output cell.
 

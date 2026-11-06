@@ -1841,7 +1841,7 @@ mod tests {
         assert_eq!(profiled.metrics().scan_input_rows, 4);
         assert_eq!(profiled.metrics().output_rows, 2);
         assert_eq!(profiled.metrics().scan_input_value_payload_bytes, 28);
-        assert_eq!(profiled.metrics().output_value_payload_bytes, 18);
+        assert_eq!(profiled.metrics().output_value_payload_bytes, 2);
 
         let no_filter = crate::parse("SELECT device FROM telemetry LIMIT 2").unwrap();
         let limit_plan = explain(

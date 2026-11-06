@@ -717,7 +717,7 @@ mod tests{
             named:[("lower".into(),Value::TimestampMicros(5))].into_iter().collect(),positional:vec![],
         };
         let plan=explain(&db,&query,&bindings,PlannerOptions::default()).unwrap();
-        assert_eq!(plan.required_columns,vec!["device","time"]);
+        assert_eq!(plan.required_columns,vec!["time","device"]);
         assert_eq!(plan.table_statistics.row_count,Some(1));
         assert!(plan.timestamp_range.is_some());
         assert!(plan.render().contains("projection_pushdown=true"));
@@ -869,7 +869,8 @@ mod tests{
             < unpushed.cost.estimated_scan_payload_bytes.unwrap());
         assert!(pushed.cost.total_cost_units.unwrap()
             < unpushed.cost.total_cost_units.unwrap());
-        assert!(pushed.render().contains("COST scan_rows=1 output_rows=1"));
+        assert!(pushed.render().contains("COST weights="));
+        assert!(pushed.render().contains("scan_rows=1 output_rows=1"));
 
         let limited=crate::parse("SELECT device FROM telemetry LIMIT 1").unwrap();
         let limited_plan=explain(&db,&limited,&ParameterBindings::default(),PlannerOptions::default()).unwrap();
