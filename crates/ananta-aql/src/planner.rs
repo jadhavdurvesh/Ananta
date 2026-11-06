@@ -3,7 +3,6 @@ use crate::{logical_plan, BinaryOperator, ColumnReference, Expr, ExprKind, Ident
 use ananta_core::{CapsuleScanRequest, ColumnRangePredicate, Database};
 use ananta_types::{Column, DataType, Value};
 use std::collections::BTreeSet;
-use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlannerOptions {
@@ -131,7 +130,7 @@ pub fn explain(
     let mut column_statistics=Vec::new();
     if capsule_coverage_complete {
         let capsules=database.verified_capsule_metadata(&table).map_err(|e|e.to_string())?;
-        for (index,column) in all.iter().enumerate() {
+        for column in &all {
             let column_id=database.column_id(&table,&column.name).map_err(|e|e.to_string())?.0;
             let mut null_count=Some(0_u64);
             let mut minimum:Option<Value>=None;
@@ -159,7 +158,6 @@ pub fn explain(
                 name:column.name.clone(),data_type:column.data_type,
                 null_count,minimum,maximum,
             });
-            let _=index;
         }
     }
     let statistics=TableStatistics{
