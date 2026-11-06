@@ -30,7 +30,7 @@ pub use planner::{
     explain, extract_timestamp_range, ExplainPlan, PhysicalPlanNode, PlannerOptions,
     ColumnStatistics, TableStatistics,
 };
-pub use vectorized::{execute_vectorized, execute_vectorized_source};
+pub use vectorized::{execute_vectorized, execute_vectorized_source, execute_vectorized_source_with_options, execute_vectorized_with_options};
 
 pub const AQL_VERSION: &str = "0.1";
 
