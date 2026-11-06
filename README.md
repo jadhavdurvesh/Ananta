@@ -28,6 +28,14 @@ The initial Rust implementation currently includes:
 
 This is an experimental first vertical slice, not a complete or production-ready DBMS. The legacy `scan` APIs still materialise their complete result; the additive batch APIs bound decoded output per batch but do not yet provide predicates or physical column-range I/O. Only one local database handle/process may own a database at a time. A crash can leave a stale `.ananta.lock` file; after verifying no writer remains, an operator must remove it before reopening. Non-Unix targets do not have portable directory-entry flushing in this implementation. AQL, query planning, analytics operators, compression, indexes, compaction, WAL, transactions, MVCC and a complete crash-recovery protocol remain unimplemented.
 
+
+
+## AQL v0.1 status
+
+AQL is being implemented as a native Rust language crate, not as SQL passed through to another database. The current M4 foundation includes a lexer, source-spanned SELECT AST/parser, typed literal tokens, quoted identifiers and safe named/positional binding validation. Query execution and catalog semantic validation are the next M4.3 work.
+
+- [AQL v0.1 grammar and semantics](docs/specifications/aql-v0.1.md)
+
 ## Master execution roadmap
 
 The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M3.1 — compaction foundation.** M1 and M2 are complete. M2 delivered the Chronicle ingestion contract and prototype, immutable Capsule v0.1 files, a correctness-first Navigation Map, and reproducible M2 benchmarks. M3 begins with fingerprinted compaction manifests, row provenance, bounded job execution and safely discardable attempts.
