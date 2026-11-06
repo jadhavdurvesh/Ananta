@@ -173,11 +173,7 @@ fn kahan_add(sum:&mut f64,compensation:&mut f64,value:f64)->Result<(),ExecutionE
 fn as_f64(value:&Value)->Result<f64,ExecutionError>{
     match value{
         Value::Int32(v)=>Ok(f64::from(*v)),
-        Value::Int64(v)=>{
-            let f=*v as f64;
-            if f as i128 != *v as i128{return Err(ExecutionError::Arithmetic("INT64 is not exactly representable as FLOAT64 for AVG"));}
-            Ok(f)
-        }
+        Value::Int64(v)=>Ok(*v as f64),
         Value::Float64(v)=>Ok(*v),
         _=>Err(ExecutionError::InvalidExpression("expected numeric aggregate input")),
     }
