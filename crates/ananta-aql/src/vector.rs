@@ -79,6 +79,26 @@ impl VectorBatch {
         }
         Self::try_new(columns, self.row_count)
     }
+    pub fn select_columns_with_fields(
+        &self,
+        indices: &[usize],
+        fields: &[Column],
+    ) -> Result<Self, ExecutionError> {
+        if indices.is_empty() || indices.len()!=fields.len() {
+            return Err(ExecutionError::InvalidBatch("projection indices and output fields must be non-empty and equal length".into()));
+        }
+        let mut columns=Vec::with_capacity(indices.len());
+        for (index,field) in indices.iter().zip(fields) {
+            let source=self.columns.get(*index)
+                .ok_or_else(||ExecutionError::InvalidBatch(format!("projection index {index} is out of range")))?;
+            if source.field.data_type!=field.data_type {
+                return Err(ExecutionError::TypeMismatch{expected:field.data_type,actual:source.field.data_type});
+            }
+            columns.push(Vector{field:field.clone(),values:Arc::clone(&source.values)});
+        }
+        Self::try_new(columns,self.row_count)
+    }
+
     pub fn take_rows(&self, indices: &[usize]) -> Result<Self, ExecutionError> {
         let mut columns = Vec::with_capacity(self.columns.len());
         for column in &self.columns {
@@ -298,11 +318,21 @@ pub struct ProjectionOperator {
 }
 impl ProjectionOperator {
     pub fn new(input: Box<dyn PhysicalOperator>, indices: Vec<usize>) -> Result<Self, ExecutionError> {
-        if indices.is_empty() || indices.iter().any(|index| *index >= input.schema().len()) {
-            return Err(ExecutionError::InvalidBatch("invalid projection indices".into()));
+        let schema = indices.iter().map(|index| input.schema().get(*index).cloned()
+            .ok_or_else(||ExecutionError::InvalidBatch("invalid projection index".into())))
+            .collect::<Result<Vec<_>,_>>()?;
+        Self::new_with_fields(input,indices,schema)
+    }
+    pub fn new_with_fields(
+        input:Box<dyn PhysicalOperator>,
+        indices:Vec<usize>,
+        schema:Vec<Column>,
+    )->Result<Self,ExecutionError>{
+        if indices.is_empty()||indices.len()!=schema.len()
+            ||indices.iter().any(|index|*index>=input.schema().len()){
+            return Err(ExecutionError::InvalidBatch("invalid projection indices/fields".into()));
         }
-        let schema = indices.iter().map(|index| input.schema()[*index].clone()).collect();
-        Ok(Self { input, indices, schema, terminal: false })
+        Ok(Self{input,indices,schema,terminal:false})
     }
 }
 impl PhysicalOperator for ProjectionOperator {
@@ -311,7 +341,7 @@ impl PhysicalOperator for ProjectionOperator {
         if self.terminal { return Ok(None); }
         match self.input.next_batch(context) {
             Ok(Some(batch)) => {
-                let output = batch.select_columns(&self.indices)?;
+                let output = batch.select_columns_with_fields(&self.indices,&self.schema)?;
                 Ok(Some(output))
             }
             Ok(None) => { self.terminal = true; Ok(None) }
