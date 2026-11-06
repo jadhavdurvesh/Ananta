@@ -1,7 +1,7 @@
 //! Snapshot-first publication for the first supported schema change.
 
 use super::{
-    allocate_object_id, increment_catalog_revision, save_catalog, Database,
+    allocate_object_id, increment_catalog_revision, Database,
     DbError, ObjectId,
 };
 use crate::schema_snapshot::SchemaSnapshot;
@@ -20,6 +20,7 @@ impl Database {
         name: impl Into<String>,
         data_type: DataType,
     ) -> Result<ObjectId, DbError> {
+        self.ensure_operational()?;
         let name = name.into();
         let current = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
@@ -66,18 +67,13 @@ impl Database {
 
         let revised = candidate.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
-        SchemaSnapshot::new(
+        let snapshot = SchemaSnapshot::new(
             revised.id,
             revised.schema_revision,
             &revised.schema,
             &revised.column_ids,
-        )?.write_to(&self.root)?;
-
-        save_catalog(
-            &self.root.join("catalog").join("catalog.anc"),
-            &candidate,
         )?;
-        self.catalog = candidate;
+        self.commit_catalog_mutation(candidate, snapshot, b"add_nullable_column")?;
         Ok(new_column_id)
     }
 }
