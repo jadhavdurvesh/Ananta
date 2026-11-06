@@ -160,6 +160,40 @@ fn validate_expr(expression: &Expr) -> Result<(), AqlError> {
 mod tests {
     use super::*;
     #[test]
+    fn structural_ast_validation_rejects_invalid_unquoted_identifiers_and_zero_parameters() {
+        let zero = Position::default();
+        let span = Span { start: zero, end: zero };
+        let invalid_identifier = Query {
+            statement: Statement::Select(SelectStatement {
+                projection: Projection::All,
+                source: Identifier { value: "bad table".into(), quoted: false, span },
+                selection: None,
+                limit: None,
+                span,
+            }),
+        };
+        assert_eq!(validate_ast(&invalid_identifier).unwrap_err().kind, AqlErrorKind::Semantic);
+
+        let invalid_parameter = Query {
+            statement: Statement::Select(SelectStatement {
+                projection: Projection::Items(vec![SelectItem {
+                    expression: Expr {
+                        kind: ExprKind::Parameter(ParameterRef::Positional(0)),
+                        span,
+                    },
+                    alias: None,
+                    span,
+                }]),
+                source: Identifier { value: "telemetry".into(), quoted: false, span },
+                selection: None,
+                limit: None,
+                span,
+            }),
+        };
+        assert_eq!(validate_ast(&invalid_parameter).unwrap_err().kind, AqlErrorKind::InvalidParameter);
+    }
+
+    #[test]
     fn version_and_named_parameter_validation_are_explicit() {
         assert_eq!(AQL_VERSION, "0.1");
         let query = parse("SELECT * FROM t WHERE id = :id").unwrap();
