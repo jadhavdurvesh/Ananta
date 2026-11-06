@@ -27,6 +27,7 @@ pub struct CheckpointReport {
     pub total_bytes: u64,
     pub manifest_path: PathBuf,
     pub manifest_sha256: [u8; 32],
+    /// Number of superseded manifests removed after the new WAL anchor was validated.
     pub pruned_manifest_count: u64,
 }
 
