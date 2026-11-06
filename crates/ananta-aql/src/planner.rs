@@ -4,6 +4,26 @@ use ananta_core::{ColumnRangePredicate, Database};
 use ananta_types::{Column, DataType, Value};
 use std::collections::BTreeSet;
 
+/// Integer-scaled relative cost weights. Values are milli-cost units; for
+/// example, 1_000 means one relative cost unit per measured item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CostModelWeights {
+    pub scan_row_milli: u32,
+    pub scan_kib_milli: u32,
+    pub filter_row_milli: u32,
+    pub projection_cell_milli: u32,
+}
+impl Default for CostModelWeights {
+    fn default() -> Self {
+        Self {
+            scan_row_milli: 1_000,
+            scan_kib_milli: 1_000,
+            filter_row_milli: 250,
+            projection_cell_milli: 50,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlannerOptions {
     pub enable_projection_pushdown: bool,
@@ -11,12 +31,18 @@ pub struct PlannerOptions {
     pub navigation_map_generation: Option<u64>,
     pub max_capsule_materialized_rows: u64,
     pub max_capsule_materialized_bytes: usize,
+    pub cost_weights: CostModelWeights,
 }
 impl Default for PlannerOptions {
     fn default()->Self{
-        Self{enable_projection_pushdown:true,enable_predicate_pushdown:true,
-            navigation_map_generation:None,max_capsule_materialized_rows:100_000,
-            max_capsule_materialized_bytes:128*1024*1024}
+        Self{
+            enable_projection_pushdown:true,
+            enable_predicate_pushdown:true,
+            navigation_map_generation:None,
+            max_capsule_materialized_rows:100_000,
+            max_capsule_materialized_bytes:128*1024*1024,
+            cost_weights:CostModelWeights::default(),
+        }
     }
 }
 
@@ -54,6 +80,7 @@ pub enum PhysicalPlanNode {
 /// predicate evaluation and 0.05 units per projected output cell.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanCostEstimate {
+    pub weights: CostModelWeights,
     pub estimated_scan_rows: Option<u64>,
     pub estimated_output_rows: Option<u64>,
     pub estimated_scan_payload_bytes: Option<u64>,
@@ -91,7 +118,8 @@ impl ExplainPlan {
                 column.histogram_bucket_count));
         }
         lines.push(format!(
-            "COST scan_rows={} output_rows={} scan_payload_bytes={} scan_units={} filter_units={} projection_units={} total_units={}",
+            "COST weights={:?} scan_rows={} output_rows={} scan_payload_bytes={} scan_units={} filter_units={} projection_units={} total_units={}",
+            self.cost.weights,
             display_option(self.cost.estimated_scan_rows),
             display_option(self.cost.estimated_output_rows),
             display_option(self.cost.estimated_scan_payload_bytes),
@@ -495,16 +523,23 @@ pub fn explain(
         Projection::All => all.len(),
         Projection::Items(items) => items.len(),
     };
+    let weights = options.cost_weights;
     let scan_cost_units = estimated_scan_rows.map(|rows| {
-        rows as f64 + estimated_scan_payload_bytes.unwrap_or(0) as f64 / 4096.0
+        let row_cost = rows as f64 * f64::from(weights.scan_row_milli) / 1_000.0;
+        let payload_kib = estimated_scan_payload_bytes.unwrap_or(0) as f64 / 1_024.0;
+        let byte_cost = payload_kib * f64::from(weights.scan_kib_milli) / 1_000.0;
+        row_cost + byte_cost
     });
     let filter_cost_units = if select.selection.is_some() {
-        estimated_scan_rows.map(|rows| rows as f64 * 0.25)
+        estimated_scan_rows.map(|rows| {
+            rows as f64 * f64::from(weights.filter_row_milli) / 1_000.0
+        })
     } else {
         Some(0.0)
     };
     let projection_cost_units = estimated_rows_after_filter.map(|rows| {
-        rows as f64 * output_columns as f64 * 0.05
+        rows as f64 * output_columns as f64
+            * f64::from(weights.projection_cell_milli) / 1_000.0
     });
     let total_cost_units = match (
         scan_cost_units,
@@ -515,6 +550,7 @@ pub fn explain(
         _ => None,
     };
     let cost = PlanCostEstimate {
+        weights,
         estimated_scan_rows,
         estimated_output_rows: estimated_rows_after_filter,
         estimated_scan_payload_bytes,
@@ -524,7 +560,13 @@ pub fn explain(
         total_cost_units,
     };
     notes.push(
-        "relative cost units use 1 per scanned row, 1 per 4 KiB estimated scan payload, 0.25 per filter evaluation and 0.05 per projected cell; they are not latency predictions".into()
+        format!(
+            "relative cost weights are configurable milli-units: scan_row={}, scan_KiB={}, filter_row={}, projection_cell={}; costs are not latency predictions",
+            weights.scan_row_milli,
+            weights.scan_kib_milli,
+            weights.filter_row_milli,
+            weights.projection_cell_milli,
+        )
     );
     if estimated_scan_payload_bytes.is_none() {
         notes.push("scan payload cost is unknown until a fresh ANALYZE snapshot is available".into());
@@ -781,6 +823,32 @@ mod tests{
         assert_eq!(estimate("SELECT id FROM readings WHERE value <= 2"),2);
         assert_eq!(estimate("SELECT id FROM readings WHERE value < 2"),1);
 
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cost_model_weights_are_configurable_and_reported_in_explain(){
+        let(mut db,root)=fixture();
+        ananta_execution::analyze_table_and_persist(&db,"telemetry",2).unwrap();
+        let query=crate::parse("SELECT device FROM telemetry WHERE value >= 0.5").unwrap();
+        let baseline=explain(
+            &db,&query,&ParameterBindings::default(),PlannerOptions::default()
+        ).unwrap();
+        let expensive_filter=explain(
+            &db,&query,&ParameterBindings::default(),PlannerOptions{
+                cost_weights:CostModelWeights{
+                    filter_row_milli:2_000,
+                    ..CostModelWeights::default()
+                },
+                ..PlannerOptions::default()
+            }
+        ).unwrap();
+        assert_eq!(baseline.cost.weights.filter_row_milli,250);
+        assert_eq!(expensive_filter.cost.weights.filter_row_milli,2_000);
+        assert!(expensive_filter.cost.total_cost_units.unwrap()
+            > baseline.cost.total_cost_units.unwrap());
+        assert!(expensive_filter.render().contains("filter_row=2000"));
         drop(db);
         fs::remove_dir_all(root).unwrap();
     }

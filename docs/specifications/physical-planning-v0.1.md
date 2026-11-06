@@ -107,3 +107,8 @@ The vectorized EXPLAIN result includes a cost breakdown:
 The payload estimate uses the fresh ANALYZE decoded-batch-payload estimate scaled by the fraction of columns selected for the scan; it remains unknown without fresh analysis. A storage-level LIMIT reduces estimated scan rows only when there is no WHERE predicate; with a filter, all candidate rows must still be read. Unknown cardinality propagates to unknown total cost instead of substituting Chronicle ingestion counters for full logical row counts.
 
 These weights are deterministic comparison heuristics, not milliseconds, a calibrated cost model, or a promise that the selected physical plan is optimal. They are surfaced as separate components so later benchmark data can refine the weights without obscuring their assumptions.
+
+
+## Configurable cost weights
+
+`PlannerOptions::cost_weights` exposes four integer-scaled milli-unit weights: scan row, scan KiB, filter row, and projection cell. The default values are 1000, 1000, 250 and 50 respectively. Each `ExplainPlan` embeds the weights used and renders them alongside the component costs. This makes the heuristic reproducible and tunable; it does not automatically learn weights or claim calibration until benchmark profiles are collected across representative data sizes and query shapes.

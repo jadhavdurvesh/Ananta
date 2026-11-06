@@ -29,7 +29,7 @@ pub use timeseries::{
 };
 pub use planner::{
     explain as explain_plan, extract_timestamp_range, ExplainPlan, PhysicalPlanNode,
-    PlannerOptions, ColumnStatistics, TableStatistics, PlanCostEstimate,
+    PlannerOptions, CostModelWeights, ColumnStatistics, TableStatistics, PlanCostEstimate,
 };
 pub use ananta_execution::{
     analyze_table, analyze_table_and_persist, load_table_statistics,

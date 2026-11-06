@@ -633,6 +633,7 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 - [x] Re-export the analyze/persist/load statistics workflow and snapshot types from the AQL crate public API.
 - [x] Automatically invalidate and discard stale/corrupt analysis caches after writes, schema changes or Weave promotion; expose explicit re-analysis via analyze_table_and_persist.
 - [x] Add transparent weighted physical plan cost estimates for scanned rows, estimated projected payload, filter evaluations and output cells, with explicit assumptions and unknown-value propagation.
+- [x] Expose configurable milli-unit cost weights via PlannerOptions and report the exact weights used by each EXPLAIN result.
 - [ ] Persist additional analysis metadata in the catalog and calibrate cost weights against representative runtime profiles.
 - [x] Integrate time/Capsule pruning and exact-row reporting behind verified Chronicle sequence/row coverage, legacy-ANF exclusion, map-generation and materialisation-limit gates.
 - [x] Add optimizer-disabled reference execution and compare simple optimized query results.

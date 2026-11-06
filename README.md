@@ -158,3 +158,6 @@ The AQL crate re-exports `analyze_table`, `analyze_table_and_persist` and `load_
 
 
 The vectorized `EXPLAIN` plan includes a transparent relative cost breakdown (scan rows, estimated projected payload, filter evaluations, projected cells and total cost units). The units are documented heuristics, not measured latency.
+
+
+Planner cost weights are configurable through `PlannerOptions::cost_weights`. The default relative weights are surfaced in EXPLAIN output and can be tuned against measured vectorized execution profiles; they are not treated as wall-clock predictions.
