@@ -626,9 +626,10 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 - [x] Bind analysis statistics to table/schema identity and immutable scan-inventory fingerprint; reject stale statistics after writes/Weave changes.
 - [x] Add initial heuristic cardinality and projected-byte estimates with explicit provenance.
 - [x] Refine equality, NULL and numeric range selectivity using analyzed NDV, null fraction and min/max statistics.
-- [x] Add versioned, checksummed statistics snapshot encode/decode and caller-managed save/load.
+- [x] Add versioned, checksummed statistics snapshot encode/decode, atomic save/load, and a database-managed cache path.
 - [x] Build bounded deterministic sample histograms (256-value sample, up to 16 buckets) and use them for numeric/timestamp range selectivity.
-- [ ] Persist statistics automatically in the database catalog and implement a broader cost-based physical planner.
+- [x] Add explicit analyze-and-persist and load-if-fresh APIs for the database-managed statistics cache.
+- [ ] Automatically refresh analysis after writes / persist analysis metadata in the catalog and implement a broader cost-based physical planner.
 - [x] Integrate time/Capsule pruning and exact-row reporting behind verified Chronicle sequence/row coverage, legacy-ANF exclusion, map-generation and materialisation-limit gates.
 - [x] Add optimizer-disabled reference execution and compare simple optimized query results.
 - [x] Test aliases/repeated projections, NULL predicates, computed-expression fallback and safe LIMIT decisions.
@@ -925,7 +926,7 @@ A task is done only when all applicable items are true:
 
 1. Complete M5.4 CI validation for native AQL execution, EXPLAIN and table analysis.
 2. Compare physical estimates against runtime rows/bytes on representative tables.
-3. Persist table/column statistics and use them for better selectivity estimates.
+3. Add explicit cache refresh policies and improve cost-based decisions using persisted histogram statistics.
 4. Prove Capsule coverage semantics before integrating Navigation Map pruning with full table scans.
 5. Expand optimizer-on/off equivalence tests; keep unsupported expressions on the reference evaluator until lowered.
 

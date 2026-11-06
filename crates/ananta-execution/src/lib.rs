@@ -2,7 +2,10 @@ pub mod aggregation;
 pub mod statistics;
 pub mod time_series;
 pub use aggregation::{AggregateFunction, AggregateSpec, GroupByOperator};
-pub use statistics::{analyze_table, ColumnStatistics, HistogramBucket, StatisticsFormatError, TableStatistics};
+pub use statistics::{
+    analyze_table, analyze_table_and_persist, load_table_statistics, ColumnStatistics,
+    HistogramBucket, StatisticsFormatError, TableStatistics,
+};
 pub use time_series::{
     LatestPerSeriesOperator, TimeBucketOperator, TimestampBound, TimestampRangeOperator,
 };
@@ -366,6 +369,7 @@ fn checked_add(left: usize, right: usize) -> Result<usize, ExecutionError> {
 pub enum ExecutionError {
     Storage(DbError),
     AggregateOverflow(String),
+    StatisticsFormat(String),
     InvalidSchema(String),
     InvalidBatch(String),
     InvalidPlan(String),
@@ -384,6 +388,7 @@ impl fmt::Display for ExecutionError {
         match self {
             Self::Storage(error) => write!(f, "storage error: {error}"),
             Self::AggregateOverflow(function) => write!(f, "{function} aggregate result exceeds the supported output range"),
+            Self::StatisticsFormat(message) => write!(f, "statistics snapshot error: {message}"),
             Self::InvalidSchema(message) => write!(f, "invalid execution schema: {message}"),
             Self::InvalidBatch(message) => write!(f, "invalid vector batch: {message}"),
             Self::InvalidPlan(message) => write!(f, "invalid execution plan: {message}"),
@@ -414,6 +419,12 @@ impl std::error::Error for ExecutionError {
 impl From<DbError> for ExecutionError {
     fn from(value: DbError) -> Self {
         Self::Storage(value)
+    }
+}
+
+impl From<crate::statistics::StatisticsFormatError> for ExecutionError {
+    fn from(value: crate::statistics::StatisticsFormatError) -> Self {
+        Self::StatisticsFormat(value.to_string())
     }
 }
 

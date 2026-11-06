@@ -1,9 +1,10 @@
 use crate::{estimate_batch_bytes, ExecutionError};
 use ananta_core::Database;
 use ananta_types::{Column, DataType, Value};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::cmp::Ordering;
 use std::collections::{hash_map::DefaultHasher, BTreeMap};
 use std::hash::{Hash, Hasher};
@@ -271,6 +272,57 @@ fn build_histogram(sample: &[Value]) -> Result<Vec<HistogramBucket>, ExecutionEr
     Ok(buckets)
 }
 
+/// Analyze a table and atomically store the checksummed snapshot at its
+/// database-managed catalog/statistics path.
+pub fn analyze_table_and_persist(
+    database: &Database,
+    table: &str,
+    batch_rows: usize,
+) -> Result<TableStatistics, ExecutionError> {
+    let statistics = analyze_table(database, table, batch_rows)?;
+    let path = database.statistics_cache_path(table)?;
+    statistics.save_to(path)
+        .map_err(|error| ExecutionError::StatisticsFormat(error.to_string()))?;
+    Ok(statistics)
+}
+
+/// Load a cached snapshot only when table identity, schema and scan inventory
+/// still match. Missing or stale caches return None and can be regenerated.
+pub fn load_table_statistics(
+    database: &Database,
+    table: &str,
+) -> Result<Option<TableStatistics>, ExecutionError> {
+    let path = database.statistics_cache_path(table)?;
+    let statistics = match TableStatistics::load_from(&path) {
+        Ok(statistics) => statistics,
+        Err(StatisticsFormatError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(ExecutionError::StatisticsFormat(error.to_string()));
+        }
+    };
+
+    let schema = database.schema(table)?;
+    let table_id = database.table_id(table)?.0;
+    let schema_revision = database.table_schema_revision(table)?;
+    let snapshot_token = database.table_scan_snapshot_token(table)?;
+    let matches_schema = statistics.columns.len() == schema.len()
+        && statistics.columns.iter().zip(schema.columns())
+            .all(|(statistics, column)| statistics.column == *column);
+    if statistics.table_name != table
+        || statistics.table_id != table_id
+        || statistics.schema_revision != schema_revision
+        || statistics.snapshot_token != snapshot_token
+        || !matches_schema
+    {
+        return Ok(None);
+    }
+    Ok(Some(statistics))
+}
+
 /// Collect exact row/null/min/max counts and approximate distinct counts using
 /// the database's bounded storage scan. This is an explicit analysis scan and
 /// can read the full table; it is not automatically run for every query.
@@ -393,6 +445,42 @@ mod tests {
         ));
 
         std::fs::remove_file(cache_path).unwrap();
+        drop(database);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn database_managed_statistics_cache_is_atomic_and_invalidated_after_write() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("ananta-statistics-cache-{nonce}"));
+        let mut database = Database::open(&root).unwrap();
+        database.create_table(
+            "readings",
+            Schema::new(vec![
+                Column::new("device", DataType::Utf8, false),
+                Column::new("value", DataType::Int64, true),
+            ]).unwrap(),
+        ).unwrap();
+        database.insert_batch("readings", &[
+            vec![Value::Utf8("a".into()), Value::Int64(10)],
+            vec![Value::Utf8("b".into()), Value::Int64(20)],
+        ]).unwrap();
+
+        let first = analyze_table_and_persist(&database, "readings", 1).unwrap();
+        let cache_path = database.statistics_cache_path("readings").unwrap();
+        assert!(cache_path.is_file());
+        assert_eq!(load_table_statistics(&database, "readings").unwrap(), Some(first));
+
+        // Replacing an existing cache publishes a complete new snapshot.
+        let second = analyze_table_and_persist(&database, "readings", 2).unwrap();
+        assert_eq!(second.scanned_rows, 2);
+        assert_eq!(load_table_statistics(&database, "readings").unwrap(), Some(second));
+
+        database.insert_batch("readings", &[
+            vec![Value::Utf8("c".into()), Value::Int64(30)],
+        ]).unwrap();
+        assert!(load_table_statistics(&database, "readings").unwrap().is_none());
+
         drop(database);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -630,12 +718,49 @@ impl TableStatistics {
 
     /// Persist the cache at a caller-selected path. Statistics are disposable:
     /// a partial/corrupt file is rejected by load_from and can be regenerated.
+    /// Atomically publish a disposable analysis snapshot at a caller-selected path.
+    /// The temporary file is created in the destination directory so rename stays
+    /// on one filesystem; file and parent directory are synced before returning.
     pub fn save_to(&self, path: impl AsRef<Path>) -> Result<(), StatisticsFormatError> {
+        static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+        let path = path.as_ref();
         let bytes = self.encode()?;
-        let mut file = File::create(path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        Ok(())
+        let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let file_name = path.file_name()
+            .ok_or(StatisticsFormatError::Corrupt("statistics path has no file name"))?
+            .to_string_lossy();
+        let temp_path: PathBuf;
+        let mut file = loop {
+            let id = NEXT_TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed);
+            let candidate = parent.join(format!(
+                ".{file_name}.{}.{}.tmp",
+                std::process::id(),
+                id,
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+                Ok(file) => {
+                    temp_path = candidate;
+                    break file;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(StatisticsFormatError::Io(error)),
+            }
+        };
+
+        let publish_result = (|| -> Result<(), StatisticsFormatError> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp_path, path)?;
+            File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if publish_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        publish_result
     }
 
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self, StatisticsFormatError> {

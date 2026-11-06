@@ -475,6 +475,14 @@ impl Database {
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))
     }
 
+    /// Canonical path for the disposable, checksummed analysis cache of a table.
+    /// The cache is keyed by stable table identity and is never a source of row data.
+    pub fn statistics_cache_path(&self, table: &str) -> Result<PathBuf, DbError> {
+        let table_id = self.table_id(table)?;
+        Ok(self.root.join("catalog").join("statistics")
+            .join(format!("table-{:020}.ast", table_id.0)))
+    }
+
     /// Stable database-local identity for a column.
     pub fn column_id(&self, table: &str, column: &str) -> Result<ObjectId, DbError> {
         let definition = self.catalog.tables.get(table)

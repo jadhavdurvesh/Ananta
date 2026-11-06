@@ -1623,6 +1623,11 @@ fn from_execution_error(error: ExecutionError) -> AqlExecutionError {
             format!("{function} aggregate overflow"),
             crate::Span::default(),
         ),
+        ExecutionError::StatisticsFormat(message) => query_error(
+            AqlErrorCode::Storage,
+            format!("statistics cache error: {message}"),
+            crate::Span::default(),
+        ),
         other @ (ExecutionError::InvalidSchema(_)
         | ExecutionError::InvalidBatch(_)
         | ExecutionError::InvalidPlan(_)
