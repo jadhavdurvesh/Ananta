@@ -702,10 +702,12 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Add deterministic test-only interruption checkpoints after staging create/write/flush/file sync/directory sync, WAL BEGIN/MUTATION/COMMIT, final-name link, publication directory sync, staging-name removal and cleanup directory sync.
 - [x] Exercise the ANF insert and Chronicle ingest paths at every checkpoint; reopen twice, verify row/file counts, and verify Chronicle receipt reconstruction plus duplicate BatchId resolution.
 - [x] Add subprocess-termination tests at WAL MUTATION, durable COMMIT and final-name link for both ANF and Chronicle; reopen after process exit and reopen a second time to verify rows, receipts, and artifact counts.
-- [ ] Integrate catalog DDL, compaction manifests and active-Weave publication with explicit WAL intents.
+- [x] WAL-protect `create_table`, nullable-column addition, column rename and column reorder with ordered schema-snapshot + versioned-catalog multi-intent transactions; replay committed catalog mutations before later data writes.
+- [x] Add in-process and subprocess crash/reopen coverage for DDL after WAL COMMIT, schema publication, versioned catalog publication and canonical catalog replacement.
+- [ ] Integrate compaction manifests, active-Weave pointers, Capsule and Navigation Map publication with explicit WAL intents.
 - [ ] Add checkpoint installation, WAL rotation and retention only after replay coverage is proven.
 
-**Guarantee boundary:** Initial insert/ingest artifact publication uses WAL-backed redo. Catalog DDL, compaction/Weave/Capsule/Navigation Map publication and multi-operation transactions are not yet covered; do not claim general ACID semantics.
+**Guarantee boundary:** ANF insert, Chronicle ingest, table creation, nullable-column addition, column rename and column reorder use WAL-backed redo. Compaction/Weave/Capsule/Navigation Map publication and general multi-operation application transactions remain outside this boundary; do not claim general ACID semantics.
 
 Specification: docs/specifications/wal-recovery-v0.1.md.
 
