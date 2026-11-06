@@ -3366,7 +3366,7 @@ mod tests {
     }
 
     #[test]
-    fn nullable_column_catalog_publication_failure_keeps_old_schema_and_reports_orphan() {
+    fn nullable_column_catalog_temp_collision_fails_before_commit_without_orphan() {
         let path = temp_path();
         let mut db = Database::open(&path).unwrap();
         db.create_table("telemetry", sample_schema()).unwrap();
@@ -3382,8 +3382,9 @@ mod tests {
         assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
         assert_eq!(db.catalog_revision(), 1);
         assert_eq!(db.schema("telemetry").unwrap().len(), 3);
+        assert!(!next_snapshot.exists());
         let report = db.check_schema_snapshot_consistency().unwrap();
-        assert!(report.orphaned_files.contains(&next_snapshot));
+        assert!(report.is_clean());
 
         drop(db);
         fs::remove_file(catalog_temp).unwrap();
@@ -3391,13 +3392,12 @@ mod tests {
         assert_eq!(reopened.table_schema_revision("telemetry").unwrap(), 1);
         assert_eq!(reopened.catalog_revision(), 1);
         assert_eq!(reopened.schema("telemetry").unwrap().len(), 3);
-        assert!(reopened.check_schema_snapshot_consistency().unwrap()
-            .orphaned_files.contains(&next_snapshot));
+        assert!(reopened.check_schema_snapshot_consistency().unwrap().is_clean());
         fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
-    fn nullable_column_retry_reuses_identical_orphan_snapshot() {
+    fn nullable_column_retry_after_catalog_temp_collision() {
         let path = temp_path();
         let mut db = Database::open(&path).unwrap();
         db.create_table("telemetry", sample_schema()).unwrap();
