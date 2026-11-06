@@ -285,6 +285,8 @@ pub(crate) enum WalRecoveryCrashPoint {
     AfterCanonicalCatalogRenamedBeforeDirectorySync,
     AfterActiveWeavePointerVersionedPublished,
     AfterActiveWeaveCanonicalPublished,
+    AfterActivePointerTempSynced,
+    AfterActivePointerRenamedBeforeDirectorySync,
 }
 
 #[cfg(test)]
