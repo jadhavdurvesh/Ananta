@@ -291,6 +291,24 @@ mod tests {
         assert!(stats.columns[0].approximate_distinct_count <= 4);
         assert!(stats.estimated_batch_payload_bytes > 0);
         assert_eq!(stats.chronicle_accepted_rows, 0);
+
+        let encoded = stats.encode().unwrap();
+        let decoded = TableStatistics::decode(&encoded).unwrap();
+        assert_eq!(decoded, stats);
+
+        let cache_path = root.join("readings.ast");
+        stats.save_to(&cache_path).unwrap();
+        let loaded = TableStatistics::load_from(&cache_path).unwrap();
+        assert_eq!(loaded, stats);
+
+        let mut corrupt = encoded;
+        corrupt[14] ^= 0x01;
+        assert!(matches!(
+            TableStatistics::decode(&corrupt),
+            Err(StatisticsFormatError::Corrupt("checksum mismatch"))
+        ));
+
+        std::fs::remove_file(cache_path).unwrap();
         drop(database);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -626,7 +626,8 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 - [x] Bind analysis statistics to table/schema identity and immutable scan-inventory fingerprint; reject stale statistics after writes/Weave changes.
 - [x] Add initial heuristic cardinality and projected-byte estimates with explicit provenance.
 - [x] Refine equality, NULL and numeric range selectivity using analyzed NDV, null fraction and min/max statistics.
-- [ ] Persist statistics and use histograms for cost-based selectivity.
+- [x] Add versioned, checksummed statistics snapshot encode/decode and caller-managed save/load.
+- [ ] Persist statistics automatically in the database catalog and add histograms for cost-based selectivity.
 - [ ] Integrate time/Capsule pruning only with verified complete-coverage semantics.
 - [x] Add optimizer-disabled reference execution and compare simple optimized query results.
 - [x] Test aliases/repeated projections, NULL predicates, computed-expression fallback and safe LIMIT decisions.
