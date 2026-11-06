@@ -36,7 +36,7 @@ A stale lock must never be removed solely because the PID looks old or cannot be
 
 Read methods accepting shared references do not mutate the WAL writer or catalog. ScanBatchIter is pull-based; abandoning a scan by dropping the iterator stops further reads. There is no public long-running transaction or lock-wait API requiring transaction timeout semantics yet.
 
-The concurrent-reader unit test exercises multiple scans through one shared Database handle. Multi-process read tests, high-contention stress, and platform-specific filesystem/lock behavior remain additional validation requirements.
+The concurrent-reader unit test exercises multiple scans through one shared Database handle. A subprocess lock probe is repeated five times while the parent owns the database and verifies that every second process is denied. Multi-process read sharing is not supported by the exclusive-owner contract; platform-specific filesystem/lock behavior and high-contention single-writer stress remain additional validation requirements.
 
 ## 5. Durability guarantees
 
