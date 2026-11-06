@@ -1446,6 +1446,21 @@ impl Database {
         if stats.accepted_batches == 0 {
             return Ok(false);
         }
+
+        // Legacy ANF segments may coexist with Chronicle records. Capsule
+        // coverage is only complete for a pure Chronicle-backed logical table;
+        // never substitute a Capsule scan while standalone ANF rows remain.
+        let table_directory = self.root.join("data").join(table);
+        for entry in fs::read_dir(&table_directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            if entry.path().extension().and_then(|extension| extension.to_str()) == Some("anf") {
+                return Ok(false);
+            }
+        }
+
         let capsules = self.verified_capsule_metadata(table)?;
         if capsules.is_empty() {
             return Ok(false);
@@ -4246,6 +4261,36 @@ mod tests {
             db.build_capsule("telemetry", 44, 1, 1, 3, Some("device")),
             Err(DbError::CapsuleCorrupt("event-time column must have type TIMESTAMP_MICROS"))
         ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn capsule_coverage_requires_all_logical_rows_to_be_chronicle_backed() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let chronicle_rows = vec![vec![
+            Value::TimestampMicros(10),
+            Value::Utf8("chronicle".into()),
+            Value::Float64(1.0),
+        ]];
+        db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([71; 16]).unwrap(),
+            &chronicle_rows,
+        ).unwrap();
+        db.build_capsule("telemetry", 1, 1, 1, 1, Some("timestamp")).unwrap();
+        assert!(db.capsules_cover_chronicle("telemetry").unwrap());
+
+        let legacy_rows = vec![vec![
+            Value::TimestampMicros(20),
+            Value::Utf8("legacy-anf".into()),
+            Value::Float64(2.0),
+        ]];
+        db.insert_batch("telemetry", &legacy_rows).unwrap();
+        assert!(!db.capsules_cover_chronicle("telemetry").unwrap());
+        assert_eq!(db.scan("telemetry").unwrap(), [chronicle_rows[0].clone(), legacy_rows[0].clone()]);
+        drop(db);
         fs::remove_dir_all(path).unwrap();
     }
 
