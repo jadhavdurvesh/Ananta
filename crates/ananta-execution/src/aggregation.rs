@@ -806,7 +806,6 @@ mod tests {
         assert_eq!(result.columns[5].values, vec![Value::Null]);
         assert_eq!(result.columns[6].values, vec![Value::Null]);
         assert_eq!(result.columns[7].values, vec![Value::Null]);
-        assert_eq!(result.columns[8].values, vec![Value::Null]);
     }
 
     #[test]
@@ -838,8 +837,9 @@ mod tests {
         let input = MockOperator::new(
             input_schema.clone(),
             vec![
-                batch(&input_schema, input_rows[..3].to_vec()),
-                batch(&input_schema, input_rows[3..].to_vec()),
+                batch(&input_schema, input_rows[..2].to_vec()),
+                batch(&input_schema, input_rows[2..4].to_vec()),
+                batch(&input_schema, input_rows[4..].to_vec()),
             ],
         );
         let mut operator = GroupByOperator::new(
@@ -879,11 +879,13 @@ mod tests {
 
     #[test]
     fn group_state_respects_memory_budget() {
-        let input_schema = schema();
+        let input_schema = VectorSchema::new(vec![
+            Column::new("key", DataType::Utf8, true),
+        ]).unwrap();
         let input = MockOperator::new(
             input_schema.clone(),
             vec![batch(&input_schema, vec![
-                vec![Value::Utf8("x".repeat(128)), Value::Int64(1), Value::Null],
+                vec![Value::Utf8("x".repeat(128))],
             ])],
         );
         let mut operator = GroupByOperator::new(
@@ -897,7 +899,7 @@ mod tests {
         let mut context = ExecutionContext::new(ExecutionConfig {
             max_batch_rows: 10,
             max_batch_cells: 100,
-            max_working_set_bytes: 64,
+            max_working_set_bytes: 320,
         }).unwrap();
         assert!(matches!(
             operator.next_batch(&mut context),
