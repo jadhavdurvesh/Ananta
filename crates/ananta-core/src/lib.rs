@@ -481,11 +481,16 @@ impl Database {
                     Ok(directory)
                 }
                 WalArtifactKind::ActiveWeavePointer => {
-                    let Some((table_name, _)) = catalog.tables.iter()
+                    let Some((table_name, definition)) = catalog.tables.iter()
                         .find(|(_, definition)| definition.id.0 == intent.table_id)
                     else {
                         return Err(WalRecoveryError::MissingTableId(intent.table_id));
                     };
+                    if definition.schema_revision != intent.schema_revision {
+                        return Err(WalRecoveryError::FileConflict(
+                            "active pointer schema revision differs from the catalog",
+                        ));
+                    }
                     let weave_root = root.join("data").join(table_name).join("weaves");
                     if committed_active_pointer_ids.contains(&(intent.table_id, intent.file_id)) {
                         let versioned = publish_staged_wal_artifact(&weave_root, intent)?;
