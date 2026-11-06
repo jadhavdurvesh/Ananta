@@ -249,8 +249,6 @@ pub fn build_recovery_plan(report: &WalReadReport) -> Result<WalRecoveryPlan, Wa
     Ok(plan)
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-
 /// Deterministic interruption points used only by the recovery test suite.
 /// These checkpoints deliberately sit after durable/visible filesystem steps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +291,7 @@ pub(crate) fn maybe_crash_after(point: WalRecoveryCrashPoint) {
     let _ = point;
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalRecoverySummary {
     pub committed_artifacts_published_or_verified: u64,
     pub incomplete_artifacts_discarded: u64,
