@@ -1,9 +1,10 @@
-//! Typed mutation intents and recovery-plan construction for the ANWL log.
+//! Typed mutation intents, immutable artifact publication and recovery-plan
+//! construction for the ANWL log.
 //!
-//! This module does not publish files or mutate the database. It validates the
-//! WAL payload contract and classifies committed versus incomplete transactions
-//! so Database::open can apply the recovery protocol without reinterpreting
-//! opaque payload bytes at every call site.
+//! This module validates the WAL payload contract and provides generic staging,
+//! no-replace publication, cleanup and replay helpers. Database::open supplies
+//! database-specific directory routing and applies catalog/schema state in WAL
+//! order without reinterpreting opaque payload bytes at every call site.
 
 use crate::wal::{WalReadReport, WalRecordKind, WalWriter};
 use std::collections::{BTreeMap, BTreeSet};
