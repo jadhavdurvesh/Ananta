@@ -7,6 +7,8 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub mod schema_snapshot;
+pub mod backup;
+pub use backup::BackupReport;
 mod nullable_ddl;
 mod column_rename_reorder;
 mod segment_publication;
@@ -93,6 +95,7 @@ pub enum DbError {
     CompactionPreflight(&'static str),
     Wal(String),
     RecoveryRequired(String),
+    Backup(String),
 }
 
 impl fmt::Display for DbError {
@@ -128,6 +131,7 @@ impl fmt::Display for DbError {
             Self::CompactionPreflight(message) => write!(f, "compaction input preflight failed: {message}"),
             Self::Wal(message) => write!(f, "ANANTA WAL error: {message}"),
             Self::RecoveryRequired(message) => write!(f, "database handle requires recovery before use: {message}"),
+            Self::Backup(message) => write!(f, "ANANTA backup/restore error: {message}"),
         }
     }
 }
@@ -579,6 +583,37 @@ impl Database {
         database.recover_compaction_jobs()?;
         database.recover_active_weaves()?;
         Ok(database)
+    }
+
+    /// Create a point-in-time, checksummed backup of the database directory.
+    ///
+    /// The current handle owns the exclusive writer lock, and each acknowledged
+    /// mutation has a durable WAL commit. The backup excludes only the live lock
+    /// file; restore always creates a fresh destination and validates it by opening
+    /// the restored database through the normal recovery path.
+    pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<BackupReport, DbError> {
+        self.ensure_operational()?;
+        crate::backup::create_backup(&self.root, destination.as_ref())
+            .map_err(|error| DbError::Backup(error.to_string()))
+    }
+
+    /// Verify and restore an ANBK v1 backup into a new directory.
+    ///
+    /// A successful return means both the backup manifest and the restored
+    /// database's ordinary startup recovery checks have completed.
+    pub fn restore_backup(
+        backup_directory: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<BackupReport, DbError> {
+        crate::backup::verify_backup(backup_directory.as_ref())
+            .map_err(|error| DbError::Backup(error.to_string()))?;
+        let report = crate::backup::restore_backup(
+            backup_directory.as_ref(),
+            destination.as_ref(),
+        ).map_err(|error| DbError::Backup(error.to_string()))?;
+        let restored = Self::open(&report.directory)?;
+        drop(restored);
+        Ok(report)
     }
 
     fn ensure_operational(&self) -> Result<(), DbError> {
