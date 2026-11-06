@@ -1270,11 +1270,9 @@ impl Database {
                 let manifest_bytes = read_regular_file(&versioned_path)?;
                 let output = CompactionOutputManifest::decode(&manifest_bytes)
                     .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
-                if output.table_id != definition.id.0
-                    || output.target_schema_revision != definition.schema_revision
-                {
+                if output.table_id != definition.id.0 {
                     return Err(DbError::CompactionPreflight(
-                        "committed candidate manifest TableId/schema revision mismatch",
+                        "committed candidate manifest TableId mismatch",
                     ));
                 }
 
