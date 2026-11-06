@@ -5193,6 +5193,109 @@ mod tests {
     }
 
     #[test]
+    fn database_open_truncates_torn_commit_and_discards_uncommitted_stage() {
+        let path = temp_path();
+        let mut database = Database::open(&path).unwrap();
+        database.create_table("telemetry", sample_schema()).unwrap();
+        let definition = database.catalog.tables.get("telemetry").unwrap().clone();
+        let rows = vec![vec![
+            Value::TimestampMicros(6_000),
+            Value::Utf8("torn-commit-device".into()),
+            Value::Float64(26.5),
+        ]];
+        let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let bytes = encode_segment_v2(
+            &definition.schema,
+            &rows,
+            definition.id.0,
+            definition.schema_revision,
+            &column_ids,
+        ).unwrap();
+        let table_dir = path.join("data").join("telemetry");
+        let file_id = next_segment_id(&table_dir).unwrap();
+        let intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::AnfSegment,
+            table_id: definition.id.0,
+            schema_revision: definition.schema_revision,
+            file_id,
+            file_len: bytes.len() as u64,
+            sha256: chronicle::sha256(&bytes),
+        };
+        let staging = stage_wal_artifact(&table_dir, &intent, &bytes).unwrap();
+        let transaction_id = database.wal.next_sequence();
+        database.wal.begin_transaction(transaction_id, b"fault-injected torn COMMIT").unwrap();
+        database.wal.append_mutation(transaction_id, &intent.encode().unwrap()).unwrap();
+        database.wal.sync().unwrap();
+        drop(database);
+
+        // Simulate a power loss part-way through the next COMMIT frame: a
+        // complete length prefix followed by only a small fraction of its body.
+        let wal_path = path.join("wal").join("database.anwl");
+        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        let commit_body_len = 8_u32 + 8_u32 + 1_u32 + 8_u32 + 32_u32 + 32_u32;
+        file.write_all(&commit_body_len.to_le_bytes()).unwrap();
+        file.write_all(&[0xA5; 12]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let reopened = Database::open(&path).unwrap();
+        assert!(reopened.scan("telemetry").unwrap().is_empty());
+        assert!(!staging.exists());
+        assert!(!table_dir.join(intent.artifact_kind.final_file_name(file_id)).exists());
+        let report = read_wal(&wal_path).unwrap();
+        assert!(report.is_clean());
+        assert!(!report.truncated_tail);
+        assert_eq!(report.records.last().unwrap().kind, WalRecordKind::Abort);
+
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn database_open_fails_closed_on_conflicting_committed_final_artifact() {
+        let path = temp_path();
+        let mut database = Database::open(&path).unwrap();
+        database.create_table("telemetry", sample_schema()).unwrap();
+        let definition = database.catalog.tables.get("telemetry").unwrap().clone();
+        let rows = vec![vec![
+            Value::TimestampMicros(7_000),
+            Value::Utf8("conflict-device".into()),
+            Value::Float64(27.5),
+        ]];
+        let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let bytes = encode_segment_v2(
+            &definition.schema,
+            &rows,
+            definition.id.0,
+            definition.schema_revision,
+            &column_ids,
+        ).unwrap();
+        let table_dir = path.join("data").join("telemetry");
+        let file_id = next_segment_id(&table_dir).unwrap();
+        let intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::AnfSegment,
+            table_id: definition.id.0,
+            schema_revision: definition.schema_revision,
+            file_id,
+            file_len: bytes.len() as u64,
+            sha256: chronicle::sha256(&bytes),
+        };
+        let staging = stage_wal_artifact(&table_dir, &intent, &bytes).unwrap();
+        database.commit_wal_intent(&intent, b"fault-injected conflicting final").unwrap();
+        drop(database);
+
+        let final_path = table_dir.join(intent.artifact_kind.final_file_name(file_id));
+        let conflicting_bytes = b"not the committed artifact";
+        fs::write(&final_path, conflicting_bytes).unwrap();
+        let result = Database::open(&path);
+        assert!(matches!(result, Err(DbError::Wal(_))));
+        assert_eq!(fs::read(&final_path).unwrap(), conflicting_bytes);
+        assert!(staging.is_file());
+
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn database_open_discards_incomplete_staged_intent_and_appends_abort() {
         let path = temp_path();
         let mut database = Database::open(&path).unwrap();

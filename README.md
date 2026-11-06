@@ -195,3 +195,6 @@ The M6.2 write path also synchronises the WAL parent directory after header crea
 
 
 The WAL-backed insert/ingest path preserves legacy error classifications: pre-commit staging conflicts remain I/O errors with no ingestion sequence consumed, and committed Chronicle checksum failures remain Chronicle corruption errors during startup recovery.
+
+
+Database-level recovery tests also cover torn COMMIT truncation and preservation of a conflicting final artifact; the engine fails closed rather than overwriting mismatched bytes.

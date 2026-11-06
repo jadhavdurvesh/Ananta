@@ -695,6 +695,8 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Fault-inject the stop after durable ANF COMMIT and before final publication; verify startup replay.
 - [x] Fault-inject the stop after Chronicle COMMIT and before final publication; verify receipt rebuild and idempotent duplicate BatchId retry.
 - [x] Test incomplete intent cleanup and durable ABORT on startup.
+- [x] Test torn COMMIT frame truncation followed by incomplete-intent cleanup.
+- [x] Test Database::open fails closed and preserves a conflicting final artifact.
 - [x] Preserve `DbError::Io` for pre-commit staging conflicts and `DbError::ChronicleCorrupt` for checksum failures in committed Chronicle records.
 - [ ] Inject process interruption at every publication/fsync boundary and verify replay idempotence across repeated crashes.
 - [ ] Integrate catalog DDL, compaction manifests and active-Weave publication with explicit WAL intents.

@@ -163,3 +163,10 @@ The current Database integration also synchronises the WAL directory after heade
 Failures before the WAL COMMIT (for example, a canonical staging filename already owned by another operation) remain ordinary I/O errors. They do not consume the Chronicle ingestion sequence or advance the receipt index; Chronicle publication-failure diagnostics are incremented.
 
 A committed Chronicle file that fails the WAL intent SHA-256/length validation is reported as `DbError::ChronicleCorrupt`, preserving the existing Chronicle integrity error contract even though recovery detects the mismatch before the receipt-index scan. ANF committed-artifact conflicts remain WAL recovery errors and fail open.
+
+
+## Additional Database-level crash tests
+
+The Database test suite now simulates a torn COMMIT frame by appending a valid frame-length prefix and only a partial body after a durable BEGIN/MUTATION. Database::open truncates the WAL tail to the last verified record, classifies the transaction as incomplete, removes its staged ANF file, appends ABORT, and opens with no row visible.
+
+A second test simulates a committed intent whose final ANF filename is occupied by different bytes while the matching staging file remains. Database::open fails closed, does not replace or delete the conflicting final file, and does not claim the committed row is available.
