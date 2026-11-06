@@ -96,6 +96,7 @@ pub fn execute(
     batch_rows: usize,
     cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<AqlResultIter, AqlExecutionError> {
+    crate::validate_ast(query).map_err(from_parse_error)?;
     bindings.validate_for(query).map_err(from_parse_error)?;
     let Statement::Select(select) = &query.statement;
     let source = resolve_table_name(database, &select.source)?;
@@ -203,7 +204,7 @@ impl Iterator for AqlResultIter {
                 }
             };
             let capacity = self.remaining_limit
-                .map_or(input.row_count, |limit| input.row_count.min(limit as usize));
+                .map_or(input.row_count, |limit| input.row_count.min(usize::try_from(limit).unwrap_or(usize::MAX)));
             let mut output_columns = vec![Vec::with_capacity(capacity); self.projection.len()];
             for row_index in 0..input.row_count {
                 if self.is_cancelled() {
@@ -681,7 +682,7 @@ mod tests {
 
     #[test]
     fn projection_filter_limit_matches_direct_rust_rows_and_emits_bounded_batches() {
-        let (db, root, rows) = fixture();
+        let (db, root, _) = fixture();
         let query = crate::parse(
             "SELECT device, reading FROM telemetry WHERE reading >= :minimum LIMIT 2"
         ).unwrap();
@@ -695,7 +696,8 @@ mod tests {
         assert!(output.iter().all(|batch| batch.row_count <= 1));
         let actual = output.iter().flat_map(|batch| (0..batch.row_count).map(|row| batch.row(row).unwrap()))
             .collect::<Vec<_>>();
-        let expected = rows.iter().filter(|row| matches!(&row[2], Value::Float64(v) if *v >= 25.0))
+        let reference_rows = db.scan("telemetry").unwrap();
+        let expected = reference_rows.iter().filter(|row| matches!(&row[2], Value::Float64(v) if *v >= 25.0))
             .take(2).map(|row| vec![row[1].clone(), row[2].clone()]).collect::<Vec<_>>();
         assert_eq!(actual, expected);
         assert_eq!(output[0].schema[0].name, "device");
