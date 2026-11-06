@@ -234,7 +234,7 @@ impl Database {
         read_pointer(&self.root.join("data").join(table).join("weaves"), definition.id.0)
     }
 
-    pub(crate) fn install_recovered_pointer(
+    pub(super) fn install_recovered_pointer(
         root: &Path,
         pointer: &ActiveWeavePointer,
     ) -> Result<(), DbError> {
@@ -284,7 +284,7 @@ impl Database {
         }
     }
 
-    pub(crate) fn cleanup_orphan_active_pointer_staging(
+    pub(super) fn cleanup_orphan_active_pointer_staging(
         root: &Path,
         catalog: &std::collections::BTreeMap<String, TableDefinition>,
     ) -> Result<(), DbError> {
