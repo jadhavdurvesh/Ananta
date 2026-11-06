@@ -163,7 +163,10 @@ pub fn explain(
         }
     }
     let statistics=TableStatistics{
-        row_count:if stats.accepted_batches==0{None}else{Some(stats.accepted_rows)},
+        // Chronicle counters omit legacy ANF segments. Only advertise an exact
+        // logical table cardinality when verified Capsule coverage proves every
+        // accepted Chronicle sequence and there are no standalone ANF segments.
+        row_count:if capsule_coverage_complete{Some(stats.accepted_rows)}else{None},
         ingestion_batches:if stats.accepted_batches==0{None}else{Some(stats.accepted_batches)},
         encoded_bytes:if stats.accepted_batches==0{None}else{Some(stats.accepted_encoded_bytes)},
         capsule_coverage_complete,
@@ -352,6 +355,38 @@ mod tests{
         assert!(plan.render().contains("projection_pushdown=true"));
         drop(db);fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn explain_does_not_treat_chronicle_ingestion_rows_as_full_table_rows_with_legacy_anf() {
+        let n=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root=std::env::temp_dir().join(format!("ananta-plan-mixed-storage-{n}"));
+        let mut db=Database::open(&root).unwrap();
+        db.create_table("telemetry",Schema::new(vec![
+            Column::new("time",DataType::TimestampMicros,false),
+            Column::new("device",DataType::Utf8,false),
+            Column::new("value",DataType::Float64,true),
+        ]).unwrap()).unwrap();
+        db.ingest_batch(
+            "telemetry",
+            ananta_core::BatchId::from_bytes([91;16]).unwrap(),
+            &[vec![Value::TimestampMicros(10),Value::Utf8("chronicle".into()),Value::Float64(1.0)]],
+        ).unwrap();
+        db.build_capsule("telemetry",1,1,1,1,Some("time")).unwrap();
+        assert!(db.capsules_cover_chronicle("telemetry").unwrap());
+        db.insert_batch(
+            "telemetry",
+            &[vec![Value::TimestampMicros(20),Value::Utf8("legacy".into()),Value::Float64(2.0)]],
+        ).unwrap();
+
+        let query=crate::parse("SELECT device FROM telemetry").unwrap();
+        let plan=explain(&db,&query,&ParameterBindings::default(),PlannerOptions::default()).unwrap();
+        assert!(!plan.table_statistics.capsule_coverage_complete);
+        assert_eq!(plan.table_statistics.row_count,None);
+        // Chronicle counters remain useful as ingestion-only diagnostics.
+        assert_eq!(plan.table_statistics.ingestion_batches,Some(1));
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn explain_keeps_unknown_statistics_unknown(){
         let root=std::env::temp_dir().join("ananta-empty-plan");
