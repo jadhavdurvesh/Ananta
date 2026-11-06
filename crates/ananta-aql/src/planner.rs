@@ -10,6 +10,7 @@ pub struct PlannerOptions {
     pub enable_predicate_pushdown: bool,
     pub navigation_map_generation: Option<u64>,
     pub max_capsule_materialized_rows: u64,
+    pub max_capsule_materialized_bytes: usize,
 }
 impl Default for PlannerOptions {
     fn default()->Self{
@@ -170,6 +171,7 @@ pub fn explain(
     let timestamp_range=select.selection.as_ref().and_then(|expr|extract_timestamp_range(expr,schema,&table,bindings).ok().flatten());
     let capsule_map_generation=if let (Some(generation),Some(_range))=(options.navigation_map_generation,&timestamp_range){
         if stats.accepted_rows<=options.max_capsule_materialized_rows
+            && stats.accepted_encoded_bytes<=options.max_capsule_materialized_bytes as u64
             && database.capsules_cover_chronicle(&table).unwrap_or(false){
             Some(generation)
         }else{None}
