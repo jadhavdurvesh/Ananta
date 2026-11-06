@@ -425,6 +425,14 @@ pub struct ConsistencyReport {
     pub inventory: StorageInventory,
 }
 
+/// Read-only inspection of a database's exclusive writer lock file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseLockStatus {
+    pub lock_path: PathBuf,
+    pub is_locked: bool,
+    pub owner_process_id: Option<u32>,
+}
+
 /// An embedded, single-writer ANANTA database handle. No external database is required.
 pub struct Database {
     root: PathBuf,
@@ -611,6 +619,32 @@ impl Database {
         database.recover_compaction_jobs()?;
         database.recover_active_weaves()?;
         Ok(database)
+    }
+
+    /// Inspect the lock marker without changing or removing it.
+    ///
+    /// A PID is informational only: callers must verify process ownership using
+    /// operating-system tools before treating an existing lock as stale.
+    pub fn inspect_lock(database_directory: impl AsRef<Path>) -> Result<DatabaseLockStatus, DbError> {
+        let lock_path = database_directory.as_ref().join(".ananta.lock");
+        match fs::read_to_string(&lock_path) {
+            Ok(contents) => {
+                let owner_process_id = contents.lines()
+                    .find_map(|line| line.strip_prefix("pid="))
+                    .and_then(|value| value.parse::<u32>().ok());
+                Ok(DatabaseLockStatus {
+                    lock_path,
+                    is_locked: true,
+                    owner_process_id,
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DatabaseLockStatus {
+                lock_path,
+                is_locked: false,
+                owner_process_id: None,
+            }),
+            Err(error) => Err(DbError::Io(error)),
+        }
     }
 
     /// Inventory persisted files and surface leftover temporary names without deleting them.
