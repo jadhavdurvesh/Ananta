@@ -79,11 +79,11 @@ where I:IntoIterator<Item=Result<VectorBatch,ExecutionError>>{
     let mut schema=input_schema.to_vec();
     schema.push(Column::new("_aql_bucket_start",DataType::TimestampMicros,false));
     let bucket_index=input_schema.len();
-    let mut transformed=Vec::new();
-    for batch in batches{
+    let transformed=batches.into_iter().map(|batch_result|{
         context.check_cancelled()?;
-        let batch=batch?;
-        let time=&batch.columns[timestamp_column];
+        let batch=batch_result?;
+        let time=batch.columns.get(timestamp_column)
+            .ok_or(ExecutionError::InvalidExpression("timestamp vector missing from batch"))?;
         let mut buckets=Vec::with_capacity(batch.row_count);
         for value in time.values.iter(){
             match value{
@@ -95,11 +95,11 @@ where I:IntoIterator<Item=Result<VectorBatch,ExecutionError>>{
         }
         let mut columns=batch.columns.clone();
         columns.push(Vector::new(schema[bucket_index].clone(),buckets)?);
-        transformed.push(Ok(VectorBatch::try_new(columns,batch.row_count)?));
-    }
+        VectorBatch::try_new(columns,batch.row_count)
+    });
     let mut groups=group_columns.to_vec();
     groups.push(bucket_index);
-    aggregate_batches(transformed.into_iter(),&schema,&groups,aggregates,context)
+    aggregate_batches(transformed,&schema,&groups,aggregates,context)
 }
 
 #[derive(Debug,Clone)]
@@ -163,7 +163,11 @@ where I:IntoIterator<Item=Result<VectorBatch,ExecutionError>>{
                 _=>return Err(ExecutionError::InvalidExpression("invalid event timestamp value")),
             };
             let values=batch.columns.iter().map(|column|column.values[row].clone()).collect::<Vec<_>>();
-            let key=SeriesKey(series_columns.iter().map(|index|values[*index].clone()).collect());
+            let key_values=series_columns.iter().map(|index|values[*index].clone()).collect::<Vec<_>>();
+            if key_values.iter().any(|value|matches!(value,Value::Float64(number) if !number.is_finite())){
+                return Err(ExecutionError::InvalidExpression("non-finite FLOAT64 series keys are not supported"));
+            }
+            let key=SeriesKey(key_values);
             let replace=latest.get(&key).map_or(true,|(old_timestamp,_,_)|timestamp>=*old_timestamp);
             if replace{
                 if !latest.contains_key(&key){
