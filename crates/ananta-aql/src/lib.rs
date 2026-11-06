@@ -27,7 +27,7 @@ pub use timeseries::{
 };
 pub use planner::{
     explain, extract_timestamp_range, ExplainPlan, PhysicalPlanNode, PlannerOptions,
-    TableStatistics,
+    ColumnStatistics, TableStatistics,
 };
 
 pub const AQL_VERSION: &str = "0.1";
