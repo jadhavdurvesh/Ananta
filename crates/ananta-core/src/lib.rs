@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 pub mod schema_snapshot;
 pub mod backup;
 pub use backup::BackupReport;
+pub mod wal_checkpoint;
+pub use wal_checkpoint::CheckpointReport;
 mod nullable_ddl;
 mod column_rename_reorder;
 mod segment_publication;
@@ -465,6 +467,7 @@ impl Database {
         // synchronised by WalWriter::open; syncing wal_dir persists that name.
         let wal_dir = root.join("wal");
         fs::create_dir_all(&wal_dir)?;
+        cleanup_stale_checkpoint_temp(&wal_dir)?;
         sync_recovery_directory(&root)?;
         sync_recovery_directory(&wal_dir)?;
         let wal_path = wal_dir.join("database.anwl");
@@ -473,6 +476,7 @@ impl Database {
         sync_recovery_directory(&wal_dir)?;
         let wal_report = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
+        validate_checkpoint_records(&root, &wal_report)?;
         let committed_catalog_revisions = build_recovery_plan(&wal_report)
             .map_err(|error| DbError::Wal(error.to_string()))?
             .committed
@@ -667,6 +671,7 @@ impl Database {
         let wal_path = self.root.join("wal").join("database.anwl");
         let wal_report = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
+        validate_checkpoint_records(&self.root, &wal_report)?;
         let recovery_plan = build_recovery_plan(&wal_report)
             .map_err(|error| DbError::Wal(error.to_string()))?;
         if !wal_report.is_clean() || !recovery_plan.incomplete.is_empty() {
@@ -751,6 +756,49 @@ impl Database {
                 Err(error) => return Err(DbError::Io(error)),
             }
             report.tables_checked = report.tables_checked.checked_add(1).ok_or(DbError::LengthOverflow)?;
+        }
+        Ok(report)
+    }
+
+    /// Install a durable checkpoint and atomically rotate the active ANWL log.
+    ///
+    /// The checkpoint manifest is synced first and fingerprints the immutable
+    /// storage/schema artifacts that form the database state at this boundary.
+    /// The replacement WAL contains a single sequence-1 CHECKPOINT frame that
+    /// references the manifest; subsequent transactions are replayed after it.
+    /// Full replay is retained for every transaction written after the marker.
+    pub fn create_checkpoint(&mut self) -> Result<CheckpointReport, DbError> {
+        self.ensure_operational()?;
+        let consistency = self.check_consistency(1024)?;
+        if !consistency.inventory.temporary_files.is_empty() {
+            return Err(DbError::Wal(
+                "checkpoint refused while staging/temp artifacts remain".into(),
+            ));
+        }
+        let wal_path = self.root.join("wal").join("database.anwl");
+        let current = read_wal(&wal_path)
+            .map_err(|error| DbError::Wal(error.to_string()))?;
+        if !current.is_clean() || !self.wal.incomplete_transaction_ids().is_empty() {
+            return Err(DbError::Wal("checkpoint requires a clean WAL with no open transactions".into()));
+        }
+        let (reference, report) = crate::wal_checkpoint::create_checkpoint(
+            &self.root,
+            current.last_sequence,
+            self.catalog.revision,
+        ).map_err(|error| DbError::Wal(format!("checkpoint snapshot failed: {error}")))?;
+        self.wal.replace_with_checkpoint(&reference.encode())
+            .map_err(|error| {
+                self.recovery_required = true;
+                DbError::RecoveryRequired(format!("checkpoint WAL replacement was uncertain: {error}"))
+            })?;
+        let rotated = read_wal(&wal_path)
+            .map_err(|error| DbError::Wal(error.to_string()))?;
+        validate_checkpoint_records(&self.root, &rotated)?;
+        if rotated.records.len() != 1 || rotated.last_sequence != 1 || !rotated.is_clean() {
+            self.recovery_required = true;
+            return Err(DbError::RecoveryRequired(
+                "rotated WAL did not reopen as a clean checkpoint anchor".into(),
+            ));
         }
         Ok(report)
     }
@@ -2707,6 +2755,42 @@ fn validate_catalog(catalog: &Catalog) -> Result<(), DbError> {
     if catalog.next_object_id <= max_id {
         return Err(DbError::CorruptCatalog("next object ID is not greater than allocated IDs"));
     }
+    Ok(())
+}
+
+fn cleanup_stale_checkpoint_temp(wal_directory: &Path) -> Result<(), DbError> {
+    let path = wal_directory.join(".database.anwl.checkpoint.tmp");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::remove_file(&path)?;
+            sync_recovery_directory(wal_directory)?;
+        }
+        Ok(_) => return Err(DbError::Wal(
+            "WAL checkpoint temporary path is not a regular file".into(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DbError::Io(error)),
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_records(root: &Path, report: &WalReadReport) -> Result<(), DbError> {
+    let checkpoints = report.records.iter()
+        .filter(|record| record.kind == WalRecordKind::Checkpoint)
+        .collect::<Vec<_>>();
+    if checkpoints.is_empty() {
+        return Ok(());
+    }
+    if checkpoints.len() != 1 || report.records.first().is_none_or(|record| {
+        record.sequence != 1 || record.kind != WalRecordKind::Checkpoint
+    }) || checkpoints[0].transaction_id != 0
+    {
+        return Err(DbError::Wal(
+            "checkpoint must be the unique first frame in a rotated WAL".into(),
+        ));
+    }
+    crate::wal_checkpoint::validate_checkpoint(root, &checkpoints[0].payload)
+        .map_err(|error| DbError::Wal(format!("checkpoint validation failed: {error}")))?;
     Ok(())
 }
 
