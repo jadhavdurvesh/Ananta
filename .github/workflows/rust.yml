@@ -30,6 +30,10 @@ jobs:
         run: |
           set -euo pipefail
           cargo run -p ananta-aql --example telemetry_query
+      - name: Run native analytics example
+        run: |
+          set -euo pipefail
+          cargo run -p ananta-aql --example analytics_demo
       - name: Run native storage example
         run: |
           rm -rf ananta-data
