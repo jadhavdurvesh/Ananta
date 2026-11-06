@@ -397,7 +397,7 @@ fn evaluate(
             .and_then(|column| column.values.get(row_index)).cloned()
             .ok_or_else(|| query_error(AqlErrorCode::Storage, "scan batch did not contain a referenced column", expression.span)),
         CompiledExprKind::Literal(literal) => Ok(literal_value(literal)),
-        CompiledExprKind::Parameter(parameter) => binding_value(parameter, bindings, expression.span).cloned(),
+        CompiledExprKind::Parameter(parameter) => Ok(binding_value(parameter, bindings, expression.span)?.clone()),
         CompiledExprKind::Unary { operator, expression: inner } => {
             let value = evaluate(inner, batch, row_index, bindings)?;
             match operator {
