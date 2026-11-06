@@ -5174,8 +5174,8 @@ mod tests {
         assert_recovered_artifact_inventory(&table_dir, extension, committed);
         if operation == "chronicle" {
             let stats = recovered.ingestion_stats("telemetry").unwrap();
-            assert_eq!(stats.accepted_batches, u64::from(committed));
-            assert_eq!(stats.accepted_rows, u64::from(committed));
+            assert_eq!(stats.accepted_batches, if committed { 1 } else { 0 });
+            assert_eq!(stats.accepted_rows, if committed { 1 } else { 0 });
             if committed {
                 let duplicate = recovered.ingest_batch(
                     "telemetry",
