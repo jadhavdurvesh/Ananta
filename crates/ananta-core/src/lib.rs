@@ -6315,9 +6315,19 @@ mod tests {
             "AfterCheckpointTempSynced" => AfterCheckpointTempSynced,
             "AfterCheckpointRenamedBeforeDirectorySync" => AfterCheckpointRenamedBeforeDirectorySync,
             "AfterCheckpointDirectorySync" => AfterCheckpointDirectorySync,
+            "AfterBackupFileSynced" => AfterBackupFileSynced,
+            "AfterBackupManifestSynced" => AfterBackupManifestSynced,
+            "AfterBackupDirectoryRenamedBeforeSync" => AfterBackupDirectoryRenamedBeforeSync,
             _ => panic!("unsupported subprocess crash point: {point_name}"),
         };
         let path = PathBuf::from(std::env::var_os("ANANTA_WAL_CRASH_DATABASE").unwrap());
+        if operation == "lock-probe" {
+            match Database::open(&path) {
+                Err(DbError::DatabaseLocked(_)) => return,
+                Err(error) => panic!("unexpected lock probe error: {error}"),
+                Ok(_) => panic!("a second process unexpectedly acquired the exclusive writer lock"),
+            }
+        }
         // Open and replay pre-existing transactions before arming the hook:
         // the checkpoint must target the operation under test, not startup.
         let mut database = Database::open(path).unwrap();
@@ -6349,6 +6359,10 @@ mod tests {
             }
             "checkpoint" => {
                 database.create_checkpoint().unwrap();
+            }
+            "backup" => {
+                let destination = PathBuf::from(std::env::var_os("ANANTA_WAL_CRASH_BACKUP").unwrap());
+                database.backup_to(destination).unwrap();
             }
             _ => panic!("unsupported subprocess operation: {operation}"),
         }
@@ -6597,6 +6611,97 @@ mod tests {
         reopened.check_consistency(1).unwrap();
         drop(reopened);
         fs::remove_dir_all(path).unwrap();
+    }
+
+    fn exercise_backup_process_crash(point: &str, published: bool) {
+        use std::process::Command;
+
+        let root = temp_path();
+        let backup = temp_path();
+        let rows = vec![vec![
+            Value::TimestampMicros(3_000),
+            Value::Utf8("backup-crash-source".into()),
+            Value::Float64(18.0),
+        ]];
+        let mut setup = Database::open(&root).unwrap();
+        setup.create_table("telemetry", sample_schema()).unwrap();
+        setup.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([0xB4; 16]).unwrap(),
+            &rows,
+        ).unwrap();
+        drop(setup);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::wal_recovery_process_crash_worker")
+            .arg("--nocapture")
+            .env("ANANTA_WAL_CRASH_OPERATION", "backup")
+            .env("ANANTA_WAL_CRASH_POINT", point)
+            .env("ANANTA_WAL_CRASH_DATABASE", &root)
+            .env("ANANTA_WAL_CRASH_BACKUP", &backup)
+            .env("ANANTA_WAL_CRASH_EXIT", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86), "backup worker did not terminate at {point}");
+        fs::remove_file(root.join(".ananta.lock")).unwrap();
+
+        assert_eq!(backup.is_dir(), published, "backup publication state at {point}");
+        if published {
+            crate::backup::verify_backup(&backup).unwrap();
+            let restored = temp_path();
+            let report = Database::restore_backup(&backup, &restored).unwrap();
+            assert!(report.file_count >= 4);
+            let restored_db = Database::open(&restored).unwrap();
+            assert_eq!(restored_db.scan("telemetry").unwrap(), rows);
+            drop(restored_db);
+            fs::remove_dir_all(restored).unwrap();
+        } else {
+            let parent = backup.parent().unwrap_or(Path::new("."));
+            let prefix = format!(".{}.backup-", backup.file_name().unwrap().to_string_lossy());
+            for entry in fs::read_dir(parent).unwrap().filter_map(Result::ok) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&prefix) {
+                    fs::remove_dir_all(entry.path()).unwrap();
+                }
+            }
+        }
+        let source = Database::open(&root).unwrap();
+        assert_eq!(source.scan("telemetry").unwrap(), rows);
+        source.check_consistency(1).unwrap();
+        drop(source);
+        if published {
+            fs::remove_dir_all(&backup).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backup_publication_survives_process_crashes() {
+        exercise_backup_process_crash("AfterBackupFileSynced", false);
+        exercise_backup_process_crash("AfterBackupManifestSynced", false);
+        exercise_backup_process_crash("AfterBackupDirectoryRenamedBeforeSync", true);
+    }
+
+    #[test]
+    fn second_process_cannot_acquire_database_writer_lock() {
+        use std::process::Command;
+
+        let root = temp_path();
+        let database = Database::open(&root).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::wal_recovery_process_crash_worker")
+            .arg("--nocapture")
+            .env("ANANTA_WAL_CRASH_OPERATION", "lock-probe")
+            .env("ANANTA_WAL_CRASH_DATABASE", &root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "second process did not observe DatabaseLocked");
+        assert!(Database::inspect_lock(&root).unwrap().is_locked);
+        drop(database);
+        assert!(!Database::inspect_lock(&root).unwrap().is_locked);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
