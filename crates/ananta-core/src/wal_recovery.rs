@@ -742,6 +742,18 @@ mod tests {
         assert_eq!(original.artifact_kind.final_file_name(91), "segment-00000000000000000091.anf");
         assert_eq!(original.artifact_kind.staging_file_name(91), ".segment-00000000000000000091.tmp");
 
+        let candidate = WalMutationIntent {
+            artifact_kind: WalArtifactKind::CompactionOutputManifest,
+            table_id: 4,
+            schema_revision: 2,
+            file_id: 92,
+            file_len: 164,
+            sha256: [92; 32],
+        };
+        assert_eq!(candidate.artifact_kind.final_file_name(92), "candidate-00000000000000000092.owm");
+        assert_eq!(candidate.artifact_kind.staging_file_name(92), ".candidate-00000000000000000092.tmp");
+        assert_eq!(WalMutationIntent::decode(&candidate.encode().unwrap()).unwrap(), candidate);
+
         let mut corrupt = bytes;
         corrupt[6] = 0xff;
         assert_eq!(
