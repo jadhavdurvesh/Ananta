@@ -3074,6 +3074,39 @@ mod tests {
         ]).unwrap()
     }
 
+    #[test]
+    fn database_backup_restores_into_a_new_directory_and_replays_wal() {
+        let root = temp_path();
+        let backup = temp_path();
+        let restored = temp_path();
+        let rows = vec![
+            vec![Value::TimestampMicros(10), Value::Utf8("backup-a".into()), Value::Float64(1.5)],
+            vec![Value::TimestampMicros(20), Value::Utf8("backup-b".into()), Value::Float64(2.5)],
+        ];
+        {
+            let mut db = Database::open(&root).unwrap();
+            db.create_table("telemetry", sample_schema()).unwrap();
+            db.ingest_batch(
+                "telemetry",
+                BatchId::from_bytes([201; 16]).unwrap(),
+                &rows,
+            ).unwrap();
+            let report = db.backup_to(&backup).unwrap();
+            assert!(report.file_count >= 4);
+            assert!(backup.join("backup.anbk").is_file());
+        }
+
+        let restored_report = Database::restore_backup(&backup, &restored).unwrap();
+        assert_eq!(restored_report.file_count >= 4, true);
+        let db = Database::open(&restored).unwrap();
+        assert_eq!(db.scan("telemetry").unwrap(), rows);
+        drop(db);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(backup).unwrap();
+        fs::remove_dir_all(restored).unwrap();
+    }
+
     fn legacy_v1_catalog(tables: &[(&str, &Schema)]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(CATALOG_MAGIC);
