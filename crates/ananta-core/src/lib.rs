@@ -786,11 +786,15 @@ impl Database {
             current.last_sequence,
             self.catalog.revision,
         ).map_err(|error| DbError::Wal(format!("checkpoint snapshot failed: {error}")))?;
-        self.wal.replace_with_checkpoint(&reference.encode())
-            .map_err(|error| {
-                self.recovery_required = true;
-                DbError::RecoveryRequired(format!("checkpoint WAL replacement was uncertain: {error}"))
-            })?;
+        if let Err(error) = self.wal.replace_with_checkpoint(&reference.encode()) {
+            if matches!(&error, WalError::Io(io_error) if io_error.kind() == std::io::ErrorKind::Unsupported) {
+                return Err(DbError::Wal(error.to_string()));
+            }
+            self.recovery_required = true;
+            return Err(DbError::RecoveryRequired(format!(
+                "checkpoint WAL replacement was uncertain: {error}",
+            )));
+        }
         let rotated = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
         validate_checkpoint_records(&self.root, &rotated, &self.catalog)?;
