@@ -5088,6 +5088,123 @@ mod tests {
     }
 
 
+    #[test]
+    fn wal_recovery_process_crash_worker() {
+        let Some(operation) = std::env::var_os("ANANTA_WAL_CRASH_OPERATION") else {
+            return;
+        };
+        let operation = operation.to_string_lossy();
+        let point_name = std::env::var("ANANTA_WAL_CRASH_POINT").unwrap();
+        use crate::wal_recovery::WalRecoveryCrashPoint::*;
+        let point = match point_name.as_str() {
+            "AfterWalMutation" => AfterWalMutation,
+            "AfterWalCommit" => AfterWalCommit,
+            "AfterFinalNameLinked" => AfterFinalNameLinked,
+            _ => panic!("unsupported subprocess crash point: {point_name}"),
+        };
+        let path = PathBuf::from(std::env::var_os("ANANTA_WAL_CRASH_DATABASE").unwrap());
+        crate::wal_recovery::arm_wal_recovery_crash_point(point);
+        let mut database = Database::open(path).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(9_000),
+            Value::Utf8(format!("subprocess-{operation}-{point_name}")),
+            Value::Float64(29.5),
+        ]];
+        match operation.as_str() {
+            "anf" => {
+                database.insert_batch("telemetry", &rows).unwrap();
+            }
+            "chronicle" => {
+                database.ingest_batch(
+                    "telemetry",
+                    BatchId::from_bytes([0xD4; 16]).unwrap(),
+                    &rows,
+                ).unwrap();
+            }
+            _ => panic!("unsupported subprocess operation: {operation}"),
+        }
+        panic!("subprocess crash checkpoint was not reached");
+    }
+
+    fn exercise_wal_recovery_subprocess_crash(
+        operation: &str,
+        point: &str,
+        committed: bool,
+    ) {
+        use std::process::Command;
+
+        let path = temp_path();
+        let mut setup = Database::open(&path).unwrap();
+        setup.create_table("telemetry", sample_schema()).unwrap();
+        drop(setup);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::wal_recovery_process_crash_worker")
+            .arg("--nocapture")
+            .env("ANANTA_WAL_CRASH_OPERATION", operation)
+            .env("ANANTA_WAL_CRASH_POINT", point)
+            .env("ANANTA_WAL_CRASH_DATABASE", &path)
+            .env("ANANTA_WAL_CRASH_EXIT", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86), "worker did not terminate at {operation}/{point}");
+
+        // The child has exited, so no process can own this test database.
+        // Its lock file is intentionally stale because process::exit skipped Drop.
+        fs::remove_file(path.join(".ananta.lock")).unwrap();
+
+        let table_dir = path.join("data").join("telemetry");
+        let rows = if committed {
+            vec![vec![
+                Value::TimestampMicros(9_000),
+                Value::Utf8(format!("subprocess-{operation}-{point}")),
+                Value::Float64(29.5),
+            ]]
+        } else {
+            Vec::new()
+        };
+        let mut recovered = Database::open(&path).unwrap();
+        assert_eq!(
+            recovered.scan("telemetry").unwrap(),
+            rows,
+            "wrong recovered rows after {operation}/{point}",
+        );
+        let extension = if operation == "anf" { "anf" } else { "chr" };
+        assert_recovered_artifact_inventory(&table_dir, extension, committed);
+        if operation == "chronicle" {
+            let stats = recovered.ingestion_stats("telemetry").unwrap();
+            assert_eq!(stats.accepted_batches, u64::from(committed));
+            assert_eq!(stats.accepted_rows, u64::from(committed));
+            if committed {
+                let duplicate = recovered.ingest_batch(
+                    "telemetry",
+                    BatchId::from_bytes([0xD4; 16]).unwrap(),
+                    &rows,
+                ).unwrap();
+                assert_eq!(duplicate.outcome, IngestOutcome::Duplicate);
+                assert_eq!(duplicate.ingestion_sequence, 1);
+            }
+        }
+        drop(recovered);
+
+        // A second process-level reopen must preserve the same state.
+        let recovered_again = Database::open(&path).unwrap();
+        assert_eq!(recovered_again.scan("telemetry").unwrap(), rows);
+        assert_recovered_artifact_inventory(&table_dir, extension, committed);
+        drop(recovered_again);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn database_recovery_survives_subprocess_termination_around_wal_commit_and_publication() {
+        for operation in ["anf", "chronicle"] {
+            exercise_wal_recovery_subprocess_crash(operation, "AfterWalMutation", false);
+            exercise_wal_recovery_subprocess_crash(operation, "AfterWalCommit", true);
+            exercise_wal_recovery_subprocess_crash(operation, "AfterFinalNameLinked", true);
+        }
+    }
+
     fn assert_recovered_artifact_inventory(
         table_dir: &Path,
         extension: &str,
