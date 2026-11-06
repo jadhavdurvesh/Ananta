@@ -1033,7 +1033,7 @@ mod tests {
                 }));
                 assert!(interrupted.is_err());
                 drop(db);
-                let mut db = Database::open(&root).unwrap();
+                db = Database::open(&root).unwrap();
                 let pointer = db.active_weave_pointer("telemetry").unwrap().unwrap();
                 assert_eq!(pointer.active.weave_id, 100);
                 assert!(root.join("data").join("telemetry").join("weaves")
@@ -1062,9 +1062,18 @@ mod tests {
                 assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
             }
             if offset == 1 {
-                let pointer = db.promote_compaction_candidate(
-                    "telemetry", &input, 101, 1,
-                ).unwrap();
+                // Crash immediately after the durable WAL COMMIT, before the
+                // versioned and canonical pointer names are both published.
+                crate::wal_recovery::arm_wal_recovery_crash_point(
+                    crate::wal_recovery::WalRecoveryCrashPoint::AfterWalCommit,
+                );
+                let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    db.promote_compaction_candidate("telemetry", &input, 101, 1)
+                }));
+                assert!(interrupted.is_err());
+                drop(db);
+                db = Database::open(&root).unwrap();
+                let pointer = db.active_weave_pointer("telemetry").unwrap().unwrap();
                 assert_eq!(pointer.active.weave_id, 101);
                 assert_eq!(db.scan("telemetry").unwrap()[0][0], Value::TimestampMicros(100));
                 let rolled_back = db.rollback_active_weave("telemetry").unwrap();
