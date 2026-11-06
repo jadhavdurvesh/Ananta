@@ -43,7 +43,7 @@ The separate Rust `ananta-execution` crate provides M5 pull-based operators over
 
 ## Master execution roadmap
 
-The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M6.2 — WAL-backed recovery for ANF/Chronicle, catalog DDL, Weave/compaction metadata, Capsules and Navigation Maps; remaining crash validation and checkpoint/retention work is still open.** M1, M2, M3, M4 and M5 are complete. M3 delivered bounded ChronoWeave candidate execution, three layout strategies, provenance verification, active-generation promotion/rollback, crash recovery and reproducible benchmark evidence.
+The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M6 — single-node durability and operational integrity. ANWL redo covers ANF/Chronicle, catalog DDL, Weave/compaction metadata, Capsules and Navigation Maps. The embedded API now includes a bounded consistency checker, storage inventory, writer-lock inspection and ANBK v1 full backup/restore; complete crash/platform validation and checkpoint/rotation remain open.** M1, M2, M3, M4 and M5 are complete. M3 delivered bounded ChronoWeave candidate execution, three layout strategies, provenance verification, active-generation promotion/rollback, crash recovery and reproducible benchmark evidence.
 
 ## Native design documents
 
@@ -66,6 +66,9 @@ The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source
 - [Compaction Manifest and Job Contract v0.1](docs/specifications/compaction-manifest-v0.1.md)
 - [ADR 0010: immutable compaction inputs and candidate outputs](docs/decisions/0010-compaction-input-snapshots-and-candidate-outputs.md)
 - [Segment publication and recovery contract](docs/specifications/segment-publication-recovery-v0.1.md)
+- [WAL recovery and durability protocol](docs/specifications/wal-recovery-v0.1.md)
+- [Transaction and concurrency scope](docs/specifications/transaction-concurrency-m6-v0.1.md)
+- [ANBK v1 backup and restore format](docs/specifications/backup-format-anbk-v0.1.md)
 - [ADR 0006: atomic segment publication and exclusive local writer](docs/decisions/0006-atomic-segment-publication-and-writer-lock.md)
 - [Nullable-column DDL specification](docs/specifications/nullable-column-ddl-v0.1.md)
 - [Column rename and reorder specification](docs/specifications/column-rename-reorder-v0.1.md)
