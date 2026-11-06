@@ -90,23 +90,40 @@ pub(crate) fn create_checkpoint(
     let checkpoint_directory = root.join("wal").join("checkpoints");
     fs::create_dir_all(&checkpoint_directory)?;
     let path = checkpoint_directory.join(reference.manifest_filename());
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => {
-            file.write_all(&manifest)?;
-            file.flush()?;
-            file.sync_all()?;
+    if path.exists() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file()
+            || metadata.len() != reference.manifest_len
+            || crate::chronicle::sha256_file(&path)? != reference.manifest_sha256
+            || fs::read(&path)? != manifest
+        {
+            return Err(invalid("existing checkpoint manifest conflicts with the current snapshot"));
         }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(&path)?;
-            if !metadata.file_type().is_file()
-                || metadata.len() != reference.manifest_len
-                || crate::chronicle::sha256_file(&path)? != reference.manifest_sha256
-                || fs::read(&path)? != manifest
-            {
-                return Err(invalid("existing checkpoint manifest conflicts with the current snapshot"));
-            }
+    } else {
+        let temporary = checkpoint_directory.join(format!(
+            ".checkpoint-{:020}.tmp", base_sequence,
+        ));
+        match fs::symlink_metadata(&temporary) {
+            Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(&temporary)?,
+            Ok(_) => return Err(invalid("checkpoint temporary path is not a regular file")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        file.write_all(&manifest)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointManifestTempSynced,
+        );
+        fs::hard_link(&temporary, &path)?;
+        sync_directory(&checkpoint_directory)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointManifestPublished,
+        );
+        fs::remove_file(&temporary)?;
+        sync_directory(&checkpoint_directory)?;
     }
     sync_directory(&checkpoint_directory)?;
     sync_directory(&checkpoint_directory.parent().ok_or_else(|| invalid("checkpoint directory has no parent"))?)?;
