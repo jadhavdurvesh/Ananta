@@ -300,6 +300,14 @@ pub fn load_table_statistics(
         {
             return Ok(None);
         }
+        Err(StatisticsFormatError::Corrupt(_))
+        | Err(StatisticsFormatError::LimitExceeded(_)) => {
+            // A statistics snapshot is a disposable cache. Remove malformed
+            // or unsupported cache files and let the caller fall back to an
+            // unestimated plan until ANALYZE is run again.
+            let _ = fs::remove_file(&path);
+            return Ok(None);
+        }
         Err(error) => {
             return Err(ExecutionError::StatisticsFormat(error.to_string()));
         }
@@ -318,6 +326,9 @@ pub fn load_table_statistics(
         || statistics.snapshot_token != snapshot_token
         || !matches_schema
     {
+        // New immutable segments, schema changes or Weave promotion make the
+        // saved analysis unsuitable for planning. Delete the disposable cache.
+        let _ = fs::remove_file(&path);
         return Ok(None);
     }
     Ok(Some(statistics))

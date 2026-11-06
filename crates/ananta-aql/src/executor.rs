@@ -1942,6 +1942,33 @@ mod tests {
     }
 
     #[test]
+    fn explain_discards_persisted_statistics_after_table_changes() {
+        let (mut db, root, _) = fixture();
+        let query = crate::parse(
+            "SELECT device FROM telemetry WHERE reading >= 25.0"
+        ).unwrap();
+        ananta_execution::analyze_table_and_persist(&db, "telemetry", 2).unwrap();
+        let cached = explain(&db, &query, &ParameterBindings::default(), true).unwrap();
+        assert_eq!(cached.estimated_rows_after_filter, Some(2));
+
+        db.insert_batch("telemetry", &[vec![
+            Value::TimestampMicros(900),
+            Value::Utf8("e".into()),
+            Value::Float64(35.0),
+            Value::Boolean(true),
+        ]]).unwrap();
+
+        let after_write = explain(&db, &query, &ParameterBindings::default(), true).unwrap();
+        assert_eq!(after_write.estimated_rows_after_filter, None);
+        assert_eq!(after_write.estimated_output_rows, None);
+        let cache_path = db.statistics_cache_path("telemetry").unwrap();
+        assert!(!cache_path.exists(), "stale statistics cache should be discarded");
+
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn optimizer_matches_reference_for_nested_boolean_and_null_predicates() {
         let (db, root, _) = fixture();
         let query = crate::parse(
