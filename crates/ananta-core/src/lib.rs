@@ -760,7 +760,12 @@ impl Database {
     /// the restored database through the normal recovery path.
     pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<BackupReport, DbError> {
         self.ensure_operational()?;
-        self.check_consistency(1024)?;
+        let consistency = self.check_consistency(1024)?;
+        if !consistency.inventory.temporary_files.is_empty() {
+            return Err(DbError::Backup(
+                "backup refused while staging/temp artifacts remain; inspect storage_inventory first".into(),
+            ));
+        }
         crate::backup::create_backup(&self.root, destination.as_ref())
             .map_err(|error| DbError::Backup(error.to_string()))
     }
@@ -2722,6 +2727,16 @@ fn collect_storage_inventory(
             )));
         }
         if file_type.is_dir() {
+            if name.to_str().is_some_and(|value| {
+                value.starts_with(".stage-") || value.starts_with(".candidate-") || value.ends_with(".tmp")
+            }) {
+                let relative = path.strip_prefix(root)
+                    .map_err(|_| DbError::Wal("temporary directory escaped database root".into()))?
+                    .to_str()
+                    .ok_or_else(|| DbError::Wal("temporary directory path is not UTF-8".into()))?
+                    .replace('\\', "/");
+                inventory.temporary_files.push(relative);
+            }
             collect_storage_inventory(root, &path, inventory)?;
             continue;
         }
