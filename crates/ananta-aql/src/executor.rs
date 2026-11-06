@@ -6,7 +6,7 @@ use ananta_core::{Database, DbError, ScanBatchIter};
 use ananta_execution::{
     ComparisonOperator as NativeComparison, ExecutionContext, ExecutionError, ExecutionOperator,
     FilterOperator, FilterPredicate, LimitOperator, Operand, ProjectionField, ProjectionOperator,
-    ScanOperator,
+    ScanOperator, TableStatistics,
 };
 use ananta_types::{Column, DataType, Schema, Value};
 use std::cmp::Ordering;
@@ -113,9 +113,9 @@ pub struct AqlPhysicalPlan {
     pub storage_limit_pushed: bool,
     pub chronicle_accepted_rows: u64,
     pub chronicle_accepted_encoded_bytes: u64,
-    pub estimated_rows_after_filter: u64,
-    pub estimated_output_rows: u64,
-    pub estimated_projected_encoded_bytes: u64,
+    pub estimated_rows_after_filter: Option<u64>,
+    pub estimated_output_rows: Option<u64>,
+    pub estimated_projected_payload_bytes: Option<u64>,
     pub notes: Vec<String>,
 }
 
@@ -157,14 +157,17 @@ impl AqlPhysicalPlan {
         lines.push(format!(
             "  Estimated rows after filter: {}",
             self.estimated_rows_after_filter
+                .map_or_else(|| "unknown (no table row-count stats)".to_owned(), |rows| rows.to_string())
         ));
         lines.push(format!(
             "  Estimated output rows: {}",
             self.estimated_output_rows
+                .map_or_else(|| "unknown (no table row-count stats)".to_owned(), |rows| rows.to_string())
         ));
         lines.push(format!(
-            "  Estimated projected encoded bytes: {}",
-            self.estimated_projected_encoded_bytes
+            "  Estimated projected payload bytes: {}",
+            self.estimated_projected_payload_bytes
+                .map_or_else(|| "unknown (run analyze_table first)".to_owned(), |bytes| bytes.to_string())
         ));
         for note in &self.notes {
             lines.push(format!("  Note: {note}"));
@@ -333,6 +336,18 @@ pub fn explain(
     bindings: &ParameterBindings,
     optimizer_enabled: bool,
 ) -> Result<AqlPhysicalPlan, AqlExecutionError> {
+    explain_with_statistics(database, query, bindings, optimizer_enabled, None)
+}
+
+/// Explain using optional table statistics collected explicitly by
+/// ananta_execution::analyze_table. Statistics are never scanned implicitly.
+pub fn explain_with_statistics(
+    database: &Database,
+    query: &Query,
+    bindings: &ParameterBindings,
+    optimizer_enabled: bool,
+    table_statistics: Option<&TableStatistics>,
+) -> Result<AqlPhysicalPlan, AqlExecutionError> {
     crate::validate_ast(query).map_err(from_parse_error)?;
     bindings.validate_for(query).map_err(from_parse_error)?;
     let Statement::Select(select) = &query.statement;
@@ -365,35 +380,52 @@ pub fn explain(
     } else {
         schema.columns().iter().map(|column| column.name.clone()).collect::<Vec<_>>()
     };
-    let stats = database.ingestion_stats(&table).map_err(from_storage_error)?;
-    let table_rows = stats.accepted_rows;
+    let ingestion = database.ingestion_stats(&table).map_err(from_storage_error)?;
+    let table_statistics = match table_statistics {
+        Some(statistics) if statistics.table_name == table => Some(statistics),
+        Some(_) => {
+            return Err(query_error(
+                AqlErrorCode::InvalidQuery,
+                "EXPLAIN statistics belong to a different table",
+                select.source.span,
+            ));
+        }
+        None => None,
+    };
     let selectivity = predicate.as_ref()
         .map(estimate_compiled_selectivity)
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
-    let estimated_rows_after_filter = (table_rows as f64 * selectivity)
-        .round()
-        .min(u64::MAX as f64) as u64;
-    let estimated_output_rows = select.limit
-        .map_or(estimated_rows_after_filter, |limit| estimated_rows_after_filter.min(limit));
+    let estimated_rows_after_filter = table_statistics.map(|statistics| {
+        (statistics.scanned_rows as f64 * selectivity)
+            .round()
+            .min(u64::MAX as f64) as u64
+    });
+    let estimated_output_rows = estimated_rows_after_filter.map(|rows| {
+        select.limit.map_or(rows, |limit| rows.min(limit))
+    });
     let projected_fraction = if native_execution && !schema.columns().is_empty() {
         scan_columns.len() as f64 / schema.columns().len() as f64
     } else {
         1.0
     };
-    let estimated_projected_encoded_bytes =
-        (stats.accepted_encoded_bytes as f64 * projected_fraction)
+    let estimated_projected_payload_bytes = table_statistics.map(|statistics| {
+        (statistics.estimated_batch_payload_bytes as f64 * projected_fraction)
             .round()
-            .min(u64::MAX as f64) as u64;
+            .min(u64::MAX as f64) as u64
+    });
 
     let predicate_pushed = native_execution && predicate.is_some();
     let storage_limit_pushed =
         native_execution && predicate.is_none() && select.limit.is_some();
     let mut notes = vec![
         "row cardinality uses a fixed selectivity heuristic, not collected column histograms".to_owned(),
-        "projected bytes assume uniform encoded column widths; actual I/O can differ".to_owned(),
+        "projected payload bytes assume uniform per-column batch payload; actual bytes can differ".to_owned(),
         "Chronicle row/byte values are accepted-ingestion counters, not an execution profile".to_owned(),
     ];
+    if table_statistics.is_none() {
+        notes.push("row-count and payload estimates are unknown until explicit table analysis is supplied".to_owned());
+    }
     if !native_execution {
         notes.push(
             "query uses the reference evaluator because a projection or predicate is not yet lowerable".to_owned(),
@@ -405,11 +437,11 @@ pub fn explain(
         scan_columns,
         predicate_pushed,
         storage_limit_pushed,
-        chronicle_accepted_rows: stats.accepted_rows,
-        chronicle_accepted_encoded_bytes: stats.accepted_encoded_bytes,
+        chronicle_accepted_rows: ingestion.accepted_rows,
+        chronicle_accepted_encoded_bytes: ingestion.accepted_encoded_bytes,
         estimated_rows_after_filter,
         estimated_output_rows,
-        estimated_projected_encoded_bytes,
+        estimated_projected_payload_bytes,
         notes,
     })
 }
@@ -1483,10 +1515,23 @@ mod tests {
         assert!(plan.predicate_pushed);
         assert!(!plan.storage_limit_pushed);
         assert_eq!(plan.scan_columns, vec!["device", "reading"]);
-        assert_eq!(plan.chronicle_accepted_rows, 4);
-        assert!(plan.estimated_rows_after_filter <= 4);
-        assert!(plan.estimated_output_rows <= 2);
-        assert!(plan.explain().contains("native vector predicate"));
+        assert_eq!(plan.chronicle_accepted_rows, 0);
+        assert_eq!(plan.estimated_rows_after_filter, None);
+        assert_eq!(plan.estimated_output_rows, None);
+        assert!(plan.explain().contains("unknown (no table row-count stats)"));
+
+        let table_stats = ananta_execution::analyze_table(&db, "telemetry", 2).unwrap();
+        let analyzed_plan = explain_with_statistics(
+            &db,
+            &query,
+            &ParameterBindings::default(),
+            true,
+            Some(&table_stats),
+        ).unwrap();
+        assert_eq!(analyzed_plan.estimated_rows_after_filter, Some(1));
+        assert_eq!(analyzed_plan.estimated_output_rows, Some(1));
+        assert!(analyzed_plan.estimated_projected_payload_bytes.unwrap() > 0);
+        assert!(analyzed_plan.explain().contains("native vector predicate"));
 
         let no_filter = crate::parse("SELECT device FROM telemetry LIMIT 2").unwrap();
         let limit_plan = explain(
@@ -1505,6 +1550,43 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_matches_reference_for_nested_boolean_and_null_predicates() {
+        let (db, root, _) = fixture();
+        let query = crate::parse(
+            "SELECT device FROM telemetry WHERE (reading >= 25.0 AND active IS NOT NULL) OR device = 'a'"
+        ).unwrap();
+
+        let mut optimized = execute(&db, &query, &ParameterBindings::default(), 2, None).unwrap();
+        assert!(optimized.used_native_execution());
+        let optimized_rows = optimized
+            .by_ref()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .flat_map(|batch| (0..batch.row_count).map(|row| batch.row(row).unwrap()))
+            .collect::<Vec<_>>();
+
+        let mut reference = execute_with_options(
+            &db,
+            &query,
+            &ParameterBindings::default(),
+            2,
+            None,
+            false,
+        ).unwrap();
+        let reference_rows = reference
+            .by_ref()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .flat_map(|batch| (0..batch.row_count).map(|row| batch.row(row).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(optimized_rows, reference_rows);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn native_projection_preserves_aliases_and_repeated_columns() {
         let (db, root, _) = fixture();
         let query = crate::parse(
@@ -1513,14 +1595,15 @@ mod tests {
         let mut iterator = execute(&db, &query, &ParameterBindings::default(), 2, None).unwrap();
         assert!(iterator.used_native_execution());
         let output = iterator.collect::<Result<Vec<_>, _>>().unwrap();
-        assert_eq!(output.len(), 1);
-        assert_eq!(output[0].schema[0].name, "primary_device");
-        assert_eq!(output[0].schema[1].name, "duplicate_device");
-        assert_eq!(output[0].columns[0], output[0].columns[1]);
-        assert_eq!(
-            output[0].columns[0],
-            vec![Value::Utf8("b".into()), Value::Utf8("d".into())]
-        );
+        assert_eq!(output.len(), 2);
+        assert!(output.iter().all(|batch| {
+            batch.schema[0].name == "primary_device"
+                && batch.schema[1].name == "duplicate_device"
+        }));
+        let first = output.iter().flat_map(|batch| batch.columns[0].iter().cloned()).collect::<Vec<_>>();
+        let second = output.iter().flat_map(|batch| batch.columns[1].iter().cloned()).collect::<Vec<_>>();
+        assert_eq!(first, second);
+        assert_eq!(first, vec![Value::Utf8("b".into()), Value::Utf8("d".into())]);
         drop(db);
         fs::remove_dir_all(root).unwrap();
     }

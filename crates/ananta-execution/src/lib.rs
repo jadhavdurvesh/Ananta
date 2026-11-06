@@ -10,7 +10,6 @@ pub use time_series::{
 use ananta_core::{BatchColumn, Database, DbError, RecordBatch, ScanBatchIter};
 use ananta_types::{Column, DataType, Schema, Value};
 use std::cmp::Ordering;
-use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{
     atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -962,6 +961,7 @@ impl ExecutionOperator for LimitOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use ananta_types::{Column, DataType, Value};
 
     struct MockOperator {

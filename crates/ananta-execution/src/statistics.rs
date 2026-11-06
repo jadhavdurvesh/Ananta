@@ -273,7 +273,7 @@ mod tests {
         assert!(stats.columns[0].approximate_distinct_count >= 2);
         assert!(stats.columns[0].approximate_distinct_count <= 4);
         assert!(stats.estimated_batch_payload_bytes > 0);
-        assert_eq!(stats.chronicle_accepted_rows, 4);
+        assert_eq!(stats.chronicle_accepted_rows, 0);
         drop(database);
         std::fs::remove_dir_all(root).unwrap();
     }

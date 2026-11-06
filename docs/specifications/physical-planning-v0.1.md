@@ -1,4 +1,4 @@
-# Physical Planning, Explain and Statistics Contract v0.1
+# Physical Planning, Explain and Statistics Contract v0.2
 
 **Status:** M5.4 implementation baseline  
 **Crates:** ananta-aql, ananta-execution
@@ -11,7 +11,7 @@ Storage Scan -> optional Vector Filter -> Projection -> optional Limit
 
 The scan requests only the columns needed by the projection and supported predicate. The filter is evaluated before projection so predicate-only columns need not appear in the output. Projection preserves caller order, aliases and repeated output columns.
 
-AQL expressions are compiled once against the catalog schema. Native lowering is intentionally conservative:
+Native lowering is intentionally conservative:
 - Direct column projection items are supported.
 - WHERE supports typed comparisons, AND, OR, NOT, IS NULL / IS NOT NULL, boolean columns and boolean constants/parameters.
 - Unsupported predicates or computed projection expressions use the existing AQL reference evaluator.
@@ -21,16 +21,11 @@ The optimizer can be disabled explicitly through execute_with_options; this pres
 
 ## 2. Physical explain
 
-explain(database, query, bindings, optimizer_enabled) returns an AqlPhysicalPlan containing:
-- Resolved table and scan column list.
-- Whether native execution is selected.
-- Whether the predicate and LIMIT are pushed down.
-- Chronicle ingestion row and encoded-byte counters.
-- Estimated rows after filtering and after LIMIT.
-- Estimated projected encoded bytes.
-- Notes describing the estimate's provenance and limitations.
+explain(database, query, bindings, optimizer_enabled) returns an AqlPhysicalPlan with the selected operator path, scan columns, pushdown decisions, Chronicle ingestion counters and estimate provenance.
 
-AqlPhysicalPlan::explain() renders a human-readable operator summary. The output is a planned physical path; it is not a runtime profile.
+AqlPhysicalPlan::explain() renders the plan in readable text. Calling explain without table-analysis results deliberately reports row and payload estimates as unknown; Chronicle ingestion counters are not assumed to equal the full table size because tables can also contain legacy inserted segments.
+
+explain_with_statistics accepts TableStatistics returned by an explicit analyze_table call. It checks that the statistics belong to the resolved table and then estimates rows and projected payload using those analyzed table counts.
 
 ## 3. Cardinality estimates
 
@@ -44,15 +39,19 @@ The first estimator uses a documented heuristic, not histograms:
 - NOT: one minus child selectivity.
 - Unknown expression: 50%.
 
-Estimated filtered rows are rounded from Chronicle's accepted-row counter times selectivity. LIMIT caps the estimated output count. These heuristics may be inaccurate for skewed data and must not be presented as measured cardinality.
+Estimated filtered rows are rounded from analyzed scanned rows times selectivity. LIMIT caps the estimated output count. These heuristics may be inaccurate for skewed data and must not be presented as measured cardinality.
 
-## 4. Encoded-byte estimate
+## 4. Runtime query profile
 
-Chronicle's accepted encoded-byte counter is reported separately from the projected-byte estimate. The first projected-byte estimate scales the table byte counter by the fraction of required columns, assuming uniform column encoded widths. It is a planning heuristic only; compression, variable-length data, file layouts and metadata mean actual I/O can differ.
+AqlExecutionMetrics records measured output batches, output rows and output cells for values returned to the caller. output_value_payload_bytes counts the actual value-body bytes returned (fixed-width scalar bodies and UTF8/BINARY payload bytes); it excludes null markers, vector/column descriptors, allocator overhead and storage-file encoding overhead. output_bytes is a separate estimate of the owned result-batch footprint, not allocator RSS or physical disk I/O.
 
-Runtime AqlExecutionMetrics report output batches, output rows and an estimated owned output payload size accumulated from returned result batches. The payload estimate is not allocator RSS or physical disk bytes.
+These counters describe returned output, not rows scanned or bytes read from disk. Runtime scan/input counters and operator-by-operator timings remain future profiling work.
 
-## 5. Table and column analysis statistics
+## 5. Encoded-byte and payload estimate
+
+Chronicle accepted encoded-byte counters are reported separately from analyzed batch payload. The explicit table analyzer measures scanned rows and sums estimated owned batch-payload sizes. A projected payload estimate scales that analysis value by the fraction of columns required by the query, assuming uniform per-column payload. This is a planning heuristic; variable-length values and storage layout can make actual operator allocations differ.
+
+## 6. Table and column analysis statistics
 
 analyze_table(database, table, batch_rows) performs an explicit bounded full-table scan. It returns:
 - Exact scanned row count for this scan.
@@ -62,17 +61,17 @@ analyze_table(database, table, batch_rows) performs an explicit bounded full-tab
 - Sum of estimated owned batch payload sizes.
 - Chronicle accepted row and encoded-byte counters.
 
-The analysis scan is explicit and can read the entire table. It is not run automatically before a query and these statistics are not persisted in the catalog in v0.1. The planner does not currently consume the HLL/min/max statistics for selectivity; integrating persisted stats and histogram-based estimates is future work.
+The analysis scan can read the full table. It is not run automatically before a query and these statistics are not persisted in the catalog in v0.2. The planner does not yet consume HLL/min/max statistics for selectivity; persisted statistics and histogram-based estimates remain future work.
 
-## 6. Capsule / Navigation Map pruning boundary
+## 7. Capsule / Navigation Map pruning boundary
 
-Capsules and Navigation Maps are derived analytical artifacts. A table may contain Chronicle rows not represented in a particular Capsule generation. Therefore, an AQL table query must not replace a full table scan with a Capsule-only scan unless complete and current coverage can be proven for that table and snapshot. M5.4 does not yet enable Capsule pruning for ordinary AQL table queries. The existing core Capsule/Navigation Map API remains separately available and has its own correctness tests.
+Capsules and Navigation Maps are derived analytical artifacts. A table may contain Chronicle rows not represented in a particular Capsule generation. Therefore, an AQL table query must not replace a full table scan with a Capsule-only scan unless complete and current coverage can be proven for that table and snapshot. M5.4 does not yet enable Capsule pruning for ordinary AQL table queries.
 
-## 7. Validation
+## 8. Validation
 
 Tests compare native execution with optimizer-disabled reference execution on supported SELECT queries, verify computed projections fall back, exercise NULL behavior, aliases/repeated projections, cancellation, explain decisions and safe LIMIT pushdown. The workspace CI runs formatting, tests, Clippy, native examples and storage benchmarks.
 
-## 8. Non-goals
+## 9. Non-goals
 
 - Cost-based join ordering or join operators.
 - Persisted histograms and automatic ANALYZE scheduling.

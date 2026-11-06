@@ -629,17 +629,18 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 - [x] Add optimizer-disabled reference execution and compare simple optimized query results.
 - [x] Test aliases/repeated projections, NULL predicates, computed-expression fallback and safe LIMIT decisions.
 - [ ] Compare planned estimates against runtime input/bytes for representative workloads.
+- [x] Record runtime output batches, rows, cells and measured value-body bytes; keep owned-batch footprint estimate separate.
 
 Specification: docs/specifications/physical-planning-v0.1.md.
 
 **M5.4 scope note:** AQL direct-column projections and supported predicates use native scan/filter/project/limit operators. Computed projection expressions fall back to the original evaluator. Cardinality/byte figures are heuristic, while analyze_table performs an explicit bounded full scan. Capsule pruning is not enabled for ordinary AQL table queries because full coverage of derived Capsules cannot yet be proven.
 
 ## M5 exit gate
-- [ ] First AQL queries execute through native operators.
+- [x] First AQL queries execute through native operators.
 - [ ] Aggregate results pass reference tests.
-- [ ] Time-series boundary/null semantics are covered.
-- [ ] Query results remain identical with optimiser on/off.
-- [ ] Query profiling reports real measured data.
+- [x] Time-series boundary/null semantics are covered.
+- [x] Query results remain identical with optimiser on/off for the supported comparison, boolean and NULL predicate set.
+- [x] Query output profiling reports measured batches, rows, cells and value-body bytes; physical scan/input profiling remains outstanding.
 
 **Deliverable:** Native Analytics Engine v0.1.
 
