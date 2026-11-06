@@ -2360,6 +2360,193 @@ fn encode_catalog_v2(catalog: &Catalog) -> Result<Vec<u8>, DbError> {
     Ok(bytes)
 }
 
+fn apply_catalog_snapshot_artifact(
+    root: &Path,
+    current: &mut Catalog,
+    intent: &WalMutationIntent,
+    artifact_path: &Path,
+) -> Result<(), DbError> {
+    if intent.artifact_kind != WalArtifactKind::CatalogSnapshot {
+        return Err(DbError::CorruptCatalog("non-catalog artifact passed to catalog recovery"));
+    }
+    let metadata = fs::metadata(artifact_path)?;
+    if metadata.len() > MAX_CATALOG_BYTES {
+        return Err(DbError::CorruptCatalog("catalog snapshot exceeds size limit"));
+    }
+    let capacity = usize::try_from(metadata.len()).map_err(|_| DbError::LengthOverflow)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    File::open(artifact_path)?.read_to_end(&mut bytes)?;
+    let candidate = decode_catalog_v2(&bytes)?;
+    validate_catalog(&candidate)?;
+    if candidate.revision != intent.file_id {
+        return Err(DbError::CorruptCatalog(
+            "catalog snapshot revision differs from committed WAL intent",
+        ));
+    }
+    let (table_name, definition) = candidate.tables.iter()
+        .find(|(_, definition)| definition.id.0 == intent.table_id)
+        .ok_or(DbError::CorruptCatalog(
+            "catalog snapshot does not contain the committed TableId",
+        ))?;
+    if definition.schema_revision != intent.schema_revision {
+        return Err(DbError::CorruptCatalog(
+            "catalog snapshot schema revision differs from committed WAL intent",
+        ));
+    }
+
+    // The schema intent is ordered before the catalog intent in the same WAL
+    // transaction. It must already have been published and identity-checked.
+    let snapshot = SchemaSnapshot::read_from(
+        root,
+        definition.id,
+        definition.schema_revision,
+    )?;
+    if snapshot.schema()? != definition.schema
+        || snapshot.column_ids().collect::<Vec<_>>() != definition.column_ids
+    {
+        return Err(DbError::SchemaCompatibility(
+            "published schema snapshot does not match committed catalog snapshot",
+        ));
+    }
+
+    let data_root = root.join("data");
+    fs::create_dir_all(&data_root)?;
+    let table_directory = data_root.join(table_name);
+    match fs::symlink_metadata(&table_directory) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(DbError::CorruptCatalog(
+                "catalog table path is not a real directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&table_directory)?;
+            sync_recovery_directory(&data_root)?;
+        }
+        Err(error) => return Err(DbError::Io(error)),
+    }
+    sync_recovery_directory(&table_directory)?;
+
+    if candidate.revision > current.revision {
+        let expected_revision = current.revision
+            .checked_add(1)
+            .ok_or(DbError::LengthOverflow)?;
+        if candidate.revision != expected_revision {
+            return Err(DbError::CorruptCatalog(
+                "committed catalog revisions are not contiguous",
+            ));
+        }
+        save_catalog(&root.join("catalog").join("catalog.anc"), &candidate)?;
+        *current = candidate;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterCanonicalCatalogPublished,
+        );
+    } else if candidate.revision == current.revision {
+        if encode_catalog_v2(current)? != bytes {
+            return Err(DbError::CorruptCatalog(
+                "canonical catalog conflicts with committed catalog snapshot",
+            ));
+        }
+    } else {
+        // Earlier committed snapshots remain in the WAL. A later catalog is
+        // acceptable only if it still contains this table and has advanced its
+        // schema past this historical revision.
+        let current_definition = current.tables.values()
+            .find(|definition| definition.id.0 == intent.table_id)
+            .ok_or(DbError::CorruptCatalog(
+                "current catalog lost a table from committed history",
+            ))?;
+        if current_definition.schema_revision < intent.schema_revision {
+            return Err(DbError::CorruptCatalog(
+                "current catalog is behind a committed schema snapshot",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_canonical_numbered_temp(filename: &str, prefix: &str, suffix: &str) -> bool {
+    let Some(id) = filename.strip_prefix(prefix).and_then(|value| value.strip_suffix(suffix)) else {
+        return false;
+    };
+    id.len() == 20
+        && id.bytes().all(|byte| byte.is_ascii_digit())
+        && id.parse::<u64>().is_ok_and(|value| value != 0 && format!("{value:020}") == id)
+}
+
+fn cleanup_stale_catalog_replacement_temp(root: &Path) -> Result<(), DbError> {
+    let directory = root.join("catalog");
+    let temp = directory.join("catalog.anc.tmp");
+    match fs::symlink_metadata(&temp) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::remove_file(&temp)?;
+            sync_recovery_directory(&directory)?;
+        }
+        Ok(_) => {
+            return Err(DbError::CorruptCatalog(
+                "catalog replacement temporary path is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DbError::Io(error)),
+    }
+    Ok(())
+}
+
+fn cleanup_orphan_catalog_staging_temps(root: &Path) -> Result<(), DbError> {
+    let catalog_directory = root.join("catalog");
+    let mut catalog_changed = false;
+    for entry in fs::read_dir(&catalog_directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let filename = entry.file_name();
+        let filename = filename.to_string_lossy();
+        if is_canonical_numbered_temp(&filename, ".catalog-", ".tmp") {
+            fs::remove_file(entry.path())?;
+            catalog_changed = true;
+        }
+    }
+    if catalog_changed {
+        sync_recovery_directory(&catalog_directory)?;
+    }
+
+    let schemas_root = catalog_directory.join("schemas");
+    match fs::read_dir(&schemas_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let schema_directory = entry.path();
+                let mut changed = false;
+                for schema_entry in fs::read_dir(&schema_directory)? {
+                    let schema_entry = schema_entry?;
+                    if !schema_entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let filename = schema_entry.file_name();
+                    let filename = filename.to_string_lossy();
+                    if is_canonical_numbered_temp(&filename, ".schema-", ".tmp")
+                        || is_canonical_numbered_temp(&filename, "schema-", ".ans.tmp")
+                    {
+                        fs::remove_file(schema_entry.path())?;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    sync_recovery_directory(&schema_directory)?;
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DbError::Io(error)),
+    }
+    Ok(())
+}
+
 fn save_catalog(path: &Path, catalog: &Catalog) -> Result<(), DbError> {
     let bytes = encode_catalog_v2(catalog)?;
     let temp = path.with_extension("anc.tmp");
