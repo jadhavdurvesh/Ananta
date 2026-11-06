@@ -5644,7 +5644,7 @@ mod tests {
         let Some(operation) = std::env::var_os("ANANTA_WAL_CRASH_OPERATION") else {
             return;
         };
-        let operation = operation.to_string_lossy();
+        let operation = operation.to_string_lossy().into_owned();
         let point_name = std::env::var("ANANTA_WAL_CRASH_POINT").unwrap();
         use crate::wal_recovery::WalRecoveryCrashPoint::*;
         let point = match point_name.as_str() {
