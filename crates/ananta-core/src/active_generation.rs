@@ -324,14 +324,17 @@ impl Database {
     }
 
     pub(crate) fn recover_active_weaves(&mut self) -> Result<(), DbError> {
-        for (table, definition) in &self.catalog.tables {
-            let root = self.root.join("data").join(table).join("weaves");
+        let tables = self.catalog.tables.iter()
+            .map(|(name, definition)| (name.clone(), definition.clone()))
+            .collect::<Vec<_>>();
+        for (table, definition) in tables {
+            let root = self.root.join("data").join(&table).join("weaves");
             let Some(pointer) = read_pointer(&root, definition.id.0)? else { continue; };
-            if self.verify_generation(table, pointer.active).is_ok() { continue; }
+            if self.verify_generation(&table, pointer.active).is_ok() { continue; }
             let previous = pointer.previous.ok_or(DbError::CompactionPreflight(
                 "active Weave is invalid and no previous generation is available"
             ))?;
-            self.verify_generation(table, previous)?;
+            self.verify_generation(&table, previous)?;
             let fallback = ActiveWeavePointer {
                 table_id: pointer.table_id,
                 revision: pointer.revision.checked_add(1).ok_or(DbError::LengthOverflow)?,
