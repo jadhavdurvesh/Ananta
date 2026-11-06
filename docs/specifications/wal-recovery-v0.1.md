@@ -135,3 +135,12 @@ The core crate now exposes AMUT v1 typed mutation intents for ANF segment and Ch
 The recovery planner consumes an already-verified WalReadReport and classifies transactions into committed redo work, incomplete staging cleanup work, or explicitly aborted work. Committed and incomplete transaction lists preserve BEGIN order in the WAL. Unit tests cover intent round-trip, canonical naming, malformed artifact kinds, zero IDs, unsupported intent versions and committed/incomplete/aborted classification.
 
 These primitives do not yet publish or replay database files; Database::open and the ANF/Chronicle write paths are the next integration stage.
+
+
+## Implemented staged publication and replay driver
+
+The core recovery module now provides staging, publishing and discard helpers. Staging uses create_new, verifies input size/SHA-256 against the mutation intent, syncs the file and its containing directory. Publication derives canonical names from artifact kind/file ID, rejects symlinks and non-regular files, verifies exact file length and a streaming SHA-256 digest, uses a no-replace hard link, and syncs directory changes. Repeating publication for a matching final file succeeds without duplicating it; a conflicting final file is preserved and reported as an error.
+
+The recover_staged_artifacts driver consumes a verified WAL report, publishes all committed intents, discards only staging names owned by incomplete transactions, appends explicit ABORT records, and syncs those markers. Its tests cover committed replay, repeat replay, incomplete cleanup, missing committed artifacts, conflicting final checksums and canonical file derivation.
+
+These helpers are still not invoked by Database::open or the insert/ingest mutation methods. The production integration checkboxes remain open until that wiring and process-interruption tests are committed.

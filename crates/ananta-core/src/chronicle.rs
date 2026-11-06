@@ -392,6 +392,22 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     state.finalize()
 }
 
+/// Hash a file incrementally so recovery can verify large immutable artifacts
+/// without allocating a buffer proportional to the complete file size.
+pub(crate) fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
+    let mut file = File::open(path)?;
+    let mut state = Sha256::new();
+    let mut buffer = [0_u8; IO_BUFFER];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        state.update(&buffer[..read]);
+    }
+    Ok(state.finalize())
+}
+
 fn checksum64(bytes: &[u8]) -> u64 {
     let mut value = 0xcbf29ce484222325_u64;
     for byte in bytes {

@@ -19,8 +19,9 @@ pub mod wal;
 pub mod wal_recovery;
 pub use wal::{read_wal, WalError, WalReadReport, WalRecord, WalRecordKind, WalSyncPolicy, WalWriter};
 pub use wal_recovery::{
-    build_recovery_plan, RecoveredWalTransaction, WalArtifactKind, WalMutationIntent,
-    WalRecoveryError, WalRecoveryPlan,
+    build_recovery_plan, discard_staged_wal_artifact, publish_staged_wal_artifact,
+    recover_staged_artifacts, stage_wal_artifact, RecoveredWalTransaction, WalArtifactKind,
+    WalMutationIntent, WalRecoveryError, WalRecoveryPlan, WalRecoverySummary,
 };
 pub use active_generation::{ActiveWeaveGeneration, ActiveWeavePointer};
 pub use compaction_execution::{CompactionExecutionReport, CompactionReadMeasurement, RowOrigin};

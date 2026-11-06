@@ -5,9 +5,12 @@
 //! so Database::open can apply the recovery protocol without reinterpreting
 //! opaque payload bytes at every call site.
 
-use crate::wal::{WalReadReport, WalRecordKind};
+use crate::wal::{WalReadReport, WalRecordKind, WalWriter};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 const INTENT_MAGIC: &[u8; 4] = b"AMUT";
 const INTENT_VERSION: u16 = 1;
@@ -142,6 +145,11 @@ pub enum WalRecoveryError {
     CorruptIntent(&'static str),
     UnsupportedIntentVersion(u16),
     TransactionClassification(&'static str),
+    Io(String),
+    FileConflict(&'static str),
+    MissingCommittedArtifact,
+    MissingTableId(u64),
+    Wal(String),
 }
 
 impl fmt::Display for WalRecoveryError {
@@ -154,6 +162,15 @@ impl fmt::Display for WalRecoveryError {
             Self::TransactionClassification(message) => {
                 write!(formatter, "invalid WAL recovery transaction classification: {message}")
             }
+            Self::Io(message) => write!(formatter, "WAL recovery I/O error: {message}"),
+            Self::FileConflict(message) => write!(formatter, "WAL recovery file conflict: {message}"),
+            Self::MissingCommittedArtifact => formatter.write_str(
+                "committed WAL artifact has neither a valid staging file nor a valid final file",
+            ),
+            Self::MissingTableId(table_id) => {
+                write!(formatter, "WAL recovery cannot resolve TableId {table_id}")
+            }
+            Self::Wal(message) => write!(formatter, "WAL recovery log error: {message}"),
         }
     }
 }
@@ -226,6 +243,222 @@ pub fn build_recovery_plan(report: &WalReadReport) -> Result<WalRecoveryPlan, Wa
         ));
     }
     Ok(plan)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalRecoverySummary {
+    pub committed_artifacts_published_or_verified: u64,
+    pub incomplete_artifacts_discarded: u64,
+    pub aborted_transactions: u64,
+}
+
+/// Apply the redo/cleanup plan. The caller resolves each stable TableId to its
+/// real table directory using the loaded catalog and validates the referenced
+/// schema snapshot before returning the directory. Incomplete transactions
+/// receive durable ABORT markers after their staged files are discarded.
+pub fn recover_staged_artifacts<F>(
+    report: &WalReadReport,
+    writer: &mut WalWriter,
+    mut resolve_table_directory: F,
+) -> Result<WalRecoverySummary, WalRecoveryError>
+where
+    F: FnMut(&WalMutationIntent) -> Result<PathBuf, WalRecoveryError>,
+{
+    let plan = build_recovery_plan(report)?;
+    let mut summary = WalRecoverySummary::default();
+
+    for transaction in &plan.committed {
+        for intent in &transaction.intents {
+            let directory = resolve_table_directory(intent)?;
+            publish_staged_wal_artifact(&directory, intent)?;
+            summary.committed_artifacts_published_or_verified =
+                summary.committed_artifacts_published_or_verified
+                    .checked_add(1)
+                    .ok_or(WalRecoveryError::CorruptIntent("recovery artifact counter overflow"))?;
+        }
+    }
+
+    for transaction in &plan.incomplete {
+        for intent in &transaction.intents {
+            let directory = resolve_table_directory(intent)?;
+            discard_staged_wal_artifact(&directory, intent)?;
+            summary.incomplete_artifacts_discarded =
+                summary.incomplete_artifacts_discarded
+                    .checked_add(1)
+                    .ok_or(WalRecoveryError::CorruptIntent("recovery artifact counter overflow"))?;
+        }
+    }
+
+    for transaction in &plan.incomplete {
+        writer.abort_transaction(
+            transaction.transaction_id,
+            b"startup recovery discarded uncommitted staged artifacts",
+        ).map_err(|error| WalRecoveryError::Wal(error.to_string()))?;
+        summary.aborted_transactions = summary.aborted_transactions
+            .checked_add(1)
+            .ok_or(WalRecoveryError::CorruptIntent("recovery transaction counter overflow"))?;
+    }
+    if summary.aborted_transactions > 0 {
+        writer.sync().map_err(|error| WalRecoveryError::Wal(error.to_string()))?;
+    }
+    Ok(summary)
+}
+
+/// Stage complete immutable bytes under the intent's canonical temporary
+/// filename. The file and directory entry are synchronised before WAL COMMIT.
+pub fn stage_wal_artifact(
+    directory: impl AsRef<Path>,
+    intent: &WalMutationIntent,
+    bytes: &[u8],
+) -> Result<PathBuf, WalRecoveryError> {
+    intent.validate()?;
+    let directory = directory.as_ref();
+    fs::create_dir_all(directory).map_err(io_error)?;
+    let expected_len = u64::try_from(bytes.len())
+        .map_err(|_| WalRecoveryError::CorruptIntent("artifact length exceeds u64"))?;
+    if expected_len != intent.file_len || crate::chronicle::sha256(bytes) != intent.sha256 {
+        return Err(WalRecoveryError::FileConflict(
+            "staged bytes do not match mutation intent length/SHA-256",
+        ));
+    }
+
+    let staging_path = directory.join(intent.artifact_kind.staging_file_name(intent.file_id));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging_path)
+        .map_err(io_error)?;
+    let write_result = (|| {
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        sync_recovery_directory(directory)?;
+        Ok::<(), std::io::Error>(())
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&staging_path);
+        return Err(io_error(error));
+    }
+    Ok(staging_path)
+}
+
+/// Idempotently publish a committed intent. Existing final files are accepted
+/// only when they exactly match the recorded size and checksum. Publication
+/// uses a no-replace hard link so recovery never overwrites conflicting data.
+pub fn publish_staged_wal_artifact(
+    directory: impl AsRef<Path>,
+    intent: &WalMutationIntent,
+) -> Result<PathBuf, WalRecoveryError> {
+    intent.validate()?;
+    let directory = directory.as_ref();
+    require_recovery_directory(directory)?;
+    let staging_path = directory.join(intent.artifact_kind.staging_file_name(intent.file_id));
+    let final_path = directory.join(intent.artifact_kind.final_file_name(intent.file_id));
+
+    if final_path.exists() {
+        verify_intent_file(&final_path, intent)?;
+        if staging_path.exists() {
+            verify_intent_file(&staging_path, intent)?;
+            fs::remove_file(&staging_path).map_err(io_error)?;
+            sync_recovery_directory(directory).map_err(io_error)?;
+        }
+        return Ok(final_path);
+    }
+
+    if !staging_path.exists() {
+        return Err(WalRecoveryError::MissingCommittedArtifact);
+    }
+    verify_intent_file(&staging_path, intent)?;
+    match fs::hard_link(&staging_path, &final_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            verify_intent_file(&final_path, intent)?;
+        }
+        Err(error) => return Err(io_error(error)),
+    }
+    sync_recovery_directory(directory).map_err(io_error)?;
+    verify_intent_file(&final_path, intent)?;
+    if staging_path.exists() {
+        fs::remove_file(&staging_path).map_err(io_error)?;
+        sync_recovery_directory(directory).map_err(io_error)?;
+    }
+    Ok(final_path)
+}
+
+/// Discard an incomplete transaction's staged artifact. A final artifact is
+/// never removed by this operation.
+pub fn discard_staged_wal_artifact(
+    directory: impl AsRef<Path>,
+    intent: &WalMutationIntent,
+) -> Result<(), WalRecoveryError> {
+    intent.validate()?;
+    let directory = directory.as_ref();
+    let staging_path = directory.join(intent.artifact_kind.staging_file_name(intent.file_id));
+    match fs::symlink_metadata(&staging_path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(WalRecoveryError::FileConflict(
+                    "staging path is not a regular file",
+                ));
+            }
+            fs::remove_file(&staging_path).map_err(io_error)?;
+            sync_recovery_directory(directory).map_err(io_error)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(error)),
+    }
+    Ok(())
+}
+
+fn verify_intent_file(
+    path: &Path,
+    intent: &WalMutationIntent,
+) -> Result<(), WalRecoveryError> {
+    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+    if !metadata.file_type().is_file() {
+        return Err(WalRecoveryError::FileConflict(
+            "artifact path is not a regular file",
+        ));
+    }
+    if metadata.len() != intent.file_len {
+        return Err(WalRecoveryError::FileConflict(
+            "artifact length differs from committed WAL intent",
+        ));
+    }
+    let checksum = crate::chronicle::sha256_file(path).map_err(io_error)?;
+    if checksum != intent.sha256 {
+        return Err(WalRecoveryError::FileConflict(
+            "artifact SHA-256 differs from committed WAL intent",
+        ));
+    }
+    Ok(())
+}
+
+fn require_recovery_directory(path: &Path) -> Result<(), WalRecoveryError> {
+    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+    if !metadata.file_type().is_dir() {
+        return Err(WalRecoveryError::FileConflict(
+            "table directory is not a real directory",
+        ));
+    }
+    Ok(())
+}
+
+fn sync_recovery_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn io_error(error: std::io::Error) -> WalRecoveryError {
+    WalRecoveryError::Io(error.to_string())
 }
 
 #[cfg(test)]
@@ -312,6 +545,138 @@ mod tests {
         assert_eq!(plan.incomplete[0].transaction_id, incomplete);
         assert_eq!(plan.incomplete_intent_count(), 1);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn staged_artifact_publication_is_idempotent_and_checksum_guarded() {
+        let root = std::env::temp_dir().join(format!(
+            "ananta-wal-publish-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let bytes = b"immutable ANF payload".to_vec();
+        let intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::AnfSegment,
+            table_id: 4,
+            schema_revision: 2,
+            file_id: 91,
+            file_len: bytes.len() as u64,
+            sha256: crate::chronicle::sha256(&bytes),
+        };
+        let staged = stage_wal_artifact(&root, &intent, &bytes).unwrap();
+        assert!(staged.is_file());
+        let final_path = publish_staged_wal_artifact(&root, &intent).unwrap();
+        assert_eq!(fs::read(&final_path).unwrap(), bytes);
+        assert!(!staged.exists());
+        // Replaying a committed intent after final publication is a no-op.
+        assert_eq!(publish_staged_wal_artifact(&root, &intent).unwrap(), final_path);
+
+        let conflicting = b"different immutable payload";
+        fs::write(&final_path, conflicting).unwrap();
+        assert!(matches!(
+            publish_staged_wal_artifact(&root, &intent),
+            Err(WalRecoveryError::FileConflict("artifact length differs from committed WAL intent"))
+        ));
+        assert_eq!(fs::read(&final_path).unwrap(), conflicting);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_replays_committed_and_aborts_incomplete_staged_artifacts_idempotently() {
+        let wal_path = path("replay");
+        let table_dir = wal_path.with_extension("table");
+        fs::create_dir_all(&table_dir).unwrap();
+        let committed_bytes = b"committed payload";
+        let committed_intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::AnfSegment,
+            table_id: 71,
+            schema_revision: 1,
+            file_id: 101,
+            file_len: committed_bytes.len() as u64,
+            sha256: crate::chronicle::sha256(committed_bytes),
+        };
+        let incomplete_bytes = b"incomplete payload";
+        let incomplete_intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::ChronicleRecord,
+            table_id: 71,
+            schema_revision: 1,
+            file_id: 102,
+            file_len: incomplete_bytes.len() as u64,
+            sha256: crate::chronicle::sha256(incomplete_bytes),
+        };
+        stage_wal_artifact(&table_dir, &committed_intent, committed_bytes).unwrap();
+        stage_wal_artifact(&table_dir, &incomplete_intent, incomplete_bytes).unwrap();
+
+        let mut writer = WalWriter::open(&wal_path, WalSyncPolicy::OnCommit).unwrap();
+        let committed_id = writer.next_sequence();
+        writer.begin_transaction(committed_id, b"ANF insert").unwrap();
+        writer.append_mutation(committed_id, &committed_intent.encode().unwrap()).unwrap();
+        writer.commit_transaction(committed_id).unwrap();
+
+        let incomplete_id = writer.next_sequence();
+        writer.begin_transaction(incomplete_id, b"Chronicle ingest").unwrap();
+        writer.append_mutation(incomplete_id, &incomplete_intent.encode().unwrap()).unwrap();
+        drop(writer);
+
+        let mut writer = WalWriter::open(&wal_path, WalSyncPolicy::OnCommit).unwrap();
+        let report = read_wal(&wal_path).unwrap();
+        let resolve = |intent: &WalMutationIntent| {
+            if intent.table_id == 71 {
+                Ok(table_dir.clone())
+            } else {
+                Err(WalRecoveryError::MissingTableId(intent.table_id))
+            }
+        };
+        let summary = recover_staged_artifacts(&report, &mut writer, resolve).unwrap();
+        assert_eq!(summary.committed_artifacts_published_or_verified, 1);
+        assert_eq!(summary.incomplete_artifacts_discarded, 1);
+        assert_eq!(summary.aborted_transactions, 1);
+        assert!(table_dir.join(committed_intent.artifact_kind.final_file_name(101)).is_file());
+        assert!(!table_dir.join(incomplete_intent.artifact_kind.staging_file_name(102)).exists());
+
+        let second_report = read_wal(&wal_path).unwrap();
+        assert!(second_report.is_clean());
+        let second = recover_staged_artifacts(&second_report, &mut writer, |intent| {
+            if intent.table_id == 71 { Ok(table_dir.clone()) }
+            else { Err(WalRecoveryError::MissingTableId(intent.table_id)) }
+        }).unwrap();
+        assert_eq!(second.committed_artifacts_published_or_verified, 1);
+        assert_eq!(second.aborted_transactions, 0);
+
+        drop(writer);
+        fs::remove_file(wal_path).unwrap();
+        fs::remove_dir_all(table_dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_fails_closed_when_a_committed_artifact_is_missing() {
+        let wal_path = path("missing-artifact");
+        let table_dir = wal_path.with_extension("table");
+        fs::create_dir_all(&table_dir).unwrap();
+        let intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::AnfSegment,
+            table_id: 81,
+            schema_revision: 1,
+            file_id: 111,
+            file_len: 3,
+            sha256: crate::chronicle::sha256(b"abc"),
+        };
+        let mut writer = WalWriter::open(&wal_path, WalSyncPolicy::OnCommit).unwrap();
+        let transaction = writer.next_sequence();
+        writer.begin_transaction(transaction, b"insert").unwrap();
+        writer.append_mutation(transaction, &intent.encode().unwrap()).unwrap();
+        writer.commit_transaction(transaction).unwrap();
+        drop(writer);
+
+        let mut writer = WalWriter::open(&wal_path, WalSyncPolicy::OnCommit).unwrap();
+        let report = read_wal(&wal_path).unwrap();
+        assert_eq!(
+            recover_staged_artifacts(&report, &mut writer, |_| Ok(table_dir.clone())),
+            Err(WalRecoveryError::MissingCommittedArtifact),
+        );
+        drop(writer);
+        fs::remove_file(wal_path).unwrap();
+        fs::remove_dir_all(table_dir).unwrap();
     }
 
     #[test]

@@ -689,7 +689,8 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Define crash-point matrix for staging, commit, link publication and cleanup.
 - [x] Implement typed AMUT v1 mutation-intent encode/decode with canonical ANF/Chronicle file-name derivation.
 - [x] Implement recovery-plan classification for committed, incomplete and explicitly aborted transactions, preserving WAL order.
-- [ ] Implement checksum-verified staging and no-replace final publication helpers.
+- [x] Implement checksum-verified staging and no-replace final publication helpers.
+- [x] Implement reusable recovery driver for committed replay, incomplete staging cleanup, durable ABORT markers and repeatable recovery.
 - [ ] Integrate ANF insert staging and WAL intent integration.
 - [ ] Integrate Chronicle ingest staging and WAL intent integration.
 - [ ] Run WAL replay before Chronicle index reconstruction in Database::open.

@@ -183,3 +183,6 @@ M6.2 is being developed against a redo-only staged-file publication protocol. It
 
 
 M6.2 now includes typed AMUT v1 mutation intents and a tested recovery-plan classifier for committed, incomplete and aborted WAL transactions. These are primitives only; Database::open replay and ANF/Chronicle mutation-path integration remain in progress.
+
+
+M6.2 now has reusable staged-artifact publication and WAL replay-plan helpers, including streaming SHA-256 verification and idempotent final-name publication. They are not yet wired into Database::open or insert/ingest; no crash-recovery guarantee is claimed yet.
