@@ -826,9 +826,10 @@ impl Database {
                 "rotated WAL did not reopen as a clean checkpoint anchor".into(),
             ));
         }
+        let current_manifest_path = report.manifest_path.clone();
         report.pruned_manifest_count = crate::wal_checkpoint::prune_superseded_checkpoint_manifests(
             &self.root,
-            &report.manifest_path,
+            &current_manifest_path,
         ).map_err(|error| DbError::Wal(format!(
             "checkpoint is durable but superseded-manifest pruning failed: {error}",
         )))?;
@@ -6897,12 +6898,14 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_archive_pruning_survives_process_crashes() {
         exercise_checkpoint_prune_process_crash("AfterCheckpointArchiveRemoved");
         exercise_checkpoint_prune_process_crash("AfterCheckpointRetentionDirectorySynced");
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_wal_replacement_survives_subprocess_crashes() {
         exercise_checkpoint_process_crash("AfterCheckpointManifestTempSynced", false);
@@ -6912,6 +6915,7 @@ mod tests {
         exercise_checkpoint_process_crash("AfterCheckpointDirectorySync", true);
     }
 
+    #[cfg(unix)]
     #[test]
     fn database_checkpoint_rotates_wal_and_replays_subsequent_commits() {
         let path = temp_path();
@@ -6967,6 +6971,7 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_replays_catalog_changes_and_revalidates_mutable_state() {
         let path = temp_path();
@@ -6986,6 +6991,7 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_manifest_mismatch_fails_database_open_closed() {
         let path = temp_path();
