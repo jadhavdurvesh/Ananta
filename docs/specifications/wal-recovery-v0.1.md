@@ -1,7 +1,7 @@
 # ANANTA WAL Recovery and Publication Protocol v0.1
 
 **Milestone:** M6.2 — startup recovery and redo  
-**Status:** Design contract; not yet connected to Database mutation paths
+**Status:** Design contract plus tested mutation-intent/recovery-plan primitives; not yet connected to Database mutation paths
 
 ## 1. Guarantee boundary
 
@@ -126,3 +126,12 @@ M6.2 must first complete deterministic replay. WAL truncation/rotation is intent
 - Reopen twice after recovery to prove idempotence.
 
 Until these tests pass on actual Database mutation paths, the engine must continue to describe M6.2 as incomplete.
+
+
+## Implemented recovery primitives
+
+The core crate now exposes AMUT v1 typed mutation intents for ANF segment and Chronicle record artifacts. The fixed-width envelope carries TableId, schema revision, preallocated file ID, exact file length and SHA-256. Final and staging filenames are derived from artifact kind and numeric ID; the WAL payload does not contain an arbitrary filesystem path.
+
+The recovery planner consumes an already-verified WalReadReport and classifies transactions into committed redo work, incomplete staging cleanup work, or explicitly aborted work. Committed and incomplete transaction lists preserve BEGIN order in the WAL. Unit tests cover intent round-trip, canonical naming, malformed artifact kinds, zero IDs, unsupported intent versions and committed/incomplete/aborted classification.
+
+These primitives do not yet publish or replay database files; Database::open and the ANF/Chronicle write paths are the next integration stage.

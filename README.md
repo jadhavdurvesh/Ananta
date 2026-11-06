@@ -180,3 +180,6 @@ The standalone ANWL WAL reader additionally tests truncated frame-body recovery,
 
 
 M6.2 is being developed against a redo-only staged-file publication protocol. Its crash matrix, mutation-intent envelope, recovery ordering, Chronicle idempotency rules and fail-closed cases are specified in docs/specifications/wal-recovery-v0.1.md. This remains design work until Database mutation paths and startup replay are implemented and fault-injection tested.
+
+
+M6.2 now includes typed AMUT v1 mutation intents and a tested recovery-plan classifier for committed, incomplete and aborted WAL transactions. These are primitives only; Database::open replay and ANF/Chronicle mutation-path integration remain in progress.
