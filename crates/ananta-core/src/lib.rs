@@ -6333,9 +6333,18 @@ mod tests {
         let point_name = std::env::var("ANANTA_WAL_CRASH_POINT").unwrap();
         use crate::wal_recovery::WalRecoveryCrashPoint::*;
         let point = match point_name.as_str() {
+            "AfterStagingFileCreated" => AfterStagingFileCreated,
+            "AfterStagingBytesWritten" => AfterStagingBytesWritten,
+            "AfterStagingFlush" => AfterStagingFlush,
+            "AfterStagingFileSync" => AfterStagingFileSync,
+            "AfterStagingDirectorySync" => AfterStagingDirectorySync,
+            "AfterWalBegin" => AfterWalBegin,
             "AfterWalMutation" => AfterWalMutation,
             "AfterWalCommit" => AfterWalCommit,
             "AfterFinalNameLinked" => AfterFinalNameLinked,
+            "AfterPublishDirectorySync" => AfterPublishDirectorySync,
+            "AfterStagingNameRemoved" => AfterStagingNameRemoved,
+            "AfterCleanupDirectorySync" => AfterCleanupDirectorySync,
             "AfterSchemaSnapshotPublished" => AfterSchemaSnapshotPublished,
             "AfterCatalogSnapshotPublished" => AfterCatalogSnapshotPublished,
             "AfterCanonicalCatalogPublished" => AfterCanonicalCatalogPublished,
@@ -6720,16 +6729,18 @@ mod tests {
 
         let root = temp_path();
         let database = Database::open(&root).unwrap();
-        let status = Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("tests::wal_recovery_process_crash_worker")
-            .arg("--nocapture")
-            .env("ANANTA_WAL_CRASH_OPERATION", "lock-probe")
-            .env("ANANTA_WAL_CRASH_POINT", "AfterWalCommit")
-            .env("ANANTA_WAL_CRASH_DATABASE", &root)
-            .status()
-            .unwrap();
-        assert!(status.success(), "second process did not observe DatabaseLocked");
+        for _ in 0..5 {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("tests::wal_recovery_process_crash_worker")
+                .arg("--nocapture")
+                .env("ANANTA_WAL_CRASH_OPERATION", "lock-probe")
+                .env("ANANTA_WAL_CRASH_POINT", "AfterWalCommit")
+                .env("ANANTA_WAL_CRASH_DATABASE", &root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "second process did not observe DatabaseLocked");
+        }
         assert!(Database::inspect_lock(&root).unwrap().is_locked);
         drop(database);
         assert!(!Database::inspect_lock(&root).unwrap().is_locked);
@@ -6823,9 +6834,18 @@ mod tests {
     fn capsule_and_navigation_map_wal_recovery_survives_process_crashes() {
         for operation in ["capsule", "navigation-map"] {
             for (point, committed) in [
+                ("AfterStagingFileCreated", false),
+                ("AfterStagingBytesWritten", false),
+                ("AfterStagingFlush", false),
+                ("AfterStagingFileSync", false),
+                ("AfterStagingDirectorySync", false),
+                ("AfterWalBegin", false),
                 ("AfterWalMutation", false),
                 ("AfterWalCommit", true),
                 ("AfterFinalNameLinked", true),
+                ("AfterPublishDirectorySync", true),
+                ("AfterStagingNameRemoved", true),
+                ("AfterCleanupDirectorySync", true),
             ] {
                 exercise_derived_artifact_subprocess_crash(operation, point, committed);
             }
