@@ -1230,26 +1230,43 @@ impl Database {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(DbError::Io(error)),
             };
+            let mut entries_to_scan = Vec::new();
+            let mut removed_orphans = false;
             for entry in entries {
                 let entry = entry?;
                 if !entry.file_type()?.is_file() {
                     continue;
                 }
                 let filename = entry.file_name();
-                let filename = filename.to_string_lossy();
+                let filename = filename.to_string_lossy().into_owned();
+                if let Some(number) = filename.strip_prefix(".candidate-").and_then(|v| v.strip_suffix(".tmp")) {
+                    let canonical = number.len() == 20
+                        && number.bytes().all(|byte| byte.is_ascii_digit())
+                        && number.parse::<u64>().ok().map_or(false, |id| id != 0 && format!("{id:020}") == number);
+                    if canonical {
+                        fs::remove_file(entry.path())?;
+                        removed_orphans = true;
+                        continue;
+                    }
+                }
+                entries_to_scan.push((entry.path(), filename));
+            }
+            if removed_orphans {
+                sync_directory(&weave_root)?;
+            }
+            for (versioned_path, filename) in entries_to_scan {
                 let Some(number) = filename.strip_prefix("candidate-")
                     .and_then(|value| value.strip_suffix(".owm")) else {
                     continue;
                 };
                 if number.len() != 20 || !number.bytes().all(|byte| byte.is_ascii_digit())
-                    || number.parse::<u64>().ok().is_none_or(|id| id == 0 || format!("{id:020}") != number)
+                    || number.parse::<u64>().ok().map_or(true, |id| id == 0 || format!("{id:020}") != number)
                 {
                     return Err(DbError::CompactionExecution(
                         "versioned candidate manifest filename is not canonical".into(),
                     ));
                 }
 
-                let versioned_path = entry.path();
                 let manifest_bytes = read_regular_file(&versioned_path)?;
                 let output = CompactionOutputManifest::decode(&manifest_bytes)
                     .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
@@ -1298,6 +1315,18 @@ impl Database {
                 if stage_exists && final_exists {
                     return Err(DbError::CompactionPreflight(
                         "both staged and final directories exist for one committed candidate",
+                    ));
+                }
+                // A fully finalized historical candidate may outlive a later
+                // schema revision. It is immutable and no longer needs replay;
+                // an unfinished candidate at an old revision cannot be safely
+                // completed against the current table schema.
+                if output.target_schema_revision != definition.schema_revision {
+                    if final_exists && !stage_exists {
+                        continue;
+                    }
+                    return Err(DbError::CompactionPreflight(
+                        "unfinished committed candidate targets a different schema revision",
                     ));
                 }
                 if !stage_exists && !final_exists {
