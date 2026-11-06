@@ -3323,8 +3323,17 @@ mod tests {
                 BatchId::from_bytes([201; 16]).unwrap(),
                 &rows,
             ).unwrap();
+            db.build_capsule("telemetry", 3, 1, 1, 1, Some("timestamp")).unwrap();
+            db.build_navigation_map("telemetry", 1).unwrap();
+            let consistency = db.check_consistency(1).unwrap();
+            assert_eq!(consistency.tables_checked, 1);
+            assert_eq!(consistency.rows_checked, 2);
+            assert_eq!(consistency.chronicle_records_checked, 1);
+            assert_eq!(consistency.capsules_checked, 1);
+            assert_eq!(consistency.navigation_maps_checked, 1);
+            assert!(consistency.inventory.total_bytes > 0);
             let report = db.backup_to(&backup).unwrap();
-            assert!(report.file_count >= 4);
+            assert!(report.file_count >= 7);
             assert!(backup.join("backup.anbk").is_file());
         }
 
@@ -3337,6 +3346,47 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(backup).unwrap();
         fs::remove_dir_all(restored).unwrap();
+    }
+
+    #[test]
+    fn writer_lock_inspection_reports_owner_without_mutating_lock() {
+        let path = temp_path();
+        let db = Database::open(&path).unwrap();
+        let status = Database::inspect_lock(&path).unwrap();
+        assert!(status.is_locked);
+        assert_eq!(status.owner_process_id, Some(std::process::id()));
+        assert!(matches!(Database::open(&path), Err(DbError::DatabaseLocked(_))));
+        drop(db);
+        let unlocked = Database::inspect_lock(&path).unwrap();
+        assert!(!unlocked.is_locked);
+        assert_eq!(unlocked.owner_process_id, None);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn one_database_handle_supports_concurrent_readers() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![
+            vec![Value::TimestampMicros(1), Value::Utf8("reader-a".into()), Value::Float64(1.0)],
+            vec![Value::TimestampMicros(2), Value::Utf8("reader-b".into()), Value::Float64(2.0)],
+        ];
+        db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([202; 16]).unwrap(),
+            &rows,
+        ).unwrap();
+        std::thread::scope(|scope| {
+            let readers = (0..4)
+                .map(|_| scope.spawn(|| db.scan("telemetry").unwrap()))
+                .collect::<Vec<_>>();
+            for reader in readers {
+                assert_eq!(reader.join().unwrap(), rows);
+            }
+        });
+        drop(db);
+        fs::remove_dir_all(path).unwrap();
     }
 
     fn legacy_v1_catalog(tables: &[(&str, &Schema)]) -> Vec<u8> {
