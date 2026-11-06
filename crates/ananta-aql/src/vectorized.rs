@@ -325,9 +325,106 @@ fn vector_error(error:ExecutionError)->AqlExecutionError{
 #[cfg(test)]
 mod tests{
     use super::*;
+    use ananta_core::BatchId;
     use ananta_types::Schema;
     use std::fs;
     use std::time::{SystemTime,UNIX_EPOCH};
+
+    #[test]
+    fn vectorized_capsule_pruning_requires_complete_coverage_and_preserves_results() {
+        let n=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root=std::env::temp_dir().join(format!("ananta-vectorized-capsule-{n}"));
+        let mut db=Database::open(&root).unwrap();
+        db.create_table("telemetry",Schema::new(vec![
+            Column::new("time",DataType::TimestampMicros,false),
+            Column::new("device",DataType::Utf8,false),
+            Column::new("reading",DataType::Float64,true),
+        ]).unwrap()).unwrap();
+
+        for capsule_index in 0..3_i64 {
+            let sequence=(capsule_index+1) as u8;
+            let rows=(0..10_i64).map(|offset|{
+                let timestamp=capsule_index*10+offset;
+                vec![
+                    Value::TimestampMicros(timestamp),
+                    Value::Utf8(format!("device-{capsule_index}")),
+                    Value::Float64(timestamp as f64),
+                ]
+            }).collect::<Vec<_>>();
+            db.ingest_batch(
+                "telemetry",
+                BatchId::from_bytes([sequence;16]).unwrap(),
+                &rows,
+            ).unwrap();
+            db.build_capsule(
+                "telemetry",
+                sequence as u64,
+                1,
+                sequence as u64,
+                sequence as u64,
+                Some("time"),
+            ).unwrap();
+        }
+        db.build_navigation_map("telemetry",1).unwrap();
+        assert!(db.capsules_cover_chronicle("telemetry").unwrap());
+
+        let query=crate::parse(
+            "SELECT device FROM telemetry WHERE time >= :lower AND time <= :upper"
+        ).unwrap();
+        let bindings=ParameterBindings{
+            named:[
+                ("lower".into(),Value::TimestampMicros(15)),
+                ("upper".into(),Value::TimestampMicros(25)),
+            ].into_iter().collect(),
+            positional:vec![],
+        };
+        let options=crate::PlannerOptions{
+            navigation_map_generation:Some(1),
+            ..crate::PlannerOptions::default()
+        };
+        let mut pruned=execute_vectorized_with_options(
+            &db,&query,&bindings,4,ResourceLimits::default(),
+            Arc::new(AtomicBool::new(false)),options,
+        ).unwrap();
+        let pruned_rows=pruned.by_ref()
+            .collect::<Result<Vec<_>,_>>()
+            .unwrap()
+            .iter()
+            .flat_map(|batch|batch.rows())
+            .collect::<Vec<_>>();
+        let pruned_profile=pruned.profile();
+        assert_eq!(pruned_rows.len(),11);
+        assert_eq!(pruned_profile.capsules_considered,3);
+        assert_eq!(pruned_profile.capsules_skipped,1);
+        assert_eq!(pruned_profile.capsules_read,2);
+
+        // A legacy ANF segment adds rows outside Chronicle/Capsule lineage.
+        // The same query must fall back to the authoritative table scanner.
+        db.insert_batch("telemetry",&[vec![
+            Value::TimestampMicros(22),
+            Value::Utf8("legacy-anf".into()),
+            Value::Float64(22.0),
+        ]]).unwrap();
+        assert!(!db.capsules_cover_chronicle("telemetry").unwrap());
+
+        let mut guarded=execute_vectorized_with_options(
+            &db,&query,&bindings,4,ResourceLimits::default(),
+            Arc::new(AtomicBool::new(false)),options,
+        ).unwrap();
+        let guarded_rows=guarded.by_ref()
+            .collect::<Result<Vec<_>,_>>()
+            .unwrap()
+            .iter()
+            .flat_map(|batch|batch.rows())
+            .collect::<Vec<_>>();
+        let guarded_profile=guarded.profile();
+        assert_eq!(guarded_profile.capsules_read,0);
+        assert_eq!(guarded_rows.len(),12);
+        assert!(guarded_rows.iter().any(|row|row[0]==Value::Utf8("legacy-anf".into())));
+
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn vectorized_aql_uses_projection_pushdown_filter_and_limit(){

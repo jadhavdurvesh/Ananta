@@ -66,11 +66,11 @@ The analysis scan can read the full table. TableStatistics supports a versioned 
 
 ## 7. Capsule / Navigation Map pruning boundary
 
-Capsules and Navigation Maps are derived analytical artifacts. A table may contain Chronicle rows not represented in a particular Capsule generation. Therefore, an AQL table query must not replace a full table scan with a Capsule-only scan unless complete and current coverage can be proven for that table and snapshot. M5.4 does not yet enable Capsule pruning for ordinary AQL table queries.
+Capsules and Navigation Maps are derived analytical artifacts. A table may contain Chronicle rows not represented in a particular Capsule generation. Therefore, an AQL table query must not replace a full table scan with a Capsule-only scan unless complete and current coverage can be proven for that table and snapshot. The scalar AQL execute path continues to use its bounded base-table scan. The separate vectorized AQL path may use Capsule/Navigation Map pruning for extracted timestamp ranges only when the core proves contiguous non-overlapping Capsule coverage of every Chronicle sequence and accepted row, no standalone legacy ANF file remains, a map generation is configured, and materialisation row/byte caps are met. Any failed check causes a fallback to the authoritative table scan.
 
 ## 8. Validation
 
-Tests compare native execution with optimizer-disabled reference execution on supported SELECT queries, verify computed projections fall back, exercise NULL behavior, aliases/repeated projections, cancellation, explain decisions and safe LIMIT pushdown. The workspace CI runs formatting, tests, Clippy, native examples and storage benchmarks.
+Tests compare native execution with optimizer-disabled reference execution on supported SELECT queries, verify computed projections fall back, exercise NULL behavior, aliases/repeated projections, cancellation, explain decisions, safe LIMIT pushdown, and vectorized Capsule pruning equivalence with fallback after a legacy ANF insert. The workspace CI runs formatting, tests, Clippy, native examples and storage benchmarks.
 
 ## 9. Non-goals
 

@@ -629,7 +629,7 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 - [x] Add versioned, checksummed statistics snapshot encode/decode and caller-managed save/load.
 - [x] Build bounded deterministic sample histograms (256-value sample, up to 16 buckets) and use them for numeric/timestamp range selectivity.
 - [ ] Persist statistics automatically in the database catalog and implement a broader cost-based physical planner.
-- [ ] Integrate time/Capsule pruning only with verified complete-coverage semantics.
+- [x] Integrate time/Capsule pruning behind verified Chronicle sequence/row coverage, legacy-ANF exclusion, map-generation and materialisation-limit gates.
 - [x] Add optimizer-disabled reference execution and compare simple optimized query results.
 - [x] Test aliases/repeated projections, NULL predicates, computed-expression fallback and safe LIMIT decisions.
 - [x] Record measured decoded scan input batches, rows and value bytes alongside returned output metrics.
@@ -638,7 +638,7 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 
 Specification: docs/specifications/physical-planning-v0.1.md.
 
-**M5.4 scope note:** AQL direct-column projections and supported predicates use native scan/filter/project/limit operators. Computed projection expressions fall back to the original evaluator. Cardinality/byte figures are heuristic, while analyze_table performs an explicit bounded full scan. Capsule pruning is not enabled for ordinary AQL table queries because full coverage of derived Capsules cannot yet be proven.
+**M5.4 scope note:** AQL direct-column projections and supported predicates use native scan/filter/project/limit operators. Computed projection expressions fall back to the original evaluator. Cardinality/byte figures are heuristic, while analyze_table performs an explicit bounded full scan. Vectorized time-range queries may use Capsule/Navigation Map pruning only after the core proves complete Chronicle coverage and excludes legacy ANF files; otherwise they fall back to the authoritative table scan.
 
 ## M5 exit gate
 - [x] First AQL queries execute through native operators.
