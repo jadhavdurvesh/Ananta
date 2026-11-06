@@ -328,6 +328,8 @@ pub(crate) enum WalRecoveryCrashPoint {
     AfterBackupFileSynced,
     AfterBackupManifestSynced,
     AfterBackupDirectoryRenamedBeforeSync,
+    AfterCheckpointArchiveRemoved,
+    AfterCheckpointRetentionDirectorySynced,
 }
 
 #[cfg(test)]
