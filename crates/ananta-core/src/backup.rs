@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,7 +38,6 @@ pub(crate) fn create_backup(source: &Path, destination: &Path) -> io::Result<Bac
     let destination = prepare_new_destination(&source, destination)?;
     let parent = destination.parent().ok_or_else(|| invalid("backup destination has no parent"))?;
     let staging = unique_sibling(parent, destination.file_name().ok_or_else(|| invalid("invalid backup destination name"))?, "backup")?;
-    fs::create_dir(&staging)?;
 
     let result = (|| {
         let mut entries = Vec::new();
@@ -69,7 +68,6 @@ pub(crate) fn restore_backup(backup: &Path, destination: &Path) -> io::Result<Ba
     let destination = prepare_new_destination(&backup, destination)?;
     let parent = destination.parent().ok_or_else(|| invalid("restore destination has no parent"))?;
     let staging = unique_sibling(parent, destination.file_name().ok_or_else(|| invalid("invalid restore destination name"))?, "restore")?;
-    fs::create_dir(&staging)?;
 
     let result = (|| {
         for entry in &entries {
@@ -156,9 +154,10 @@ fn unique_sibling(parent: &Path, name: &std::ffi::OsStr, kind: &str) -> io::Resu
             .map_err(|_| invalid("system clock is before Unix epoch"))?
             .as_nanos();
         let candidate = parent.join(format!(".{base}.{kind}-{nonce}-{attempt}.tmp"));
-        if fs::create_dir(&candidate).is_ok() {
-            fs::remove_dir(&candidate)?;
-            return Ok(candidate);
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
         }
     }
     Err(io::Error::new(io::ErrorKind::AlreadyExists, "could not allocate a unique staging directory"))
