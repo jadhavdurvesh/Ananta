@@ -36,10 +36,10 @@ A stale lock must never be removed solely because the PID looks old or cannot be
 
 Read methods accepting shared references do not mutate the WAL writer or catalog. ScanBatchIter is pull-based; abandoning a scan by dropping the iterator stops further reads. There is no public long-running transaction or lock-wait API requiring transaction timeout semantics yet.
 
-The concurrent-reader unit test exercises multiple scans through one shared Database handle. Multi-process read tests, high-contention stress, and platform-specific filesystem/lock behavior remain additional validation requirements.
+The concurrent-reader unit test exercises multiple scans through one shared Database handle. A subprocess lock probe is repeated five times while the parent owns the database and verifies that every second process is denied. Multi-process read sharing is not supported by the exclusive-owner contract; platform-specific filesystem/lock behavior and high-contention single-writer stress remain additional validation requirements.
 
 ## 5. Durability guarantees
 
 The supported per-operation durability boundary is documented in the WAL recovery specification. ANWL COMMIT is synced before immutable artifact publication. Recovery validates checksums and embedded identities and fails closed if a committed artifact cannot be recovered without conflict.
 
-This is not a claim of physical power-loss immunity on every filesystem/device, nor general ACID semantics for arbitrary sequences of API calls. The current database retains the complete WAL and does not rotate/truncate it. Checkpointing and log-prefix reclamation remain disabled until a durable checkpoint captures all replay-relevant state and the complete crash matrix is validated.
+This is not a claim of physical power-loss immunity on every filesystem/device, nor general ACID semantics for arbitrary sequences of API calls. ANCP v1 checkpoints fingerprint stable database artifacts and anchor an atomically replaced ANWL log on Unix. The checkpoint frame uses the prior WAL high-water sequence plus one; future sequence-derived IDs continue monotonically. Old checkpoint manifests are retained and not pruned. Windows atomic replacement is not yet implemented, so checkpoint rotation returns unsupported there without changing the active WAL.

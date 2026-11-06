@@ -5,7 +5,7 @@
 
 ## 1. Scope and guarantee boundary
 
-The WAL module provides versioned append-only record framing, checksums, sequence validation, transaction markers, append/sync policies, and incomplete-tail detection. Database::insert_batch and Database::ingest_batch now write AMUT intents and use startup redo for immutable ANF/Chronicle artifact publication. Catalog DDL, compaction/Weave publication, checkpoint installation and general multi-operation transactions are not yet WAL-backed.
+The WAL module provides versioned record framing, checksums, sequence validation, transaction markers, append/sync policies, incomplete-tail detection, and checkpoint anchors. ANWL redo is integrated for ANF/Chronicle, supported catalog DDL, active-Weave pointer changes, compaction candidate publication, Capsules and Navigation Maps. ANCP v1 checkpoints and Unix atomic WAL rotation are implemented; general multi-operation application transactions remain outside the guarantee boundary.
 
 The WAL stores opaque mutation payloads. Their operation-specific schemas and replay handlers belong to the database/recovery layer, not the framing layer.
 
@@ -29,7 +29,7 @@ Record content fields:
 
 | Offset | Width | Field |
 |---:|---:|---|
-| 0 | 8 | Monotonic sequence number, starting at 1 |
+| 0 | 8 | Monotonic sequence number; fresh logs start at 1 and a rotated log starts with checkpoint base sequence + 1 |
 | 8 | 8 | Transaction ID; zero reserved for CHECKPOINT |
 | 16 | 1 | Record kind |
 | 17 | variable | Opaque payload |
@@ -68,7 +68,7 @@ WalWriter appends frames in sequence order and validates transaction state befor
 - **OnCommit:** COMMIT and CHECKPOINT synchronise all preceding WAL data using sync_data.
 - **EveryRecord:** every frame is synchronised before append returns.
 
-A newly created WAL writes and synchronises its file header. Directory-entry durability, WAL rotation, segment ordering and catalog publication ordering are reserved for database integration.
+A newly created WAL writes and synchronises its file header. Directory-entry durability, segment ordering and catalog publication ordering are enforced by database integration. Unix WAL rotation uses an ANCP manifest and an atomic same-directory rename; other platforms fail closed until atomic replacement is implemented.
 
 ## 6. Reader and incomplete-tail behavior
 
@@ -101,6 +101,7 @@ The WAL tests cover header creation and transaction/commit/checkpoint round trip
 
 - Only immutable ANF insert and Chronicle ingest artifacts are covered by the initial WAL redo protocol.
 - Catalog DDL, compaction manifests, active-Weave swaps, Capsule and Navigation Map publication are not WAL-backed.
-- No WAL rotation, checkpoint installation or retention policy is implemented.
+- ANCP checkpoint installation and Unix WAL rotation are implemented.
+- Checkpoint-manifest pruning/retention and Windows atomic replacement remain unsupported.
 - No concurrent writers; the existing database-wide exclusive writer lock remains unchanged.
 - No general multi-operation ACID transaction guarantee is claimed.

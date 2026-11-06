@@ -7,19 +7,20 @@
 
 M6.1 supplies an ANWL v1 append log with checksummed frames, contiguous sequence validation, BEGIN/MUTATION/COMMIT/ABORT state tracking, sync policies and torn-tail truncation.
 
-This document specifies the first safe database integration. Until implementation and fault-injection tests are complete, the database does NOT claim WAL-backed crash recovery, transaction atomicity, or ACID semantics. The integration scope includes immutable ANF inserts and Chronicle ingests, supported catalog DDL, active-Weave pointer snapshots, immutable compaction candidate manifests, Capsules and Navigation Maps. Multi-operation application transactions remain outside the replay boundary.
+The current safe integration uses redo for immutable ANF inserts, Chronicle ingests, supported catalog DDL, active-Weave pointer snapshots, immutable compaction candidate manifests, Capsules and Navigation Maps. Recovery claims are limited to these documented operation boundaries and remain subject to the stated filesystem/platform validation. The engine does not claim general multi-operation transaction atomicity or ACID semantics.
 
 ## 2. Recovery model
 
-The current database integration is redo-only for immutable ANF/Chronicle data-file publication:
+The database integration is redo-oriented for immutable artifact publication and the documented catalog/Weave pointer metadata operations:
 
 - A committed WAL transaction is authoritative intent to make each listed immutable artifact visible at its canonical final name.
 - An uncommitted transaction has no committed data effect. Any staging files owned by its intents are discarded.
 - A replayed committed intent is idempotent: an already-published final file is accepted only when its exact length and SHA-256 match the WAL intent.
 - Recovery never overwrites a different final file and never silently skips a committed intent whose staged and final files are both missing or invalid.
-- After committed artifacts have been published, Chronicle indexes are rebuilt from disk so receipts and ingestion sequence state agree with the recovered file inventory.
+- Catalog/schema snapshots, compaction candidates and active Weave pointer state are applied in WAL order; after committed data artifacts are published, Chronicle indexes are rebuilt from disk so receipts and ingestion sequence state agree with the recovered file inventory.
+- A validated ANCP checkpoint can replace the WAL prefix on Unix; the checkpoint inventory establishes the committed state through its base sequence and every later WAL intent is replayed normally.
 
-This is not general undo/redo for arbitrary in-place mutations. It works because the first target operations publish new immutable files and do not mutate existing segment contents.
+This is not general undo/redo for arbitrary in-place mutations. The supported publication protocols use immutable artifacts or separately defined atomic metadata replacement operations; other mutations are outside the guarantee boundary.
 
 ## 3. Mutation intent envelope
 
@@ -113,7 +114,7 @@ Table drop, Capsule and Navigation Map creation are not covered by the DDL integ
 
 ## 9. Checkpoint and log retention
 
-M6.2 must first complete deterministic replay. WAL truncation/rotation is intentionally not defined here. A CHECKPOINT record must not cause old intent frames to be deleted until a checksummed checkpoint state has been atomically published and recovery can prove it covers every committed transaction through the checkpoint sequence. Retention and directory fsync semantics remain separate tasks.
+ANCP v1 checkpoint installation and Unix WAL rotation are specified in Section 17. A checkpoint marker is accepted only when it is the unique first frame in the active WAL, its sequence equals the manifest base sequence plus one, its referenced manifest is checksummed, and the manifest's artifact inventory validates. The checkpoint captures stable artifact state through the base sequence; all later transactions remain in the rotated WAL and replay normally. Checkpoint manifests are retained and are not pruned. Atomic replacement is unsupported on non-Unix platforms.
 
 ## 10. Required validation
 
@@ -145,7 +146,7 @@ The core recovery module now provides staging, publishing and discard helpers. S
 
 The recover_staged_artifacts driver consumes a verified WAL report, publishes all committed intents, discards only staging names owned by incomplete transactions, appends explicit ABORT records, and syncs those markers. Its tests cover committed replay, repeat replay, incomplete cleanup, missing committed artifacts, conflicting final checksums and canonical file derivation.
 
-The helpers are invoked by `Database::open`, `insert_batch`, `ingest_batch` and the shared catalog DDL publication path. The test suite includes deterministic interruption coverage and child-process termination cases; execution of the newly added DDL tests remains outstanding in the current environment.
+The helpers are invoked by `Database::open`, ANF/Chronicle writes, catalog DDL, active Weave pointer changes, compaction candidate publication, Capsule publication and Navigation Map publication. The test suite includes deterministic interruption coverage and child-process termination cases; the tests have not been executed in the current environment.
 
 
 ## Initial Database integration status
@@ -154,7 +155,7 @@ The core Database owns a WAL writer at catalog-independent path `wal/database.an
 
 Database::insert_batch and Database::ingest_batch now stage and sync complete immutable artifacts, append AMUT v1 BEGIN/MUTATION/COMMIT intent records using OnCommit sync, and publish the final filename with no-replace semantics. A failed/uncertain WAL or final-publication outcome marks the current Database handle recovery-required; data-facing APIs reject further use through that handle and ask the caller to reopen.
 
-Integration tests cover normal ANF/Chronicle close/reopen, deterministic interruptions across their staging/WAL/publication boundaries, subprocess termination around WAL commit/publication, catalog DDL replay and DDL publication crash points. DDL subprocess tests were added but not executed in the current environment. Compaction/Weave/Capsule/Navigation Map publication and checkpoint/rotation remain open. This is not a general ACID transaction implementation.
+Integration tests cover normal ANF/Chronicle close/reopen, deterministic interruption boundaries, subprocess recovery for ANF/Chronicle and DDL, WAL-backed compaction/Weave/Capsule/Navigation Map publication, ANCP checkpoint creation/rotation, and backup/restore interruption boundaries. These tests have been added but have not been executed in the current environment. This is not a general ACID transaction implementation.
 
 
 The current Database integration synchronises the WAL directory after header creation, and synchronises the data root/table directory before catalog DDL COMMIT as well as before staged data publication. Directory fsync is applied on platforms that support it.
@@ -214,7 +215,7 @@ The DDL path encodes the full candidate catalog snapshot and the affected immuta
 
 The current DDL crash suite covers pre-COMMIT interruption after staging file creation/write/flush/file sync/directory sync, after WAL BEGIN and after the first mutation (confirming no table becomes visible and staging is cleaned), plus `create_table` after COMMIT, after schema publication, after versioned catalog publication, after the canonical replacement temp has been synced, after atomic rename but before catalog-directory sync, and after completed canonical catalog replacement. Each case reopens twice and checks catalog/schema revisions and snapshot consistency. Child-process termination covers the same six DDL publication boundaries. The replacement-temp crash case verifies startup removes the stale temp under the writer lock and replays the committed snapshot. The pre-existing catalog-temp collision regression verifies that a known publication blocker is rejected before WAL COMMIT and leaves no orphan schema snapshot.
 
-The DDL tests were added to the repository but have not been executed in the current development environment. These process-exit and in-process interruption tests do not constitute physical power-loss or storage-controller cache-loss validation. Compaction/active-Weave/Capsule/Navigation Map WAL intents and checkpoint/rotation/retention remain open.
+The DDL and later M6 process-exit/in-process interruption tests have been added but have not been executed in the current development environment. These tests do not constitute physical power-loss or storage-controller cache-loss validation. Cross-platform and broader filesystem fault injection remain open.
 
 
 ## 14. Active Weave pointer WAL integration
@@ -225,7 +226,7 @@ Startup replays committed pointer revisions in WAL order after catalog metadata 
 
 If startup detects that an active generation is damaged but a retained previous generation verifies, the fallback pointer revision is itself committed to the WAL. This prevents recovery from silently changing the active generation outside the log.
 
-The existing compaction integration test now injects interruption after versioned pointer publication, immediately after WAL COMMIT for a later promotion, and after canonical pointer rename but before directory fsync during rollback. Reopen is expected to restore/verify the committed pointer and preserve logical scans. These tests are committed but have not been executed here. The immutable candidate directory rename and OWM1 manifest publication still occur outside WAL and remain the next compaction-publication task.
+The existing compaction integration test injects interruption after versioned pointer publication, immediately after WAL COMMIT for a later promotion, and after canonical pointer rename but before directory fsync during rollback. Reopen restores/verifies the committed pointer and preserves logical scans. Immutable candidate directory rename and OWM1 manifest publication are also WAL-backed. These tests are committed but have not been executed here.
 
 
 ## 15. Immutable compaction candidate publication
@@ -247,8 +248,23 @@ AMUT v1 has a fixed-size identity envelope. For a Capsule intent, `table_id` is 
 
 For a Navigation Map intent, `table_id` is the stable TableId, `file_id` is the map generation, and `schema_revision` remains the current logical schema revision. Recovery decodes the map against the logged TableId/generation, then checks every referenced Capsule is a regular file of the recorded length, matches its SHA-256, decodes successfully, and has metadata identical to the map entry. Missing or conflicting dependencies fail open; the map is never treated as authoritative data.
 
-Both builders reject an already-existing immutable generation before committing another intent. In-process and subprocess crash/reopen tests cover both artifact types. Child-process termination is exercised at WAL MUTATION (incomplete transaction), durable COMMIT and final-name link before directory sync; recovery checks artifact/data state, consistency, and a second reopen. The full subprocess matrix for every staging/flush/file-sync/directory-sync/cleanup checkpoint and broader filesystem fault injection remains outstanding. These tests have been added but were not executed in this environment.
+Both builders reject an already-existing immutable generation before committing another intent. In-process and subprocess crash/reopen tests cover both artifact types. Child-process termination is exercised at WAL MUTATION (incomplete transaction), durable COMMIT and final-name link before directory sync; recovery checks artifact/data state, consistency, and a second reopen. Subprocess coverage now exercises all 12 staging/flush/file-sync/directory-sync/WAL/final-publication/cleanup checkpoints for both Capsule and Navigation Map builders. Broader filesystem fault injection remains outstanding. These tests have been added but were not executed in this environment.
 
-## 17. Checkpoint and retention boundary
+## 17. ANCP checkpoint installation and ANWL rotation
 
-ANWL checkpoint frame support exists at the framing layer, but database checkpoint installation, replay truncation, WAL rotation and retention are not enabled. The database continues to retain its complete WAL history and replays it from the beginning. This is deliberate: log truncation is not safe until a durable checkpoint captures every replay-relevant state transition (including DDL, data, Weave/OWM, Capsule and Navigation Map references) and recovery validates the checkpoint before discarding any prefix. No checkpoint or WAL-retention guarantee is claimed.
+ANCP v1 is an immutable checkpoint manifest under `wal/checkpoints/checkpoint-{base_sequence}.anck`. It records the checkpoint base sequence, current catalog revision and a sorted inventory of the stable artifacts that form the database state: ANF, Chronicle, Capsule, Navigation Map, schema/catalog snapshots, versioned Active Weave pointers, OWM1 manifests and immutable Weave data/provenance/input files. Every entry stores a canonical relative path, exact byte length and SHA-256. The manifest itself has a SHA-256 trailer and bounded entry/path/size limits.
+
+Mutable canonical state (`catalog/catalog.anc` and each `active.awp`) is also fingerprinted. During startup validation, a mismatch is permitted only when the post-checkpoint WAL contains a committed CatalogSnapshot or ActiveWeavePointer intent for that state. Those intents are then replayed in WAL order and perform their ordinary format/identity validation. Otherwise the canonical mutable file must still match the checkpoint fingerprint.
+
+Checkpoint installation requires an operational handle, a clean WAL, no incomplete transaction, a successful bounded consistency pass and no staging/temp artifacts. The implementation:
+1. Builds the ANCP manifest from the current database state.
+2. Writes a checkpoint-specific temporary manifest, flushes/syncs it, publishes it with a no-replace hard link and syncs the checkpoint directory.
+3. Encodes a fixed ANCPREF1 reference (base sequence, catalog revision, manifest length and SHA-256) as the payload of an ANWL CHECKPOINT frame.
+4. Writes a new ANWL header plus a CHECKPOINT frame at `base_sequence + 1` to a sibling temporary file, syncs it and the WAL directory. The marker preserves the global WAL sequence high-water mark so future transaction IDs and sequence-derived artifact IDs cannot be reused.
+5. Atomically replaces `database.anwl` with the new file using POSIX rename, then syncs the WAL directory and reopens the new writer at `base_sequence + 2`.
+
+The original WAL path remains authoritative until the atomic rename. A process stop before rename leaves the original log usable; stale checkpoint temporary files are removed under the exclusive writer lock. A stop after rename leaves a durable manifest available to validate the new anchor. The replacement WAL begins with the CHECKPOINT record at the previous high-water sequence plus one. Every later transaction continues contiguously from the next sequence; rotation never resets transaction IDs or sequence-derived artifact IDs. The checkpoint inventory is verified before replay. WAL prefix history before the checkpoint is therefore no longer needed after the manifest and replacement log are durable.
+
+Subprocess tests cover stop after checkpoint-manifest temp sync, after manifest publication, after replacement-WAL temp sync, after WAL rename before directory sync, and after directory sync. Additional tests cover successful rotation followed by new writes/reopen, a post-checkpoint DDL commit, and fail-closed detection of a changed checkpointed immutable file.
+
+Atomic replacement is currently implemented only on Unix. On other platforms `Database::create_checkpoint` returns an unsupported error and leaves the database usable; it does not use an unsafe delete-then-rename fallback. Checkpoint archive pruning/retention is not yet implemented: old ANCP manifests are retained. Physical power-loss/device-cache validation and large-database stress remain open. The full Rust test suite has not been executed in the current environment.

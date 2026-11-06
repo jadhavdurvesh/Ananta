@@ -263,6 +263,105 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Atomically replace the current WAL with a new log whose first frame
+    /// anchors a separately synced, checksummed database checkpoint manifest.
+    ///
+    /// This operation is currently enabled on Unix, where rename atomically
+    /// replaces the existing pathname while the old file handle remains open.
+    /// Other targets fail closed until a platform-specific atomic replace is
+    /// implemented; they never emulate replacement with delete-then-rename.
+    pub(crate) fn replace_with_checkpoint(&mut self, base_sequence: u64, payload: &[u8]) -> Result<(), WalError> {
+        self.ensure_healthy()?;
+        if !self.active_transactions.is_empty() {
+            return Err(WalError::InvalidRecord(
+                "WAL rotation requires no open transactions".into(),
+            ));
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = payload;
+            return Err(WalError::Io(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "atomic WAL replacement is not implemented on this platform",
+            )));
+        }
+
+        #[cfg(unix)]
+        {
+            self.file.sync_all()?;
+            let parent = self.path.parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let filename = self.path.file_name()
+                .ok_or(WalError::InvalidHeader)?
+                .to_string_lossy();
+            let temporary = parent.join(format!(".{filename}.checkpoint.tmp"));
+
+            match fs::symlink_metadata(&temporary) {
+                Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(&temporary)?,
+                Ok(_) => return Err(WalError::InvalidRecord(
+                    "WAL checkpoint temporary path is not a regular file".into(),
+                )),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(WalError::Io(error)),
+            }
+
+            let checkpoint_sequence = base_sequence
+                .checked_add(1)
+                .ok_or(WalError::SequenceOverflow)?;
+            if self.next_sequence != checkpoint_sequence {
+                return Err(WalError::InvalidRecord(
+                    "checkpoint base sequence differs from the WAL high-water mark".into(),
+                ));
+            }
+            let checkpoint = WalRecord {
+                sequence: checkpoint_sequence,
+                transaction_id: 0,
+                kind: WalRecordKind::Checkpoint,
+                payload: payload.to_vec(),
+            };
+            apply_transaction_record(&mut BTreeMap::new(), &checkpoint)?;
+            let encoded = encode_record(&checkpoint)?;
+            let mut staged = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            staged.write_all(FILE_MAGIC)?;
+            staged.write_all(&FILE_VERSION.to_le_bytes())?;
+            staged.write_all(&(FILE_HEADER_LEN as u16).to_le_bytes())?;
+            staged.write_all(&encoded)?;
+            staged.flush()?;
+            staged.sync_all()?;
+            drop(staged);
+            sync_wal_directory(parent)?;
+            crate::wal_recovery::maybe_crash_after(
+                crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointTempSynced,
+            );
+
+            // POSIX rename atomically replaces the WAL directory entry. Until
+            // this point the old complete log remains the authoritative path.
+            fs::rename(&temporary, &self.path)?;
+            crate::wal_recovery::maybe_crash_after(
+                crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointRenamedBeforeDirectorySync,
+            );
+            sync_wal_directory(parent)?;
+            crate::wal_recovery::maybe_crash_after(
+                crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointDirectorySync,
+            );
+
+            let replacement = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&self.path)?;
+            self.file = replacement;
+            self.next_sequence = base_sequence.checked_add(2).ok_or(WalError::SequenceOverflow)?;
+            self.active_transactions.clear();
+            self.poisoned = false;
+            Ok(())
+        }
+    }
+
     fn append(
         &mut self,
         kind: WalRecordKind,
@@ -311,6 +410,11 @@ impl WalWriter {
             Ok(())
         }
     }
+}
+
+#[cfg(unix)]
+fn sync_wal_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
 }
 
 /// Read and verify a WAL. Complete frames are checksum/sequence/transaction
@@ -400,16 +504,23 @@ pub fn read_wal(path: impl AsRef<Path>) -> Result<WalReadReport, WalError> {
         let sequence = u64::from_le_bytes(
             content[0..8].try_into().map_err(|_| WalError::Corrupt("invalid sequence"))?,
         );
-        let expected_sequence = report.last_sequence
-            .checked_add(1)
-            .ok_or(WalError::SequenceOverflow)?;
-        if sequence != expected_sequence {
-            return Err(WalError::Corrupt("sequence is not contiguous"));
-        }
         let transaction_id = u64::from_le_bytes(
             content[8..16].try_into().map_err(|_| WalError::Corrupt("invalid transaction ID"))?,
         );
         let kind = WalRecordKind::from_byte(content[16])?;
+        let expected_sequence = if report.records.is_empty()
+            && kind == WalRecordKind::Checkpoint
+            && transaction_id == 0
+        {
+            // A rotated WAL begins with its checkpoint at the previous
+            // high-water mark plus one, preserving globally monotonic IDs.
+            sequence
+        } else {
+            report.last_sequence.checked_add(1).ok_or(WalError::SequenceOverflow)?
+        };
+        if sequence == 0 || sequence != expected_sequence {
+            return Err(WalError::Corrupt("sequence is not contiguous"));
+        }
         let payload = content[17..].to_vec();
         let record = WalRecord {
             sequence,

@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 pub mod schema_snapshot;
 pub mod backup;
 pub use backup::BackupReport;
+pub mod wal_checkpoint;
+pub use wal_checkpoint::CheckpointReport;
 mod nullable_ddl;
 mod column_rename_reorder;
 mod segment_publication;
@@ -465,6 +467,7 @@ impl Database {
         // synchronised by WalWriter::open; syncing wal_dir persists that name.
         let wal_dir = root.join("wal");
         fs::create_dir_all(&wal_dir)?;
+        cleanup_stale_checkpoint_temp(&wal_dir)?;
         sync_recovery_directory(&root)?;
         sync_recovery_directory(&wal_dir)?;
         let wal_path = wal_dir.join("database.anwl");
@@ -473,6 +476,7 @@ impl Database {
         sync_recovery_directory(&wal_dir)?;
         let wal_report = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
+        validate_checkpoint_records(&root, &wal_report, &catalog)?;
         let committed_catalog_revisions = build_recovery_plan(&wal_report)
             .map_err(|error| DbError::Wal(error.to_string()))?
             .committed
@@ -667,6 +671,7 @@ impl Database {
         let wal_path = self.root.join("wal").join("database.anwl");
         let wal_report = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
+        validate_checkpoint_records(&self.root, &wal_report, &self.catalog)?;
         let recovery_plan = build_recovery_plan(&wal_report)
             .map_err(|error| DbError::Wal(error.to_string()))?;
         if !wal_report.is_clean() || !recovery_plan.incomplete.is_empty() {
@@ -750,7 +755,64 @@ impl Database {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
                 Err(error) => return Err(DbError::Io(error)),
             }
+            self.validate_active_weave_integrity(table)?;
             report.tables_checked = report.tables_checked.checked_add(1).ok_or(DbError::LengthOverflow)?;
+        }
+        Ok(report)
+    }
+
+    /// Install a durable checkpoint and atomically rotate the active ANWL log.
+    ///
+    /// The checkpoint manifest is synced first and fingerprints the immutable
+    /// storage/schema artifacts that form the database state at this boundary.
+    /// The replacement WAL contains a single sequence-1 CHECKPOINT frame that
+    /// references the manifest; subsequent transactions are replayed after it.
+    /// Full replay is retained for every transaction written after the marker.
+    pub fn create_checkpoint(&mut self) -> Result<CheckpointReport, DbError> {
+        #[cfg(not(unix))]
+        {
+            return Err(DbError::Wal(
+                "atomic WAL checkpoint rotation is currently supported only on Unix".into(),
+            ));
+        }
+        self.ensure_operational()?;
+        let consistency = self.check_consistency(1024)?;
+        if !consistency.inventory.temporary_files.is_empty() {
+            return Err(DbError::Wal(
+                "checkpoint refused while staging/temp artifacts remain".into(),
+            ));
+        }
+        let wal_path = self.root.join("wal").join("database.anwl");
+        let current = read_wal(&wal_path)
+            .map_err(|error| DbError::Wal(error.to_string()))?;
+        if !current.is_clean() || !self.wal.incomplete_transaction_ids().is_empty() {
+            return Err(DbError::Wal("checkpoint requires a clean WAL with no open transactions".into()));
+        }
+        let (reference, report) = crate::wal_checkpoint::create_checkpoint(
+            &self.root,
+            current.last_sequence,
+            self.catalog.revision,
+        ).map_err(|error| DbError::Wal(format!("checkpoint snapshot failed: {error}")))?;
+        if let Err(error) = self.wal.replace_with_checkpoint(current.last_sequence, &reference.encode()) {
+            if matches!(&error, WalError::Io(io_error) if io_error.kind() == std::io::ErrorKind::Unsupported) {
+                return Err(DbError::Wal(error.to_string()));
+            }
+            self.recovery_required = true;
+            return Err(DbError::RecoveryRequired(format!(
+                "checkpoint WAL replacement was uncertain: {error}",
+            )));
+        }
+        let rotated = read_wal(&wal_path)
+            .map_err(|error| DbError::Wal(error.to_string()))?;
+        validate_checkpoint_records(&self.root, &rotated, &self.catalog)?;
+        if rotated.records.len() != 1
+            || rotated.last_sequence != current.last_sequence.saturating_add(1)
+            || !rotated.is_clean()
+        {
+            self.recovery_required = true;
+            return Err(DbError::RecoveryRequired(
+                "rotated WAL did not reopen as a clean checkpoint anchor".into(),
+            ));
         }
         Ok(report)
     }
@@ -2706,6 +2768,112 @@ fn validate_catalog(catalog: &Catalog) -> Result<(), DbError> {
     }
     if catalog.next_object_id <= max_id {
         return Err(DbError::CorruptCatalog("next object ID is not greater than allocated IDs"));
+    }
+    Ok(())
+}
+
+fn cleanup_stale_checkpoint_temp(wal_directory: &Path) -> Result<(), DbError> {
+    let path = wal_directory.join(".database.anwl.checkpoint.tmp");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::remove_file(&path)?;
+            sync_recovery_directory(wal_directory)?;
+        }
+        Ok(_) => return Err(DbError::Wal(
+            "WAL checkpoint temporary path is not a regular file".into(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DbError::Io(error)),
+    }
+    let checkpoints = wal_directory.join("checkpoints");
+    match fs::read_dir(&checkpoints) {
+        Ok(entries) => {
+            let mut removed = false;
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let text = name.to_string_lossy();
+                if !text.starts_with(".checkpoint-") || !text.ends_with(".tmp") {
+                    continue;
+                }
+                let metadata = entry.file_type()?;
+                if !metadata.is_file() {
+                    return Err(DbError::Wal(
+                        "checkpoint staging path is not a regular file".into(),
+                    ));
+                }
+                fs::remove_file(entry.path())?;
+                removed = true;
+            }
+            if removed {
+                sync_recovery_directory(&checkpoints)?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DbError::Io(error)),
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_records(
+    root: &Path,
+    report: &WalReadReport,
+    catalog: &Catalog,
+) -> Result<(), DbError> {
+    let checkpoints = report.records.iter()
+        .filter(|record| record.kind == WalRecordKind::Checkpoint)
+        .collect::<Vec<_>>();
+    if checkpoints.is_empty() {
+        return Ok(());
+    }
+    if checkpoints.len() != 1 || report.records.first().map_or(true, |record| {
+        record.kind != WalRecordKind::Checkpoint
+    }) || checkpoints[0].transaction_id != 0
+    {
+        return Err(DbError::Wal(
+            "checkpoint must be the unique first frame in a rotated WAL".into(),
+        ));
+    }
+    let plan = build_recovery_plan(report)
+        .map_err(|error| DbError::Wal(error.to_string()))?;
+    let mut permitted_changed_paths = BTreeSet::new();
+    for transaction in &plan.committed {
+        for intent in &transaction.intents {
+            match intent.artifact_kind {
+                WalArtifactKind::CatalogSnapshot => {
+                    permitted_changed_paths.insert("catalog/catalog.anc".to_owned());
+                }
+                WalArtifactKind::ActiveWeavePointer => {
+                    let Some((table_name, _)) = catalog.tables.iter()
+                        .find(|(_, definition)| definition.id.0 == intent.table_id)
+                    else {
+                        return Err(DbError::Wal(format!(
+                            "checkpoint post-commit pointer has unknown TableId {}",
+                            intent.table_id,
+                        )));
+                    };
+                    permitted_changed_paths.insert(format!(
+                        "data/{table_name}/weaves/active.awp",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    let checkpoint = crate::wal_checkpoint::validate_checkpoint(
+        root,
+        &checkpoints[0].payload,
+        &permitted_changed_paths,
+    ).map_err(|error| DbError::Wal(format!("checkpoint validation failed: {error}")))?;
+    if checkpoints[0].sequence != checkpoint.base_sequence.checked_add(1).ok_or(DbError::LengthOverflow)? {
+        return Err(DbError::Wal(
+            "checkpoint WAL sequence does not follow its declared base sequence".into(),
+        ));
+    }
+    if checkpoint.catalog_revision > catalog.revision {
+        return Err(DbError::Wal(
+            "checkpoint catalog revision is newer than the loaded database catalog".into(),
+        ));
     }
     Ok(())
 }
@@ -6184,17 +6352,41 @@ mod tests {
         let point_name = std::env::var("ANANTA_WAL_CRASH_POINT").unwrap();
         use crate::wal_recovery::WalRecoveryCrashPoint::*;
         let point = match point_name.as_str() {
+            "AfterStagingFileCreated" => AfterStagingFileCreated,
+            "AfterStagingBytesWritten" => AfterStagingBytesWritten,
+            "AfterStagingFlush" => AfterStagingFlush,
+            "AfterStagingFileSync" => AfterStagingFileSync,
+            "AfterStagingDirectorySync" => AfterStagingDirectorySync,
+            "AfterWalBegin" => AfterWalBegin,
             "AfterWalMutation" => AfterWalMutation,
             "AfterWalCommit" => AfterWalCommit,
             "AfterFinalNameLinked" => AfterFinalNameLinked,
+            "AfterPublishDirectorySync" => AfterPublishDirectorySync,
+            "AfterStagingNameRemoved" => AfterStagingNameRemoved,
+            "AfterCleanupDirectorySync" => AfterCleanupDirectorySync,
             "AfterSchemaSnapshotPublished" => AfterSchemaSnapshotPublished,
             "AfterCatalogSnapshotPublished" => AfterCatalogSnapshotPublished,
             "AfterCanonicalCatalogPublished" => AfterCanonicalCatalogPublished,
             "AfterCanonicalCatalogTempSynced" => AfterCanonicalCatalogTempSynced,
             "AfterCanonicalCatalogRenamedBeforeDirectorySync" => AfterCanonicalCatalogRenamedBeforeDirectorySync,
+            "AfterCheckpointManifestTempSynced" => AfterCheckpointManifestTempSynced,
+            "AfterCheckpointManifestPublished" => AfterCheckpointManifestPublished,
+            "AfterCheckpointTempSynced" => AfterCheckpointTempSynced,
+            "AfterCheckpointRenamedBeforeDirectorySync" => AfterCheckpointRenamedBeforeDirectorySync,
+            "AfterCheckpointDirectorySync" => AfterCheckpointDirectorySync,
+            "AfterBackupFileSynced" => AfterBackupFileSynced,
+            "AfterBackupManifestSynced" => AfterBackupManifestSynced,
+            "AfterBackupDirectoryRenamedBeforeSync" => AfterBackupDirectoryRenamedBeforeSync,
             _ => panic!("unsupported subprocess crash point: {point_name}"),
         };
         let path = PathBuf::from(std::env::var_os("ANANTA_WAL_CRASH_DATABASE").unwrap());
+        if operation == "lock-probe" {
+            match Database::open(&path) {
+                Err(DbError::DatabaseLocked(_)) => return,
+                Err(error) => panic!("unexpected lock probe error: {error}"),
+                Ok(_) => panic!("a second process unexpectedly acquired the exclusive writer lock"),
+            }
+        }
         // Open and replay pre-existing transactions before arming the hook:
         // the checkpoint must target the operation under test, not startup.
         let mut database = Database::open(path).unwrap();
@@ -6223,6 +6415,13 @@ mod tests {
             }
             "navigation-map" => {
                 database.build_navigation_map("telemetry", 901).unwrap();
+            }
+            "checkpoint" => {
+                database.create_checkpoint().unwrap();
+            }
+            "backup" => {
+                let destination = PathBuf::from(std::env::var_os("ANANTA_WAL_CRASH_BACKUP").unwrap());
+                database.backup_to(destination).unwrap();
             }
             _ => panic!("unsupported subprocess operation: {operation}"),
         }
@@ -6424,13 +6623,268 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
+    fn exercise_checkpoint_process_crash(point: &str, rotated: bool) {
+        use std::process::Command;
+
+        let path = temp_path();
+        let rows = vec![vec![
+            Value::TimestampMicros(1_000),
+            Value::Utf8("checkpoint-source".into()),
+            Value::Float64(15.0),
+        ]];
+        let mut setup = Database::open(&path).unwrap();
+        setup.create_table("telemetry", sample_schema()).unwrap();
+        setup.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([0xC1; 16]).unwrap(),
+            &rows,
+        ).unwrap();
+        drop(setup);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::wal_recovery_process_crash_worker")
+            .arg("--nocapture")
+            .env("ANANTA_WAL_CRASH_OPERATION", "checkpoint")
+            .env("ANANTA_WAL_CRASH_POINT", point)
+            .env("ANANTA_WAL_CRASH_DATABASE", &path)
+            .env("ANANTA_WAL_CRASH_EXIT", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86), "checkpoint worker did not terminate at {point}");
+        fs::remove_file(path.join(".ananta.lock")).unwrap();
+
+        let mut recovered = Database::open(&path).unwrap();
+        assert_eq!(recovered.scan("telemetry").unwrap(), rows);
+        let wal_report = read_wal(path.join("wal").join("database.anwl")).unwrap();
+        assert_eq!(
+            wal_report.records.first().map(|record| record.kind == WalRecordKind::Checkpoint).unwrap_or(false),
+            rotated,
+            "checkpoint rotation state at {point}",
+        );
+        recovered.check_consistency(1).unwrap();
+        drop(recovered);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap(), rows);
+        reopened.check_consistency(1).unwrap();
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    fn exercise_backup_process_crash(point: &str, published: bool) {
+        use std::process::Command;
+
+        let root = temp_path();
+        let backup = temp_path();
+        let rows = vec![vec![
+            Value::TimestampMicros(3_000),
+            Value::Utf8("backup-crash-source".into()),
+            Value::Float64(18.0),
+        ]];
+        let mut setup = Database::open(&root).unwrap();
+        setup.create_table("telemetry", sample_schema()).unwrap();
+        setup.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([0xB4; 16]).unwrap(),
+            &rows,
+        ).unwrap();
+        drop(setup);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::wal_recovery_process_crash_worker")
+            .arg("--nocapture")
+            .env("ANANTA_WAL_CRASH_OPERATION", "backup")
+            .env("ANANTA_WAL_CRASH_POINT", point)
+            .env("ANANTA_WAL_CRASH_DATABASE", &root)
+            .env("ANANTA_WAL_CRASH_BACKUP", &backup)
+            .env("ANANTA_WAL_CRASH_EXIT", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86), "backup worker did not terminate at {point}");
+        fs::remove_file(root.join(".ananta.lock")).unwrap();
+
+        assert_eq!(backup.is_dir(), published, "backup publication state at {point}");
+        if published {
+            crate::backup::verify_backup(&backup).unwrap();
+            let restored = temp_path();
+            let report = Database::restore_backup(&backup, &restored).unwrap();
+            assert!(report.file_count >= 4);
+            let restored_db = Database::open(&restored).unwrap();
+            assert_eq!(restored_db.scan("telemetry").unwrap(), rows);
+            drop(restored_db);
+            fs::remove_dir_all(restored).unwrap();
+        } else {
+            let parent = backup.parent().unwrap_or(Path::new("."));
+            let prefix = format!(".{}.backup-", backup.file_name().unwrap().to_string_lossy());
+            for entry in fs::read_dir(parent).unwrap().filter_map(Result::ok) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&prefix) {
+                    fs::remove_dir_all(entry.path()).unwrap();
+                }
+            }
+        }
+        let source = Database::open(&root).unwrap();
+        assert_eq!(source.scan("telemetry").unwrap(), rows);
+        source.check_consistency(1).unwrap();
+        drop(source);
+        if published {
+            fs::remove_dir_all(&backup).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backup_publication_survives_process_crashes() {
+        exercise_backup_process_crash("AfterBackupFileSynced", false);
+        exercise_backup_process_crash("AfterBackupManifestSynced", false);
+        exercise_backup_process_crash("AfterBackupDirectoryRenamedBeforeSync", true);
+    }
+
+    #[test]
+    fn second_process_cannot_acquire_database_writer_lock() {
+        use std::process::Command;
+
+        let root = temp_path();
+        let database = Database::open(&root).unwrap();
+        for _ in 0..5 {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("tests::wal_recovery_process_crash_worker")
+                .arg("--nocapture")
+                .env("ANANTA_WAL_CRASH_OPERATION", "lock-probe")
+                .env("ANANTA_WAL_CRASH_POINT", "AfterWalCommit")
+                .env("ANANTA_WAL_CRASH_DATABASE", &root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "second process did not observe DatabaseLocked");
+        }
+        assert!(Database::inspect_lock(&root).unwrap().is_locked);
+        drop(database);
+        assert!(!Database::inspect_lock(&root).unwrap().is_locked);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_wal_replacement_survives_subprocess_crashes() {
+        exercise_checkpoint_process_crash("AfterCheckpointManifestTempSynced", false);
+        exercise_checkpoint_process_crash("AfterCheckpointManifestPublished", false);
+        exercise_checkpoint_process_crash("AfterCheckpointTempSynced", false);
+        exercise_checkpoint_process_crash("AfterCheckpointRenamedBeforeDirectorySync", true);
+        exercise_checkpoint_process_crash("AfterCheckpointDirectorySync", true);
+    }
+
+    #[test]
+    fn database_checkpoint_rotates_wal_and_replays_subsequent_commits() {
+        let path = temp_path();
+        let first_rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("before-checkpoint".into()),
+            Value::Float64(1.0),
+        ]];
+        let second_rows = vec![vec![
+            Value::TimestampMicros(2),
+            Value::Utf8("after-checkpoint".into()),
+            Value::Float64(2.0),
+        ]];
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([0xC2; 16]).unwrap(),
+            &first_rows,
+        ).unwrap();
+        let previous = read_wal(path.join("wal").join("database.anwl")).unwrap();
+        assert!(previous.last_sequence > 1);
+
+        let checkpoint = db.create_checkpoint().unwrap();
+        assert_eq!(checkpoint.base_sequence, previous.last_sequence);
+        assert!(checkpoint.manifest_path.is_file());
+        let rotated = read_wal(path.join("wal").join("database.anwl")).unwrap();
+        assert_eq!(rotated.records.len(), 1);
+        assert_eq!(rotated.records[0].kind, WalRecordKind::Checkpoint);
+        assert_eq!(rotated.records[0].sequence, checkpoint.base_sequence + 1);
+        assert!(rotated.is_clean());
+
+        db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([0xC3; 16]).unwrap(),
+            &second_rows,
+        ).unwrap();
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap(), vec![first_rows[0].clone(), second_rows[0].clone()]);
+        let consistency = reopened.check_consistency(1).unwrap();
+        assert_eq!(consistency.rows_checked, 2);
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_replays_catalog_changes_and_revalidates_mutable_state() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let checkpoint = db.create_checkpoint().unwrap();
+        assert!(checkpoint.manifest_path.is_file());
+
+        db.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.table_schema_revision("telemetry").unwrap(), 2);
+        assert_eq!(reopened.schema("telemetry").unwrap().len(), 4);
+        reopened.check_consistency(1).unwrap();
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_manifest_mismatch_fails_database_open_closed() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let row = vec![vec![
+            Value::TimestampMicros(50),
+            Value::Utf8("checkpoint-integrity".into()),
+            Value::Float64(5.0),
+        ]];
+        db.insert_batch("telemetry", &row).unwrap();
+        let checkpoint = db.create_checkpoint().unwrap();
+        drop(db);
+
+        let segment = fs::read_dir(path.join("data").join("telemetry")).unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| candidate.extension().and_then(|value| value.to_str()) == Some("anf"))
+            .unwrap();
+        let mut bytes = fs::read(&segment).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        fs::write(&segment, bytes).unwrap();
+        assert!(matches!(Database::open(&path), Err(DbError::Wal(_))));
+        assert!(checkpoint.manifest_path.is_file());
+        fs::remove_dir_all(path).unwrap();
+    }
+
     #[test]
     fn capsule_and_navigation_map_wal_recovery_survives_process_crashes() {
         for operation in ["capsule", "navigation-map"] {
             for (point, committed) in [
+                ("AfterStagingFileCreated", false),
+                ("AfterStagingBytesWritten", false),
+                ("AfterStagingFlush", false),
+                ("AfterStagingFileSync", false),
+                ("AfterStagingDirectorySync", false),
+                ("AfterWalBegin", false),
                 ("AfterWalMutation", false),
                 ("AfterWalCommit", true),
                 ("AfterFinalNameLinked", true),
+                ("AfterPublishDirectorySync", true),
+                ("AfterStagingNameRemoved", true),
+                ("AfterCleanupDirectorySync", true),
             ] {
                 exercise_derived_artifact_subprocess_crash(operation, point, committed);
             }
