@@ -441,6 +441,14 @@ impl Database {
             .filter(|intent| intent.artifact_kind == WalArtifactKind::CatalogSnapshot)
             .map(|intent| intent.file_id)
             .collect::<BTreeSet<_>>();
+        let committed_active_pointer_ids = build_recovery_plan(&wal_report)
+            .map_err(|error| DbError::Wal(error.to_string()))?
+            .committed
+            .into_iter()
+            .flat_map(|transaction| transaction.intents)
+            .filter(|intent| intent.artifact_kind == WalArtifactKind::ActiveWeavePointer)
+            .map(|intent| (intent.table_id, intent.file_id))
+            .collect::<BTreeSet<_>>();
 
         recover_staged_artifacts(&wal_report, &mut wal, |intent| {
             match intent.artifact_kind {
@@ -471,6 +479,26 @@ impl Database {
                         ).map_err(|error| WalRecoveryError::SchemaSnapshot(error.to_string()))?;
                     }
                     Ok(directory)
+                }
+                WalArtifactKind::ActiveWeavePointer => {
+                    let Some((table_name, _)) = catalog.tables.iter()
+                        .find(|(_, definition)| definition.id.0 == intent.table_id)
+                    else {
+                        return Err(WalRecoveryError::MissingTableId(intent.table_id));
+                    };
+                    let weave_root = root.join("data").join(table_name).join("weaves");
+                    if committed_active_pointer_ids.contains(&(intent.table_id, intent.file_id)) {
+                        let versioned = publish_staged_wal_artifact(&weave_root, intent)?;
+                        let bytes = fs::read(&versioned).map_err(|error| {
+                            WalRecoveryError::Io(error.to_string())
+                        })?;
+                        let pointer = ActiveWeavePointer::decode(&bytes).map_err(|error| {
+                            WalRecoveryError::FileConflict(Box::leak(error.to_string().into_boxed_str()))
+                        })?;
+                        crate::active_generation::install_recovered_pointer(&weave_root, &pointer)
+                            .map_err(|error| WalRecoveryError::FileConflict(Box::leak(error.to_string().into_boxed_str())))?;
+                    }
+                    Ok(weave_root)
                 }
                 WalArtifactKind::AnfSegment | WalArtifactKind::ChronicleRecord => {
                     let Some((table_name, definition)) = catalog.tables.iter()
