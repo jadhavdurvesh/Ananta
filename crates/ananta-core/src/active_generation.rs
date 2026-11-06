@@ -239,11 +239,25 @@ impl Database {
         pointer: &ActiveWeavePointer,
     ) -> Result<(), DbError> {
         require_directory(root)?;
+        let stale_temp = root.join(format!(".active-{:020}.tmp", pointer.revision));
+        match fs::symlink_metadata(&stale_temp) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                fs::remove_file(&stale_temp)?;
+                sync_directory(root)?;
+            }
+            Ok(_) => return Err(DbError::CompactionExecution(
+                "active pointer replacement temp is not a regular file".into(),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DbError::Io(error)),
+        }
         match read_pointer(root, pointer.table_id) {
             Ok(Some(current)) if current.revision > pointer.revision => Ok(()),
             Ok(Some(current)) if current.revision == pointer.revision => {
                 if current == *pointer {
-                    Ok(())
+                    // A crash can occur after rename and before the directory
+                    // fsync. Re-sync even when the canonical bytes are present.
+                    sync_directory(root)
                 } else {
                     Err(DbError::CompactionExecution(
                         "active pointer revision conflicts with committed WAL snapshot".into(),
@@ -485,10 +499,16 @@ where F: FnMut(PublishStage) -> std::io::Result<()> {
         file.sync_all()?;
         drop(file);
         hook(PublishStage::TempSynced).map_err(DbError::Io)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterActivePointerTempSynced,
+        );
         fs::rename(&temp, &target)?;
         owned = false;
         replaced = true;
         hook(PublishStage::Replaced).map_err(DbError::Io)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterActivePointerRenamedBeforeDirectorySync,
+        );
         sync_directory(root)?;
         hook(PublishStage::DirectorySynced).map_err(DbError::Io)?;
         Ok(())
