@@ -1,7 +1,7 @@
 use crate::chronicle::sha256;
 use crate::compaction_manifest::CompactionInputManifest;
 use crate::compaction_output_manifest::CompactionOutputManifest;
-use crate::{DbError, Database, TableDefinition};
+use crate::{DbError, Database, TableDefinition, WalArtifactKind, WalMutationIntent};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -120,8 +120,9 @@ impl ActiveWeavePointer {
 
 impl Database {
     pub fn promote_compaction_candidate(
-        &self, table: &str, input: &CompactionInputManifest, weave_id: u64, generation: u64,
+        &mut self, table: &str, input: &CompactionInputManifest, weave_id: u64, generation: u64,
     ) -> Result<ActiveWeavePointer, DbError> {
+        self.ensure_operational()?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         let index = self.chronicle_indices.get(&definition.id)
@@ -154,11 +155,12 @@ impl Database {
             active: ActiveWeaveGeneration { weave_id, generation, manifest_sha256: sha256(&manifest_bytes) },
             previous: existing.map(|p| p.active),
         };
-        publish_pointer(&weave_root, &next)?;
+        self.publish_active_pointer_wal(&weave_root, &next, b"promote_active_weave")?;
         Ok(next)
     }
 
-    pub fn rollback_active_weave(&self, table: &str) -> Result<ActiveWeavePointer, DbError> {
+    pub fn rollback_active_weave(&mut self, table: &str) -> Result<ActiveWeavePointer, DbError> {
+        self.ensure_operational()?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         let root = self.root.join("data").join(table).join("weaves");
@@ -172,8 +174,58 @@ impl Database {
             active: previous,
             previous: Some(current.active),
         };
-        publish_pointer(&root, &next)?;
+        self.publish_active_pointer_wal(&root, &next, b"rollback_active_weave")?;
         Ok(next)
+    }
+
+    fn publish_active_pointer_wal(
+        &mut self,
+        weave_root: &Path,
+        pointer: &ActiveWeavePointer,
+        operation: &[u8],
+    ) -> Result<(), DbError> {
+        require_directory(weave_root)?;
+        let bytes = pointer.encode()?;
+        let schema_revision = self.catalog.tables.values()
+            .find(|definition| definition.id.0 == pointer.table_id)
+            .map(|definition| definition.schema_revision)
+            .ok_or(DbError::CompactionPreflight("active pointer TableId is not in the catalog"))?;
+        let intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::ActiveWeavePointer,
+            table_id: pointer.table_id,
+            schema_revision,
+            file_id: pointer.revision,
+            file_len: u64::try_from(bytes.len()).map_err(|_| DbError::LengthOverflow)?,
+            sha256: sha256(&bytes),
+        };
+        let final_path = weave_root.join(intent.artifact_kind.final_file_name(intent.file_id));
+        match fs::symlink_metadata(&final_path) {
+            Ok(metadata) if metadata.file_type().is_file() && metadata.len() == intent.file_len => {
+                if fs::read(&final_path)? != bytes {
+                    return Err(DbError::CompactionExecution("immutable active pointer snapshot conflict".into()));
+                }
+            }
+            Ok(_) => return Err(DbError::CompactionExecution("immutable active pointer snapshot conflict".into())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DbError::Io(error)),
+        }
+        let staging = weave_root.join(intent.artifact_kind.staging_file_name(intent.file_id));
+        if fs::symlink_metadata(&staging).is_ok() {
+            return Err(DbError::CompactionExecution("active pointer staging path already exists".into()));
+        }
+        crate::stage_wal_artifact(weave_root, &intent, &bytes)
+            .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
+        self.commit_wal_intent(&intent, operation)?;
+        let versioned = self.publish_wal_intent(weave_root, &intent)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterActiveWeavePointerVersionedPublished,
+        );
+        publish_pointer(weave_root, pointer)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterActiveWeaveCanonicalPublished,
+        );
+        let _ = versioned;
+        Ok(())
     }
 
     pub fn active_weave_pointer(&self, table: &str) -> Result<Option<ActiveWeavePointer>, DbError> {
@@ -182,22 +234,114 @@ impl Database {
         read_pointer(&self.root.join("data").join(table).join("weaves"), definition.id.0)
     }
 
-    pub(super) fn recover_active_weaves(&self) -> Result<(), DbError> {
-        for (table, definition) in &self.catalog.tables {
-            let root = self.root.join("data").join(table).join("weaves");
+    pub(super) fn install_recovered_pointer(
+        root: &Path,
+        pointer: &ActiveWeavePointer,
+    ) -> Result<(), DbError> {
+        require_directory(root)?;
+        let stale_temp = root.join(format!(".active-{:020}.tmp", pointer.revision));
+        match fs::symlink_metadata(&stale_temp) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                fs::remove_file(&stale_temp)?;
+                sync_directory(root)?;
+            }
+            Ok(_) => return Err(DbError::CompactionExecution(
+                "active pointer replacement temp is not a regular file".into(),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DbError::Io(error)),
+        }
+        match read_pointer(root, pointer.table_id) {
+            Ok(Some(current)) if current.revision > pointer.revision => Ok(()),
+            Ok(Some(current)) if current.revision == pointer.revision => {
+                if current == *pointer {
+                    // A crash can occur after rename and before the directory
+                    // fsync. Re-sync even when the canonical bytes are present.
+                    sync_directory(root)
+                } else {
+                    Err(DbError::CompactionExecution(
+                        "active pointer revision conflicts with committed WAL snapshot".into(),
+                    ))
+                }
+            }
+            Ok(Some(current)) => {
+                if current.revision.checked_add(1) != Some(pointer.revision) {
+                    return Err(DbError::CompactionExecution(
+                        "active pointer WAL revisions are not contiguous".into(),
+                    ));
+                }
+                publish_pointer(root, pointer)
+            }
+            Ok(None) => {
+                if pointer.revision != 1 {
+                    return Err(DbError::CompactionExecution(
+                        "active pointer WAL history does not begin at revision one".into(),
+                    ));
+                }
+                publish_pointer(root, pointer)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn cleanup_orphan_active_pointer_staging(
+        root: &Path,
+        catalog: &std::collections::BTreeMap<String, TableDefinition>,
+    ) -> Result<(), DbError> {
+        for table in catalog.keys() {
+            let weave_root = root.join("data").join(table).join("weaves");
+            let entries = match fs::read_dir(&weave_root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(DbError::Io(error)),
+            };
+            let mut changed = false;
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let canonical = |prefix: &str, suffix: &str| -> bool {
+                    let Some(number) = name.strip_prefix(prefix).and_then(|value| value.strip_suffix(suffix)) else {
+                        return false;
+                    };
+                    number.len() == 20
+                        && number.bytes().all(|byte| byte.is_ascii_digit())
+                        && number.parse::<u64>().is_ok_and(|id| id != 0 && format!("{id:020}") == number)
+                };
+                if canonical(".pointer-", ".tmp") || canonical(".active-", ".tmp") {
+                    fs::remove_file(entry.path())?;
+                    changed = true;
+                }
+            }
+            if changed {
+                sync_directory(&weave_root)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recover_active_weaves(&mut self) -> Result<(), DbError> {
+        let tables = self.catalog.tables.iter()
+            .map(|(name, definition)| (name.clone(), definition.clone()))
+            .collect::<Vec<_>>();
+        for (table, definition) in tables {
+            let root = self.root.join("data").join(&table).join("weaves");
             let Some(pointer) = read_pointer(&root, definition.id.0)? else { continue; };
-            if self.verify_generation(table, pointer.active).is_ok() { continue; }
+            if self.verify_generation(&table, pointer.active).is_ok() { continue; }
             let previous = pointer.previous.ok_or(DbError::CompactionPreflight(
                 "active Weave is invalid and no previous generation is available"
             ))?;
-            self.verify_generation(table, previous)?;
+            self.verify_generation(&table, previous)?;
             let fallback = ActiveWeavePointer {
                 table_id: pointer.table_id,
                 revision: pointer.revision.checked_add(1).ok_or(DbError::LengthOverflow)?,
                 active: previous,
                 previous: None,
             };
-            publish_pointer(&root, &fallback)?;
+            self.publish_active_pointer_wal(&root, &fallback, b"recover_active_weave_fallback")?;
         }
         Ok(())
     }
@@ -358,10 +502,16 @@ where F: FnMut(PublishStage) -> std::io::Result<()> {
         file.sync_all()?;
         drop(file);
         hook(PublishStage::TempSynced).map_err(DbError::Io)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterActivePointerTempSynced,
+        );
         fs::rename(&temp, &target)?;
         owned = false;
         replaced = true;
         hook(PublishStage::Replaced).map_err(DbError::Io)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterActivePointerRenamedBeforeDirectorySync,
+        );
         sync_directory(root)?;
         hook(PublishStage::DirectorySynced).map_err(DbError::Io)?;
         Ok(())

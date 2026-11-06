@@ -24,6 +24,7 @@ pub enum WalArtifactKind {
     ChronicleRecord = 2,
     SchemaSnapshot = 3,
     CatalogSnapshot = 4,
+    ActiveWeavePointer = 5,
 }
 
 impl WalArtifactKind {
@@ -33,6 +34,7 @@ impl WalArtifactKind {
             2 => Ok(Self::ChronicleRecord),
             3 => Ok(Self::SchemaSnapshot),
             4 => Ok(Self::CatalogSnapshot),
+            5 => Ok(Self::ActiveWeavePointer),
             _ => Err(WalRecoveryError::CorruptIntent("unknown artifact kind")),
         }
     }
@@ -43,6 +45,7 @@ impl WalArtifactKind {
             Self::ChronicleRecord => format!("segment-{file_id:020}.chr"),
             Self::SchemaSnapshot => format!("schema-{file_id:020}.ans"),
             Self::CatalogSnapshot => format!("catalog-{file_id:020}.anc"),
+            Self::ActiveWeavePointer => format!("pointer-{file_id:020}.awp"),
         }
     }
 
@@ -52,6 +55,7 @@ impl WalArtifactKind {
             Self::ChronicleRecord => format!(".chronicle-{file_id:020}.tmp"),
             Self::SchemaSnapshot => format!(".schema-{file_id:020}.tmp"),
             Self::CatalogSnapshot => format!(".catalog-{file_id:020}.tmp"),
+            Self::ActiveWeavePointer => format!(".pointer-{file_id:020}.tmp"),
         }
     }
 }
@@ -279,6 +283,10 @@ pub(crate) enum WalRecoveryCrashPoint {
     AfterCanonicalCatalogPublished,
     AfterCanonicalCatalogTempSynced,
     AfterCanonicalCatalogRenamedBeforeDirectorySync,
+    AfterActiveWeavePointerVersionedPublished,
+    AfterActiveWeaveCanonicalPublished,
+    AfterActivePointerTempSynced,
+    AfterActivePointerRenamedBeforeDirectorySync,
 }
 
 #[cfg(test)]
@@ -609,6 +617,23 @@ fn verify_artifact_identity(
             if catalog.revision != intent.file_id || !table_matches {
                 return Err(WalRecoveryError::FileConflict(
                     "catalog snapshot identity differs from committed WAL intent",
+                ));
+            }
+        }
+        WalArtifactKind::ActiveWeavePointer => {
+            let metadata = fs::metadata(path).map_err(io_error)?;
+            if metadata.len() != 164 {
+                return Err(WalRecoveryError::FileConflict(
+                    "active Weave pointer has an invalid size",
+                ));
+            }
+            let mut bytes = Vec::with_capacity(164);
+            File::open(path).map_err(io_error)?.read_to_end(&mut bytes).map_err(io_error)?;
+            let pointer = crate::ActiveWeavePointer::decode(&bytes)
+                .map_err(|_| WalRecoveryError::FileConflict("active Weave pointer is invalid"))?;
+            if pointer.table_id != intent.table_id || pointer.revision != intent.file_id {
+                return Err(WalRecoveryError::FileConflict(
+                    "active Weave pointer identity differs from committed WAL intent",
                 ));
             }
         }

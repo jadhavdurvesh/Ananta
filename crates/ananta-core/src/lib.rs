@@ -441,6 +441,14 @@ impl Database {
             .filter(|intent| intent.artifact_kind == WalArtifactKind::CatalogSnapshot)
             .map(|intent| intent.file_id)
             .collect::<BTreeSet<_>>();
+        let committed_active_pointer_ids = build_recovery_plan(&wal_report)
+            .map_err(|error| DbError::Wal(error.to_string()))?
+            .committed
+            .into_iter()
+            .flat_map(|transaction| transaction.intents)
+            .filter(|intent| intent.artifact_kind == WalArtifactKind::ActiveWeavePointer)
+            .map(|intent| (intent.table_id, intent.file_id))
+            .collect::<BTreeSet<_>>();
 
         recover_staged_artifacts(&wal_report, &mut wal, |intent| {
             match intent.artifact_kind {
@@ -472,6 +480,30 @@ impl Database {
                     }
                     Ok(directory)
                 }
+                WalArtifactKind::ActiveWeavePointer => {
+                    let Some((table_name, definition)) = catalog.tables.iter()
+                        .find(|(_, definition)| definition.id.0 == intent.table_id)
+                    else {
+                        return Err(WalRecoveryError::MissingTableId(intent.table_id));
+                    };
+                    if definition.schema_revision != intent.schema_revision {
+                        return Err(WalRecoveryError::FileConflict(
+                            "active pointer schema revision differs from the catalog",
+                        ));
+                    }
+                    let weave_root = root.join("data").join(table_name).join("weaves");
+                    if committed_active_pointer_ids.contains(&(intent.table_id, intent.file_id)) {
+                        let versioned = publish_staged_wal_artifact(&weave_root, intent)?;
+                        let bytes = fs::read(&versioned).map_err(|error| {
+                            WalRecoveryError::Io(error.to_string())
+                        })?;
+                        let pointer = ActiveWeavePointer::decode(&bytes)
+                            .map_err(|_| WalRecoveryError::FileConflict("active pointer snapshot is invalid"))?;
+                        crate::active_generation::install_recovered_pointer(&weave_root, &pointer)
+                            .map_err(|_| WalRecoveryError::FileConflict("active pointer WAL replay failed"))?;
+                    }
+                    Ok(weave_root)
+                }
                 WalArtifactKind::AnfSegment | WalArtifactKind::ChronicleRecord => {
                     let Some((table_name, definition)) = catalog.tables.iter()
                         .find(|(_, definition)| definition.id.0 == intent.table_id)
@@ -495,12 +527,13 @@ impl Database {
         // process stopped while staging the second metadata artifact).
         cleanup_orphan_segment_temps(&root.join("data"))?;
         cleanup_orphan_catalog_staging_temps(&root)?;
+        crate::active_generation::cleanup_orphan_active_pointer_staging(&root, &catalog.tables)?;
         let mut chronicle_indices = BTreeMap::new();
         for (name, definition) in &catalog.tables {
             let directory = root.join("data").join(name);
             chronicle_indices.insert(definition.id, scan_table_index(&directory, definition.id.0)?);
         }
-        let database = Self {
+        let mut database = Self {
             root,
             catalog,
             chronicle_indices,

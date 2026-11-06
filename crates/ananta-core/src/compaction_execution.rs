@@ -1023,10 +1023,21 @@ mod tests {
             assert_eq!(verified.artifacts.len(), 2);
 
             if offset == 0 {
-                let pointer = db.promote_compaction_candidate(
-                    "telemetry", &input, 100, 1,
-                ).unwrap();
+                // A durable pointer COMMIT followed by interruption before the
+                // canonical active.awp replacement must be replayed on open.
+                crate::wal_recovery::arm_wal_recovery_crash_point(
+                    crate::wal_recovery::WalRecoveryCrashPoint::AfterActiveWeavePointerVersionedPublished,
+                );
+                let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    db.promote_compaction_candidate("telemetry", &input, 100, 1)
+                }));
+                assert!(interrupted.is_err());
+                drop(db);
+                db = Database::open(&root).unwrap();
+                let pointer = db.active_weave_pointer("telemetry").unwrap().unwrap();
                 assert_eq!(pointer.active.weave_id, 100);
+                assert!(root.join("data").join("telemetry").join("weaves")
+                    .join("pointer-00000000000000000001.awp").is_file());
                 assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
 
                 // A cancellation request at the first checkpoint must leave the
@@ -1051,12 +1062,30 @@ mod tests {
                 assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
             }
             if offset == 1 {
-                let pointer = db.promote_compaction_candidate(
-                    "telemetry", &input, 101, 1,
-                ).unwrap();
+                // Crash immediately after the durable WAL COMMIT, before the
+                // versioned and canonical pointer names are both published.
+                crate::wal_recovery::arm_wal_recovery_crash_point(
+                    crate::wal_recovery::WalRecoveryCrashPoint::AfterWalCommit,
+                );
+                let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    db.promote_compaction_candidate("telemetry", &input, 101, 1)
+                }));
+                assert!(interrupted.is_err());
+                drop(db);
+                db = Database::open(&root).unwrap();
+                let pointer = db.active_weave_pointer("telemetry").unwrap().unwrap();
                 assert_eq!(pointer.active.weave_id, 101);
                 assert_eq!(db.scan("telemetry").unwrap()[0][0], Value::TimestampMicros(100));
-                let rolled_back = db.rollback_active_weave("telemetry").unwrap();
+                crate::wal_recovery::arm_wal_recovery_crash_point(
+                    crate::wal_recovery::WalRecoveryCrashPoint::AfterActivePointerRenamedBeforeDirectorySync,
+                );
+                let interrupted_rollback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    db.rollback_active_weave("telemetry")
+                }));
+                assert!(interrupted_rollback.is_err());
+                drop(db);
+                db = Database::open(&root).unwrap();
+                let rolled_back = db.active_weave_pointer("telemetry").unwrap().unwrap();
                 assert_eq!(rolled_back.active.weave_id, 100);
                 assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
             }
