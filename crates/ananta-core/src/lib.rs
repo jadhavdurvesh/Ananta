@@ -3541,6 +3541,74 @@ mod tests {
     }
 
     #[test]
+    fn large_chronicle_capsule_map_backup_restores_all_rows_and_indexes() {
+        let root = temp_path();
+        let backup = temp_path();
+        let restored = temp_path();
+        let mut expected_rows = Vec::new();
+        let mut db = Database::open(&root).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+
+        for sequence in 1_u8..=32 {
+            let mut batch = Vec::new();
+            for row_index in 0_u16..64 {
+                let value = vec![
+                    Value::TimestampMicros(i64::from(sequence) * 10_000 + i64::from(row_index)),
+                    Value::Utf8(format!("device-{}-{row_index}", sequence % 8)),
+                    Value::Float64(f64::from(sequence) + f64::from(row_index) / 100.0),
+                ];
+                expected_rows.push(value.clone());
+                batch.push(value);
+            }
+            db.ingest_batch(
+                "telemetry",
+                BatchId::from_bytes([sequence; 16]).unwrap(),
+                &batch,
+            ).unwrap();
+        }
+
+        for group in 0_u64..8 {
+            let first = group * 4 + 1;
+            let last = first + 3;
+            db.build_capsule(
+                "telemetry",
+                group + 1,
+                1,
+                first,
+                last,
+                Some("timestamp"),
+            ).unwrap();
+        }
+        db.build_navigation_map("telemetry", 1).unwrap();
+
+        let consistency = db.check_consistency(37).unwrap();
+        assert_eq!(consistency.rows_checked, 2_048);
+        assert_eq!(consistency.chronicle_records_checked, 32);
+        assert_eq!(consistency.capsules_checked, 8);
+        assert_eq!(consistency.navigation_maps_checked, 1);
+
+        let backup_report = db.backup_to(&backup).unwrap();
+        assert!(backup_report.file_count > 40);
+        assert!(backup_report.total_bytes > 0);
+        drop(db);
+
+        let restore_report = Database::restore_backup(&backup, &restored).unwrap();
+        assert_eq!(restore_report.file_count, backup_report.file_count);
+        let restored_db = Database::open(&restored).unwrap();
+        assert_eq!(restored_db.scan("telemetry").unwrap(), expected_rows);
+        let restored_consistency = restored_db.check_consistency(53).unwrap();
+        assert_eq!(restored_consistency.rows_checked, 2_048);
+        assert_eq!(restored_consistency.chronicle_records_checked, 32);
+        assert_eq!(restored_consistency.capsules_checked, 8);
+        assert_eq!(restored_consistency.navigation_maps_checked, 1);
+        drop(restored_db);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(backup).unwrap();
+        fs::remove_dir_all(restored).unwrap();
+    }
+
+    #[test]
     fn writer_lock_inspection_reports_owner_without_mutating_lock() {
         let path = temp_path();
         let db = Database::open(&path).unwrap();
