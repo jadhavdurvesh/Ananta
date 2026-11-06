@@ -3493,6 +3493,64 @@ mod tests {
     }
 
     #[test]
+    fn catalog_wal_recovery_discards_uncommitted_ddl_staging_and_intents() {
+        use crate::wal_recovery::WalRecoveryCrashPoint::*;
+
+        for point in [
+            AfterStagingFileCreated,
+            AfterStagingBytesWritten,
+            AfterStagingFlush,
+            AfterStagingFileSync,
+            AfterStagingDirectorySync,
+            AfterWalBegin,
+            AfterWalMutation,
+        ] {
+            let path = temp_path();
+            let mut database = Database::open(&path).unwrap();
+            crate::wal_recovery::arm_wal_recovery_crash_point(point);
+            let interruption = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                database.create_table("telemetry", sample_schema())
+            }));
+            assert!(interruption.is_err(), "DDL pre-COMMIT checkpoint {point:?} was not reached");
+            drop(database);
+
+            let recovered = Database::open(&path).unwrap();
+            assert_eq!(recovered.catalog_revision(), 0, "at {point:?}");
+            assert!(matches!(
+                recovered.table_id("telemetry"),
+                Err(DbError::TableNotFound(_))
+            ));
+            drop(recovered);
+
+            let catalog_directory = path.join("catalog");
+            let mut stack = vec![catalog_directory.clone()];
+            while let Some(directory) = stack.pop() {
+                for entry in fs::read_dir(&directory).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        stack.push(entry.path());
+                    } else {
+                        assert!(
+                            !entry.file_name().to_string_lossy().ends_with(".tmp"),
+                            "orphan DDL staging file remained after {point:?}: {}",
+                            entry.path().display(),
+                        );
+                    }
+                }
+            }
+
+            let reopened = Database::open(&path).unwrap();
+            assert_eq!(reopened.catalog_revision(), 0);
+            assert!(matches!(
+                reopened.table_id("telemetry"),
+                Err(DbError::TableNotFound(_))
+            ));
+            drop(reopened);
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
     fn catalog_wal_recovery_replays_create_table_at_every_ddl_publication_boundary() {
         use crate::wal_recovery::WalRecoveryCrashPoint::*;
 
