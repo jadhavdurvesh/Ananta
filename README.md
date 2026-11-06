@@ -152,3 +152,6 @@ The result includes capsules considered/skipped/read, rows examined/returned, by
 The Capsule size benchmark compared 512-row, 2,048-row and 8,192-row Capsules over identical 16,384-row datasets. The Navigation Map skipped 24/32, 6/8 and 1/2 Capsules respectively for a 4,096-row time range; all mapped outputs exactly matched the unpruned reference. The mapped path decoded less ANF payload but still verified the full Capsule bytes, so physical I/O reduction is not yet established. Full measurements are in the [Capsule benchmark report](docs/specifications/capsule-size-scan-benchmark-v0.1.md).
 
 **M2 is complete.** Chronicle ingestion, Capsule v0.1 and Navigation Map v0.1 have correctness tests and reproducible CI benchmarks. M3 begins with the compaction input/output manifest, generation lineage, temporary output, resource limits and failure/restart contract.
+
+
+The AQL crate re-exports `analyze_table`, `analyze_table_and_persist` and `load_table_statistics` for explicit table analysis and cache management. `EXPLAIN` reuses only fresh cached analysis and never starts an implicit full-table scan.

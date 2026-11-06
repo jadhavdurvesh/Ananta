@@ -630,6 +630,7 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 - [x] Build bounded deterministic sample histograms (256-value sample, up to 16 buckets) and use them for numeric/timestamp range selectivity.
 - [x] Add explicit analyze-and-persist and load-if-fresh APIs for the database-managed statistics cache.
 - [x] Reuse a fresh database-managed statistics snapshot automatically in EXPLAIN without triggering an implicit full-table analysis scan.
+- [x] Re-export the analyze/persist/load statistics workflow and snapshot types from the AQL crate public API.
 - [x] Automatically invalidate and discard stale/corrupt analysis caches after writes, schema changes or Weave promotion; expose explicit re-analysis via analyze_table_and_persist.
 - [ ] Persist analysis metadata in the catalog and implement a broader cost-based physical planner.
 - [x] Integrate time/Capsule pruning and exact-row reporting behind verified Chronicle sequence/row coverage, legacy-ANF exclusion, map-generation and materialisation-limit gates.

@@ -32,8 +32,9 @@ pub use planner::{
     PlannerOptions, ColumnStatistics, TableStatistics,
 };
 pub use ananta_execution::{
-    analyze_table, ColumnStatistics as AnalyzedColumnStatistics,
-    HistogramBucket, StatisticsFormatError, TableStatistics as AnalyzedTableStatistics,
+    analyze_table, analyze_table_and_persist, load_table_statistics,
+    ColumnStatistics as AnalyzedColumnStatistics, HistogramBucket, StatisticsFormatError,
+    TableStatistics as AnalyzedTableStatistics,
 };
 pub use vectorized::{execute_vectorized, execute_vectorized_source, execute_vectorized_source_with_options, execute_vectorized_with_options};
 
