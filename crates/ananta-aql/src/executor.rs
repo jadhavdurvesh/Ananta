@@ -97,6 +97,12 @@ pub struct AqlExecutionMetrics {
     pub output_batches: u64,
     pub output_rows: u64,
     pub output_cells: u64,
+    /// Decoded input batches returned by the native storage scan.
+    pub scan_input_batches: u64,
+    /// Decoded input rows returned by the native storage scan.
+    pub scan_input_rows: u64,
+    /// Measured value-body bytes in decoded scan input; not physical disk bytes.
+    pub scan_input_value_payload_bytes: u64,
     /// Measured value-body bytes returned to the caller. This excludes vector,
     /// descriptor, allocator and storage-file overhead; it is not disk I/O bytes.
     pub output_value_payload_bytes: u64,
@@ -671,11 +677,20 @@ impl Iterator for AqlResultIter {
         }
 
         let cancelled = self.is_cancelled();
-        if let Some(native) = self.native.as_mut() {
-            if cancelled {
-                native.context.cancel();
-            }
-            let next_batch = native.operator.next_batch(&mut native.context);
+        if self.native.is_some() {
+            let (next_batch, scan_metrics) = {
+                let native = self.native.as_mut().expect("native execution checked above");
+                if cancelled {
+                    native.context.cancel();
+                }
+                let next_batch = native.operator.next_batch(&mut native.context);
+                let metrics = native.context.metrics().clone();
+                (next_batch, metrics)
+            };
+            self.metrics.scan_input_batches = scan_metrics.scan_input_batches;
+            self.metrics.scan_input_rows = scan_metrics.scan_input_rows;
+            self.metrics.scan_input_value_payload_bytes =
+                scan_metrics.scan_input_value_payload_bytes;
             return match next_batch {
                 Ok(Some(batch)) => {
                     let result = AqlResultBatch {
@@ -1624,6 +1639,9 @@ mod tests {
         assert!(optimized.metrics().output_bytes > 0);
         assert_eq!(optimized.metrics().output_cells, 4);
         assert_eq!(optimized.metrics().output_value_payload_bytes, 18);
+        assert_eq!(optimized.metrics().scan_input_batches, 4);
+        assert_eq!(optimized.metrics().scan_input_rows, 4);
+        assert_eq!(optimized.metrics().scan_input_value_payload_bytes, 28);
 
         let mut reference = execute_with_options(&db, &query, &bindings, 1, None, false).unwrap();
         assert!(!reference.used_native_execution());

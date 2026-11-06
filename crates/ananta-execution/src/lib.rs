@@ -128,6 +128,12 @@ pub struct ExecutionMetrics {
     pub output_batches: u64,
     /// Sum of rows emitted at operator boundaries in this execution context.
     pub output_rows: u64,
+    /// Batches actually returned by the native storage scan source.
+    pub scan_input_batches: u64,
+    /// Rows actually decoded and returned by the native storage scan source.
+    pub scan_input_rows: u64,
+    /// Measured value-body bytes in decoded scan columns (not file/disk bytes).
+    pub scan_input_value_payload_bytes: u64,
     pub peak_batch_bytes: usize,
     pub peak_working_set_bytes: usize,
 }
@@ -284,6 +290,14 @@ impl ExecutionContext {
             .output_rows
             .saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
     }
+
+    fn record_scan_input(&mut self, batch: &VectorBatch) {
+        self.metrics.scan_input_batches = self.metrics.scan_input_batches.saturating_add(1);
+        self.metrics.scan_input_rows = self.metrics.scan_input_rows
+            .saturating_add(u64::try_from(batch.row_count).unwrap_or(u64::MAX));
+        self.metrics.scan_input_value_payload_bytes = self.metrics.scan_input_value_payload_bytes
+            .saturating_add(measured_value_payload_bytes(batch));
+    }
 }
 
 impl Default for ExecutionContext {
@@ -291,6 +305,20 @@ impl Default for ExecutionContext {
         Self::new(ExecutionConfig::default())
             .expect("the built-in execution limits are valid")
     }
+}
+
+fn measured_value_payload_bytes(batch: &VectorBatch) -> u64 {
+    batch.columns.iter().flatten().fold(0_u64, |total, value| {
+        let value_bytes = match value {
+            Value::Null => 0,
+            Value::Boolean(_) => 1,
+            Value::Int32(_) => 4,
+            Value::Int64(_) | Value::TimestampMicros(_) | Value::Float64(_) => 8,
+            Value::Utf8(text) => u64::try_from(text.len()).unwrap_or(u64::MAX),
+            Value::Binary(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        };
+        total.saturating_add(value_bytes)
+    })
 }
 
 /// Estimate owned batch payload capacity, including vector, string and binary
@@ -496,6 +524,7 @@ impl ExecutionOperator for ScanOperator {
         match self.input.next() {
             Some(Ok(batch)) => {
                 context.check_batch(&self.schema, &batch)?;
+                context.record_scan_input(&batch);
                 Ok(Some(batch))
             }
             Some(Err(error)) => {

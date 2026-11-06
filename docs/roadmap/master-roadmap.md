@@ -629,6 +629,7 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 - [ ] Integrate time/Capsule pruning only with verified complete-coverage semantics.
 - [x] Add optimizer-disabled reference execution and compare simple optimized query results.
 - [x] Test aliases/repeated projections, NULL predicates, computed-expression fallback and safe LIMIT decisions.
+- [x] Record measured decoded scan input batches, rows and value bytes alongside returned output metrics.
 - [ ] Compare planned estimates against runtime input/bytes for representative workloads.
 - [x] Record runtime output batches, rows, cells and measured value-body bytes; keep owned-batch footprint estimate separate.
 
@@ -638,10 +639,10 @@ Specification: docs/specifications/physical-planning-v0.1.md.
 
 ## M5 exit gate
 - [x] First AQL queries execute through native operators.
-- [ ] Aggregate results pass reference tests.
+- [x] Aggregate results pass operator/reference expectation tests.
 - [x] Time-series boundary/null semantics are covered.
 - [x] Query results remain identical with optimiser on/off for the supported comparison, boolean and NULL predicate set.
-- [x] Query output profiling reports measured batches, rows, cells and value-body bytes; physical scan/input profiling remains outstanding.
+- [x] Query profiling reports measured decoded scan input and returned output batches, rows and value bytes; physical file/disk I/O bytes and per-operator timings remain outstanding.
 
 **Deliverable:** Native Analytics Engine v0.1.
 
