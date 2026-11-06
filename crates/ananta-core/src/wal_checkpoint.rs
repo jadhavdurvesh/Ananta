@@ -465,6 +465,31 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_retention_keeps_only_the_active_wal_manifest() {
+        let root = temp_path();
+        fs::create_dir_all(root.join("data/table")).unwrap();
+        fs::create_dir_all(root.join("catalog")).unwrap();
+        fs::create_dir_all(root.join("wal")).unwrap();
+        fs::write(root.join("catalog/catalog.anc"), b"catalog").unwrap();
+        fs::write(root.join("data/table/one.anf"), b"one").unwrap();
+
+        let (first, _) = create_checkpoint(&root, 10, 1).unwrap();
+        fs::write(root.join("data/table/two.chr"), b"two").unwrap();
+        let (second, _) = create_checkpoint(&root, 20, 1).unwrap();
+        assert!(first.manifest_filename() != second.manifest_filename());
+
+        let removed = prune_superseded_checkpoint_manifests(&root, &second.manifest_path).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!first.manifest_path.exists());
+        assert!(second.manifest_path.is_file());
+        assert_eq!(
+            fs::read_dir(root.join("wal").join("checkpoints")).unwrap().count(),
+            1,
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn checkpoint_manifest_validates_immutable_file_inventory() {
         let root = temp_path();
         fs::create_dir_all(root.join("data/table")).unwrap();
