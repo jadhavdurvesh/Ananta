@@ -255,8 +255,8 @@ where I:IntoIterator<Item=Result<VectorBatch,ExecutionError>>{
                 .and_then(|column|column.value(row)).cloned()
                 .ok_or_else(||ExecutionError::InvalidBatch("group key index out of range".into())))
                 .collect::<Result<Vec<_>,_>>()?);
-            if let Some(Value::Float64(value))=key.0.iter().find(|v|matches!(v,Value::Float64(_))){
-                if !value.is_finite(){return Err(ExecutionError::InvalidExpression("NaN/infinite group keys are not supported"));}
+            if key.0.iter().any(|value|matches!(value,Value::Float64(number) if !number.is_finite())){
+                return Err(ExecutionError::InvalidExpression("NaN/infinite group keys are not supported"));
             }
             let is_new=!groups.contains_key(&key);
             if is_new{
