@@ -664,16 +664,20 @@ Specification: docs/specifications/physical-planning-v0.1.md.
 
 This milestone is a hard prerequisite for production use. Do not imply transactional safety before it passes.
 
-## M6.1 Write-ahead log
-- [ ] Define WAL record format and version.
-- [ ] Define record checksums.
-- [ ] Define sequence and commit markers.
-- [ ] Define flush/sync policy.
-- [ ] Define segment/catalog relationship to WAL.
-- [ ] Implement WAL writer.
-- [ ] Implement WAL reader.
-- [ ] Test truncated WAL records.
-- [ ] Test corrupt WAL records.
+## M6.1 Write-ahead log — framing and append primitives implemented
+- [x] Define WAL record format and version (ANWL v1, little-endian framing).
+- [x] Define record checksums (SHA-256 over canonical record content).
+- [x] Define sequence and commit markers (contiguous sequence, BEGIN/MUTATION/COMMIT/ABORT/CHECKPOINT).
+- [x] Define flush/sync policy (manual, on commit/checkpoint, every record).
+- [x] Define segment/catalog relationship to WAL (M6.2 integration protocol documented; implementation deferred).
+- [x] Implement WAL writer and explicit poisoned-writer behavior after partial write/sync failure.
+- [x] Implement WAL reader with last-valid-offset reporting.
+- [x] Test truncated WAL record tails and safe tail truncation on reopen.
+- [x] Test complete corrupt frames, sequence continuity, transaction ordering and commit digest validation.
+
+Specification: docs/specifications/wal-v0.1.md.
+
+**Guarantee boundary:** M6.1 is a standalone log format and append/read subsystem. Database insert/ingest/DDL/compaction paths do not yet write to this WAL, and startup replay is not implemented. M6.2 owns mutation intent encoding, idempotent replay, publication ordering, crash injection and recovery validation.
 
 ## M6.2 Recovery
 - [ ] Define startup recovery algorithm.

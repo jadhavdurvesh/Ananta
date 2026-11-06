@@ -163,3 +163,6 @@ The vectorized `EXPLAIN` plan includes a transparent relative cost breakdown (sc
 Planner cost weights are configurable through `PlannerOptions::cost_weights`. The default relative weights are surfaced in EXPLAIN output and can be tuned against measured vectorized execution profiles; they are not treated as wall-clock predictions.
 
 The `analytics_demo` example explicitly analyzes its fixture and reports estimated-versus-measured scan rows, output rows, projected payload and optimized/reference execution profiles as a reproducible cost-calibration workload.
+
+
+M6.1 adds the standalone versioned ANWL write-ahead log framing and append primitives. The WAL reader/writer is not yet connected to database mutations or startup replay; do not treat this as a crash-recovery or transaction guarantee. See [the WAL v0.1 specification](docs/specifications/wal-v0.1.md).

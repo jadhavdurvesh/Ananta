@@ -15,6 +15,8 @@ mod capsule;
 mod navigation_map;
 mod compaction_execution;
 mod active_generation;
+pub mod wal;
+pub use wal::{read_wal, WalError, WalReadReport, WalRecord, WalRecordKind, WalSyncPolicy, WalWriter};
 pub use active_generation::{ActiveWeaveGeneration, ActiveWeavePointer};
 pub use compaction_execution::{CompactionExecutionReport, CompactionReadMeasurement, RowOrigin};
 pub mod compaction;
