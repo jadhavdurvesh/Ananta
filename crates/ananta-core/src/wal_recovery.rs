@@ -150,6 +150,7 @@ pub enum WalRecoveryError {
     MissingCommittedArtifact,
     MissingTableId(u64),
     Wal(String),
+    SchemaSnapshot(String),
 }
 
 impl fmt::Display for WalRecoveryError {
@@ -171,6 +172,7 @@ impl fmt::Display for WalRecoveryError {
                 write!(formatter, "WAL recovery cannot resolve TableId {table_id}")
             }
             Self::Wal(message) => write!(formatter, "WAL recovery log error: {message}"),
+            Self::SchemaSnapshot(message) => write!(formatter, "WAL recovery schema snapshot error: {message}"),
         }
     }
 }
@@ -314,6 +316,7 @@ pub fn stage_wal_artifact(
     intent.validate()?;
     let directory = directory.as_ref();
     fs::create_dir_all(directory).map_err(io_error)?;
+    require_recovery_directory(directory)?;
     let expected_len = u64::try_from(bytes.len())
         .map_err(|_| WalRecoveryError::CorruptIntent("artifact length exceeds u64"))?;
     if expected_len != intent.file_len || crate::chronicle::sha256(bytes) != intent.sha256 {
@@ -394,6 +397,7 @@ pub fn discard_staged_wal_artifact(
 ) -> Result<(), WalRecoveryError> {
     intent.validate()?;
     let directory = directory.as_ref();
+    require_recovery_directory(directory)?;
     let staging_path = directory.join(intent.artifact_kind.staging_file_name(intent.file_id));
     match fs::symlink_metadata(&staging_path) {
         Ok(metadata) => {

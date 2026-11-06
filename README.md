@@ -186,3 +186,6 @@ M6.2 now includes typed AMUT v1 mutation intents and a tested recovery-plan clas
 
 
 M6.2 now has reusable staged-artifact publication and WAL replay-plan helpers, including streaming SHA-256 verification and idempotent final-name publication. They are not yet wired into Database::open or insert/ingest; no crash-recovery guarantee is claimed yet.
+
+
+M6.2 now connects the WAL to initial immutable ANF inserts and Chronicle ingests. Database startup replays committed artifact intents before rebuilding Chronicle receipt indexes; uncommitted staging is discarded and explicitly aborted. See docs/specifications/wal-recovery-v0.1.md for the current scope and remaining crash points. This is not yet general ACID transaction support.

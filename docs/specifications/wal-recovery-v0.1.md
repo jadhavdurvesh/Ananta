@@ -144,3 +144,12 @@ The core recovery module now provides staging, publishing and discard helpers. S
 The recover_staged_artifacts driver consumes a verified WAL report, publishes all committed intents, discards only staging names owned by incomplete transactions, appends explicit ABORT records, and syncs those markers. Its tests cover committed replay, repeat replay, incomplete cleanup, missing committed artifacts, conflicting final checksums and canonical file derivation.
 
 These helpers are still not invoked by Database::open or the insert/ingest mutation methods. The production integration checkboxes remain open until that wiring and process-interruption tests are committed.
+
+
+## Initial Database integration status
+
+The core Database now owns a WAL writer at catalog-independent path wal/database.anwl. Database::open acquires the exclusive writer lock, validates/truncates the WAL through the M6.1 reader, replays committed ANF/Chronicle artifact intents, discards staged files for incomplete transactions and appends ABORT markers before it rebuilds per-table Chronicle receipt indexes.
+
+Database::insert_batch and Database::ingest_batch now stage and sync complete immutable artifacts, append AMUT v1 BEGIN/MUTATION/COMMIT intent records using OnCommit sync, and publish the final filename with no-replace semantics. A failed/uncertain WAL or final-publication outcome marks the current Database handle recovery-required; data-facing APIs reject further use through that handle and ask the caller to reopen.
+
+Integration tests cover normal ANF/Chronicle close/reopen, fault injection after a durable ANF COMMIT but before final publication, the equivalent Chronicle replay with receipt-index reconstruction and duplicate BatchId behavior, and uncommitted intent discard/ABORT. More publication-boundary crash points, catalog DDL, compaction/Weave publication and checkpoint/rotation remain open. This is not yet a general ACID transaction implementation.

@@ -679,25 +679,26 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 
 **M6.1 boundary:** The ANWL v1 reader/writer is standalone. Database insert/ingest/catalog/compaction mutations are not yet routed through it, and there is no startup replay or rollback. These are M6.2 deliverables; no crash-recovery or ACID guarantee is claimed.
 
-## M6.2 Recovery — protocol defined; replay primitives implemented, storage integration in progress
-- [x] Define startup recovery algorithm for the first immutable ANF/Chronicle artifact scope.
-- [x] Define committed-only redo semantics and explicit handling of incomplete transactions.
-- [x] Define versioned mutation-intent envelope, canonical file names, size and SHA-256 validation.
+## M6.2 Recovery — initial ANF/Chronicle WAL replay integrated
+- [x] Define startup recovery algorithm for immutable ANF/Chronicle artifacts.
+- [x] Define committed-only redo semantics and handling of incomplete transactions.
+- [x] Define versioned AMUT v1 mutation-intent envelope with canonical file names, size and SHA-256.
 - [x] Define staged-file -> durable WAL COMMIT -> no-replace final publication ordering.
-- [x] Define idempotent replay for already-published files and Chronicle BatchId/sequence reconstruction.
-- [x] Define fail-closed behavior for missing committed artifacts and checksum conflicts.
-- [x] Define crash-point matrix for staging, commit, link publication and cleanup.
-- [x] Implement typed AMUT v1 mutation-intent encode/decode with canonical ANF/Chronicle file-name derivation.
-- [x] Implement recovery-plan classification for committed, incomplete and explicitly aborted transactions, preserving WAL order.
-- [x] Implement checksum-verified staging and no-replace final publication helpers.
-- [x] Implement reusable recovery driver for committed replay, incomplete staging cleanup, durable ABORT markers and repeatable recovery.
-- [ ] Integrate ANF insert staging and WAL intent integration.
-- [ ] Integrate Chronicle ingest staging and WAL intent integration.
-- [ ] Run WAL replay before Chronicle index reconstruction in Database::open.
-- [ ] Add recovery-required state after committed publication failure.
-- [ ] Inject process interruption at every listed crash point.
-- [ ] Verify replay idempotence across two consecutive reopens.
-- [ ] Implement catalog DDL replay only after data-artifact replay is proven.
+- [x] Implement streaming checksum-verified staging and idempotent final publication helpers.
+- [x] Implement recovery-plan classification and replay driver for committed/incomplete/aborted transactions.
+- [x] Run WAL recovery in Database::open before Chronicle receipt index reconstruction.
+- [x] Integrate WAL intents with Database::insert_batch (ANF) and Database::ingest_batch (Chronicle).
+- [x] Rebuild Chronicle sequence/BatchId receipt state from recovered published files.
+- [x] Mark the Database handle recovery-required if a WAL append/commit/publication outcome is uncertain.
+- [x] Test normal ANF/Chronicle writes across close/reopen.
+- [x] Fault-inject the stop after durable ANF COMMIT and before final publication; verify startup replay.
+- [x] Fault-inject the stop after Chronicle COMMIT and before final publication; verify receipt rebuild and idempotent duplicate BatchId retry.
+- [x] Test incomplete intent cleanup and durable ABORT on startup.
+- [ ] Inject process interruption at every publication/fsync boundary and verify replay idempotence across repeated crashes.
+- [ ] Integrate catalog DDL, compaction manifests and active-Weave publication with explicit WAL intents.
+- [ ] Add checkpoint installation, WAL rotation and retention only after replay coverage is proven.
+
+**Guarantee boundary:** Initial insert/ingest artifact publication uses WAL-backed redo. Catalog DDL, compaction/Weave/Capsule/Navigation Map publication and multi-operation transactions are not yet covered; do not claim general ACID semantics.
 
 Specification: docs/specifications/wal-recovery-v0.1.md.
 

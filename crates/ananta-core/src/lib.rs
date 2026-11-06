@@ -91,6 +91,8 @@ pub enum DbError {
     CompactionExecution(String),
     CompactionManifest(crate::compaction_manifest::ManifestError),
     CompactionPreflight(&'static str),
+    Wal(String),
+    RecoveryRequired(String),
 }
 
 impl fmt::Display for DbError {
@@ -124,6 +126,8 @@ impl fmt::Display for DbError {
             Self::CompactionExecution(message) => write!(f, "compaction execution failed: {message}"),
             Self::CompactionManifest(error) => write!(f, "invalid compaction manifest: {error}"),
             Self::CompactionPreflight(message) => write!(f, "compaction input preflight failed: {message}"),
+            Self::Wal(message) => write!(f, "ANANTA WAL error: {message}"),
+            Self::RecoveryRequired(message) => write!(f, "database handle requires recovery before use: {message}"),
         }
     }
 }
@@ -394,6 +398,8 @@ pub struct Database {
     root: PathBuf,
     catalog: Catalog,
     chronicle_indices: BTreeMap<ObjectId, TableChronicleIndex>,
+    wal: WalWriter,
+    recovery_required: bool,
     _writer_lock: DatabaseLock,
 }
 
@@ -411,19 +417,104 @@ impl Database {
             Err(error) => return Err(DbError::Io(error)),
         };
         ensure_initial_schema_snapshots(&root, &catalog)?;
+
+        // WAL redo must publish committed Chronicle/ANF artifacts before the
+        // Chronicle receipt indexes are rebuilt from the directory inventory.
+        let wal_path = root.join("wal").join("database.anwl");
+        let mut wal = WalWriter::open(&wal_path, WalSyncPolicy::OnCommit)
+            .map_err(|error| DbError::Wal(error.to_string()))?;
+        let wal_report = read_wal(&wal_path)
+            .map_err(|error| DbError::Wal(error.to_string()))?;
+        recover_staged_artifacts(&wal_report, &mut wal, |intent| {
+            let Some((table_name, definition)) = catalog.tables.iter()
+                .find(|(_, definition)| definition.id.0 == intent.table_id)
+            else {
+                return Err(WalRecoveryError::MissingTableId(intent.table_id));
+            };
+            crate::schema_snapshot::SchemaSnapshot::read_from(
+                &root,
+                definition.id,
+                intent.schema_revision,
+            ).map_err(|error| WalRecoveryError::SchemaSnapshot(error.to_string()))?;
+            Ok(root.join("data").join(table_name))
+        }).map_err(|error| DbError::Wal(error.to_string()))?;
+
+        // Anything left here has no verified committed intent (for example a
+        // process stopped while writing the staging file before BEGIN).
         cleanup_orphan_segment_temps(&root.join("data"))?;
         let mut chronicle_indices = BTreeMap::new();
         for (name, definition) in &catalog.tables {
             let directory = root.join("data").join(name);
             chronicle_indices.insert(definition.id, scan_table_index(&directory, definition.id.0)?);
         }
-        let database = Self { root, catalog, chronicle_indices, _writer_lock: writer_lock };
+        let database = Self {
+            root,
+            catalog,
+            chronicle_indices,
+            wal,
+            recovery_required: false,
+            _writer_lock: writer_lock,
+        };
         database.recover_compaction_jobs()?;
         database.recover_active_weaves()?;
         Ok(database)
     }
 
+    fn ensure_operational(&self) -> Result<(), DbError> {
+        if self.recovery_required {
+            Err(DbError::RecoveryRequired(
+                "a committed WAL intent could not be published; close and reopen the database".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn commit_wal_intent(
+        &mut self,
+        intent: &WalMutationIntent,
+        operation: &[u8],
+    ) -> Result<(), DbError> {
+        let payload = intent.encode()
+            .map_err(|error| DbError::Wal(error.to_string()))?;
+        let transaction_id = self.wal.next_sequence();
+        if let Err(error) = self.wal.begin_transaction(transaction_id, operation) {
+            self.recovery_required = true;
+            return Err(DbError::RecoveryRequired(format!(
+                "could not append WAL BEGIN: {error}"
+            )));
+        }
+        if let Err(error) = self.wal.append_mutation(transaction_id, &payload) {
+            self.recovery_required = true;
+            return Err(DbError::RecoveryRequired(format!(
+                "could not append WAL mutation intent: {error}"
+            )));
+        }
+        if let Err(error) = self.wal.commit_transaction(transaction_id) {
+            self.recovery_required = true;
+            return Err(DbError::RecoveryRequired(format!(
+                "WAL COMMIT durability is uncertain: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn publish_wal_intent(
+        &mut self,
+        directory: &Path,
+        intent: &WalMutationIntent,
+    ) -> Result<PathBuf, DbError> {
+        match publish_staged_wal_artifact(directory, intent) {
+            Ok(path) => Ok(path),
+            Err(error) => {
+                self.recovery_required = true;
+                Err(DbError::RecoveryRequired(error.to_string()))
+            }
+        }
+    }
+
     pub fn create_table(&mut self, name: impl Into<String>, schema: Schema) -> Result<(), DbError> {
+        self.ensure_operational()?;
         let name = name.into();
         validate_name(&name)?;
         if self.catalog.tables.contains_key(&name) {
@@ -462,6 +553,7 @@ impl Database {
     }
 
     pub fn schema(&self, table: &str) -> Result<&Schema, DbError> {
+        self.ensure_operational()?;
         self.catalog.tables.get(table)
             .map(|definition| &definition.schema)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))
@@ -478,6 +570,7 @@ impl Database {
 
     /// Stable database-local identity for a table.
     pub fn table_id(&self, table: &str) -> Result<ObjectId, DbError> {
+        self.ensure_operational()?;
         self.catalog.tables.get(table)
             .map(|definition| definition.id)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))
@@ -486,6 +579,7 @@ impl Database {
     /// Canonical path for the disposable, checksummed analysis cache of a table.
     /// The cache is keyed by stable table identity and is never a source of row data.
     pub fn statistics_cache_path(&self, table: &str) -> Result<PathBuf, DbError> {
+        self.ensure_operational()?;
         let table_id = self.table_id(table)?;
         Ok(self.root.join("catalog").join("statistics")
             .join(format!("table-{:020}.ast", table_id.0)))
@@ -493,6 +587,7 @@ impl Database {
 
     /// Stable database-local identity for a column.
     pub fn column_id(&self, table: &str, column: &str) -> Result<ObjectId, DbError> {
+        self.ensure_operational()?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         let index = definition.schema.columns().iter()
@@ -503,6 +598,7 @@ impl Database {
 
     /// Logical schema revision for a table. A newly-created table starts at revision one.
     pub fn table_schema_revision(&self, table: &str) -> Result<u64, DbError> {
+        self.ensure_operational()?;
         self.catalog.tables.get(table)
             .map(|definition| definition.schema_revision)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))
@@ -516,6 +612,7 @@ impl Database {
     pub fn check_schema_snapshot_consistency(
         &self,
     ) -> Result<SchemaSnapshotConsistencyReport, DbError> {
+        self.ensure_operational()?;
         let mut report = SchemaSnapshotConsistencyReport::default();
         let current = self.catalog.tables.values()
             .map(|definition| (definition.id, definition.schema_revision))
@@ -611,6 +708,7 @@ impl Database {
     ///
     /// This does not change the active catalog revision or enable schema DDL.
     pub fn write_schema_snapshot(&self, table: &str) -> Result<PathBuf, DbError> {
+        self.ensure_operational()?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         let snapshot = SchemaSnapshot::new(
@@ -628,12 +726,14 @@ impl Database {
         table: &str,
         revision: u64,
     ) -> Result<SchemaSnapshot, DbError> {
+        self.ensure_operational()?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         SchemaSnapshot::read_from(&self.root, definition.id, revision)
     }
 
     pub fn insert_batch(&mut self, table: &str, rows: &[Vec<Value>]) -> Result<Option<PathBuf>, DbError> {
+        self.ensure_operational()?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         for row in rows { definition.schema.validate_row(row)?; }
@@ -653,7 +753,18 @@ impl Database {
         let table_dir = self.root.join("data").join(table);
         fs::create_dir_all(&table_dir)?;
         let segment_id = next_segment_id(&table_dir)?;
-        let final_path = publish_segment(&table_dir, segment_id, &bytes)?;
+        let intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::AnfSegment,
+            table_id,
+            schema_revision,
+            file_id: segment_id,
+            file_len: u64::try_from(bytes.len()).map_err(|_| DbError::LengthOverflow)?,
+            sha256: chronicle::sha256(&bytes),
+        };
+        stage_wal_artifact(&table_dir, &intent, &bytes)
+            .map_err(|error| DbError::Wal(error.to_string()))?;
+        self.commit_wal_intent(&intent, b"ANF insert_batch")?;
+        let final_path = self.publish_wal_intent(&table_dir, &intent)?;
         Ok(Some(final_path))
     }
 
@@ -668,20 +779,25 @@ impl Database {
         batch_id: BatchId,
         rows: &[Vec<Value>],
     ) -> Result<IngestResult, DbError> {
+        self.ensure_operational()?;
         if rows.is_empty() {
             let table_id = self.table_id(table)?;
-            let index = self.chronicle_indices.entry(table_id).or_default();
-            index.stats.rejected_requests = index.stats.rejected_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+            if let Some(index) = self.chronicle_indices.get_mut(&table_id) {
+                index.stats.rejected_requests = index.stats.rejected_requests
+                    .checked_add(1).ok_or(DbError::LengthOverflow)?;
+            }
             return Err(DbError::EmptyBatch);
         }
 
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?
             .clone();
-        let directory = self.root.join("data").join(table);
-        let index = self.chronicle_indices.entry(definition.id).or_default();
+        let table_id = definition.id;
 
-        if let Some(existing) = index.by_batch_id.get(&batch_id).cloned() {
+        if let Some(existing) = self.chronicle_indices.get(&table_id)
+            .and_then(|index| index.by_batch_id.get(&batch_id))
+            .cloned()
+        {
             let snapshot = SchemaSnapshot::read_from(
                 &self.root,
                 definition.id,
@@ -700,10 +816,16 @@ impl Database {
                 .map(|bytes| chronicle::sha256(bytes) == existing.metadata.fingerprint)
                 .unwrap_or(false);
             if !fingerprint_matches {
-                index.stats.rejected_requests = index.stats.rejected_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                if let Some(index) = self.chronicle_indices.get_mut(&table_id) {
+                    index.stats.rejected_requests = index.stats.rejected_requests
+                        .checked_add(1).ok_or(DbError::LengthOverflow)?;
+                }
                 return Err(DbError::BatchIdConflict(batch_id));
             }
-            index.stats.duplicate_requests = index.stats.duplicate_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+            if let Some(index) = self.chronicle_indices.get_mut(&table_id) {
+                index.stats.duplicate_requests = index.stats.duplicate_requests
+                    .checked_add(1).ok_or(DbError::LengthOverflow)?;
+            }
             return Ok(IngestResult {
                 outcome: IngestOutcome::Duplicate,
                 batch_id,
@@ -717,13 +839,17 @@ impl Database {
 
         for (row_index, row) in rows.iter().enumerate() {
             if let Err(error) = definition.schema.validate_row(row) {
-                index.stats.rejected_requests = index.stats.rejected_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                if let Some(index) = self.chronicle_indices.get_mut(&table_id) {
+                    index.stats.rejected_requests = index.stats.rejected_requests
+                        .checked_add(1).ok_or(DbError::LengthOverflow)?;
+                }
                 return Err(DbError::IngestRowValidation {
                     row_index,
                     message: error.to_string(),
                 });
             }
         }
+
         let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
         let payload = match encode_segment_v2(
             &definition.schema,
@@ -734,11 +860,16 @@ impl Database {
         ) {
             Ok(payload) => payload,
             Err(error) => {
-                index.stats.rejected_requests = index.stats.rejected_requests.checked_add(1).ok_or(DbError::LengthOverflow)?;
+                if let Some(index) = self.chronicle_indices.get_mut(&table_id) {
+                    index.stats.rejected_requests = index.stats.rejected_requests
+                        .checked_add(1).ok_or(DbError::LengthOverflow)?;
+                }
                 return Err(DbError::Format(error));
             }
         };
-        let sequence = index.next_sequence()?;
+        let sequence = self.chronicle_indices.get(&table_id)
+            .ok_or(DbError::ChronicleCorrupt("table has no Chronicle receipt index"))?
+            .next_sequence()?;
         let (record_bytes, metadata) = encode_record(
             definition.id.0,
             batch_id,
@@ -747,42 +878,56 @@ impl Database {
             u64::try_from(rows.len()).map_err(|_| DbError::LengthOverflow)?,
             &payload,
         )?;
+
+        let directory = self.root.join("data").join(table);
         fs::create_dir_all(&directory)?;
         let physical_file_id = next_segment_id(&directory)?;
-        let expected_path = directory.join(format!("segment-{physical_file_id:020}.chr"));
+        let intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::ChronicleRecord,
+            table_id: definition.id.0,
+            schema_revision: definition.schema_revision,
+            file_id: physical_file_id,
+            file_len: u64::try_from(record_bytes.len()).map_err(|_| DbError::LengthOverflow)?,
+            sha256: chronicle::sha256(&record_bytes),
+        };
+        stage_wal_artifact(&directory, &intent, &record_bytes)
+            .map_err(|error| DbError::Wal(error.to_string()))?;
+        self.commit_wal_intent(&intent, b"Chronicle ingest_batch")?;
 
-        match publish_chronicle(&directory, physical_file_id, &record_bytes) {
-            Ok(path) => {
-                let receipt = BatchReceipt { metadata: metadata.clone(), path: path.clone() };
-                index.record(receipt)?;
-                Ok(IngestResult {
-                    outcome: IngestOutcome::Accepted,
-                    batch_id,
-                    table_id: definition.id.0,
-                    ingestion_sequence: sequence,
-                    row_count: metadata.row_count,
-                    encoded_bytes: metadata.payload_len,
-                    chronicle_path: path,
-                })
-            }
-            Err(error @ DbError::SegmentPublicationUncertain { .. }) => {
-                if expected_path.is_file() {
-                    let (published_metadata, _) = inspect_chronicle_file(&expected_path, definition.id.0)?;
-                    index.record(BatchReceipt {
-                        metadata: published_metadata,
-                        path: expected_path,
-                    })?;
-                    index.stats.uncertain_publications = index.stats.uncertain_publications.checked_add(1).ok_or(DbError::LengthOverflow)?;
-                } else {
-                    index.stats.publication_failures = index.stats.publication_failures.checked_add(1).ok_or(DbError::LengthOverflow)?;
-                }
-                Err(error)
-            }
+        let path = match self.publish_wal_intent(&directory, &intent) {
+            Ok(path) => path,
             Err(error) => {
-                index.stats.publication_failures = index.stats.publication_failures.checked_add(1).ok_or(DbError::LengthOverflow)?;
-                Err(error)
+                if let Some(index) = self.chronicle_indices.get_mut(&table_id) {
+                    index.stats.uncertain_publications = index.stats.uncertain_publications
+                        .checked_add(1).ok_or(DbError::LengthOverflow)?;
+                }
+                return Err(error);
             }
+        };
+        let receipt = BatchReceipt {
+            metadata: metadata.clone(),
+            path: path.clone(),
+        };
+        if let Err(error) = self.chronicle_indices
+            .get_mut(&table_id)
+            .ok_or(DbError::ChronicleCorrupt("table has no Chronicle receipt index"))?
+            .record(receipt)
+        {
+            self.recovery_required = true;
+            return Err(DbError::RecoveryRequired(format!(
+                "Chronicle file was committed but the in-memory receipt index could not advance: {error}"
+            )));
         }
+
+        Ok(IngestResult {
+            outcome: IngestOutcome::Accepted,
+            batch_id,
+            table_id: definition.id.0,
+            ingestion_sequence: sequence,
+            row_count: metadata.row_count,
+            encoded_bytes: metadata.payload_len,
+            chronicle_path: path,
+        })
     }
 
     /// Build one immutable Capsule from an inclusive contiguous range of committed Chronicle sequences.
@@ -798,6 +943,7 @@ impl Database {
         last_sequence: u64,
         event_time_column: Option<&str>,
     ) -> Result<PathBuf, DbError> {
+        self.ensure_operational()?;
         if capsule_id == 0 || generation == 0 || first_sequence == 0 || last_sequence < first_sequence {
             return Err(DbError::CapsuleCorrupt("Capsule identity, generation or source sequence range is invalid"));
         }
@@ -899,6 +1045,7 @@ impl Database {
         table: &str,
         manifest: &crate::compaction_manifest::CompactionInputManifest,
     ) -> Result<CompactionPreflightReport, DbError> {
+        self.ensure_operational()?;
         manifest.validate()?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
@@ -1083,6 +1230,7 @@ impl Database {
         last_sequence: u64,
         capsule_generations: &[(u64, u64)],
     ) -> Result<CompactionInputManifest, DbError> {
+        self.ensure_operational()?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         let index = self.chronicle_indices.get(&definition.id)
@@ -1172,6 +1320,7 @@ impl Database {
         capsule_id: u64,
         generation: u64,
     ) -> Result<Vec<Vec<Value>>, DbError> {
+        self.ensure_operational()?;
         self.validate_capsule(table, capsule_id, generation)?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
@@ -1193,6 +1342,7 @@ impl Database {
         table: &str,
         map_generation: u64,
     ) -> Result<PathBuf, DbError> {
+        self.ensure_operational()?;
         if map_generation == 0 {
             return Err(DbError::NavigationMapCorrupt("map generation must be nonzero"));
         }
@@ -1235,6 +1385,7 @@ impl Database {
         request: &CapsuleScanRequest,
         map_generation: Option<u64>,
     ) -> Result<CapsuleScanResult, DbError> {
+        self.ensure_operational()?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         let mut resolved_ranges = Vec::with_capacity(request.ranges.len());
@@ -1373,6 +1524,7 @@ impl Database {
         capsule_id: u64,
         generation: u64,
     ) -> Result<CapsuleMetadata, DbError> {
+        self.ensure_operational()?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         if capsule_id == 0 || generation == 0 {
@@ -1434,6 +1586,7 @@ impl Database {
     /// Return independently validated metadata for every canonical Capsule generation.
     /// The returned entries are sorted by their source Chronicle sequence interval.
     pub fn verified_capsule_metadata(&self, table: &str) -> Result<Vec<CapsuleMetadata>, DbError> {
+        self.ensure_operational()?;
         let directory = self.root.join("data").join(table).join("capsules");
         match fs::symlink_metadata(&directory) {
             Ok(metadata) if metadata.file_type().is_dir() => {}
@@ -1458,6 +1611,7 @@ impl Database {
     /// before an analytical query may replace the authoritative scan with a
     /// materialised Navigation Map Capsule path.
     pub fn capsules_cover_chronicle(&self, table: &str) -> Result<bool, DbError> {
+        self.ensure_operational()?;
         let stats = self.ingestion_stats(table)?;
         if stats.accepted_batches == 0 {
             return Ok(false);
@@ -1499,6 +1653,7 @@ impl Database {
     /// Durable accepted counters are reconstructed from Chronicle receipts on open.
     /// Request/failure counters are process-local and reset after restart.
     pub fn ingestion_stats(&self, table: &str) -> Result<IngestionStats, DbError> {
+        self.ensure_operational()?;
         let definition = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         Ok(self.chronicle_indices.get(&definition.id)
@@ -1507,6 +1662,7 @@ impl Database {
     }
 
     pub fn scan(&self, table: &str) -> Result<Vec<Vec<Value>>, DbError> {
+        self.ensure_operational()?;
         let schema = self.schema(table)?;
         let projection = (0..schema.len()).collect::<Vec<_>>();
         self.scan_projected_indices(table, &projection)
@@ -1515,6 +1671,7 @@ impl Database {
     /// Return only the requested logical columns, preserving caller order.
     /// ANF v0.1 and v0.2 segments are resolved independently using their stored schema identity.
     pub fn scan_columns(&self, table: &str, columns: &[&str]) -> Result<Vec<Vec<Value>>, DbError> {
+        self.ensure_operational()?;
         let schema = self.schema(table)?;
         let mut projection = Vec::with_capacity(columns.len());
         for name in columns {
@@ -1528,6 +1685,7 @@ impl Database {
 
     /// Scan all logical columns in bounded columnar batches.
     pub fn scan_batches(&self, table: &str, batch_rows: usize) -> Result<ScanBatchIter, DbError> {
+        self.ensure_operational()?;
         let schema = self.schema(table)?;
         let projection = (0..schema.len()).collect::<Vec<_>>();
         self.scan_indices_batches(table, projection, batch_rows, None)
@@ -1540,6 +1698,7 @@ impl Database {
         columns: &[&str],
         batch_rows: usize,
     ) -> Result<ScanBatchIter, DbError> {
+        self.ensure_operational()?;
         let schema = self.schema(table)?;
         let mut projection = Vec::with_capacity(columns.len());
         for name in columns {
@@ -1557,6 +1716,7 @@ impl Database {
         batch_rows: usize,
         row_limit: usize,
     ) -> Result<ScanBatchIter, DbError> {
+        self.ensure_operational()?;
         let schema = self.schema(table)?;
         let projection = (0..schema.len()).collect::<Vec<_>>();
         self.scan_indices_batches(table, projection, batch_rows, Some(row_limit))
@@ -1570,6 +1730,7 @@ impl Database {
         batch_rows: usize,
         row_limit: usize,
     ) -> Result<ScanBatchIter, DbError> {
+        self.ensure_operational()?;
         let schema = self.schema(table)?;
         let mut projection = Vec::with_capacity(columns.len());
         for name in columns {
@@ -1587,6 +1748,7 @@ impl Database {
         batch_rows: usize,
         row_limit: Option<usize>,
     ) -> Result<ScanBatchIter, DbError> {
+        self.ensure_operational()?;
         if batch_rows == 0 || batch_rows > MAX_BATCH_ROWS {
             return Err(DbError::Format(FormatError::LimitExceeded(
                 "batch row count must be between 1 and 65536",
@@ -4814,6 +4976,212 @@ mod tests {
             ))
         ));
         drop(db);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+
+    #[test]
+    fn database_wal_persists_anf_and_chronicle_writes_across_reopen() {
+        let path = temp_path();
+        let batch_id = BatchId::from_bytes([0xA1; 16]).unwrap();
+        let anf_row = vec![
+            Value::TimestampMicros(1_000),
+            Value::Utf8("anf-device".into()),
+            Value::Float64(21.5),
+        ];
+        let chronicle_rows = vec![vec![
+            Value::TimestampMicros(2_000),
+            Value::Utf8("chronicle-device".into()),
+            Value::Float64(22.5),
+        ]];
+
+        let mut database = Database::open(&path).unwrap();
+        database.create_table("telemetry", sample_schema()).unwrap();
+        let anf_path = database.insert_batch("telemetry", &[anf_row.clone()])
+            .unwrap().unwrap();
+        assert!(anf_path.is_file());
+        let ingested = database.ingest_batch("telemetry", batch_id, &chronicle_rows).unwrap();
+        assert_eq!(ingested.outcome, IngestOutcome::Accepted);
+        assert!(ingested.chronicle_path.is_file());
+        drop(database);
+
+        let wal_path = path.join("wal").join("database.anwl");
+        let report = read_wal(&wal_path).unwrap();
+        assert_eq!(
+            report.records.iter().filter(|record| record.kind == WalRecordKind::Commit).count(),
+            2,
+        );
+        assert!(report.is_clean());
+
+        let mut reopened = Database::open(&path).unwrap();
+        let rows = reopened.scan("telemetry").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row[1] == Value::Utf8("anf-device".into())));
+        assert!(rows.iter().any(|row| row[1] == Value::Utf8("chronicle-device".into())));
+        let stats = reopened.ingestion_stats("telemetry").unwrap();
+        assert_eq!(stats.accepted_batches, 1);
+        assert_eq!(stats.accepted_rows, 1);
+
+        let duplicate = reopened.ingest_batch("telemetry", batch_id, &chronicle_rows).unwrap();
+        assert_eq!(duplicate.outcome, IngestOutcome::Duplicate);
+        assert_eq!(duplicate.chronicle_path, ingested.chronicle_path);
+
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn database_open_replays_committed_staged_anf_before_scanning() {
+        let path = temp_path();
+        let mut database = Database::open(&path).unwrap();
+        database.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(3_000),
+            Value::Utf8("replayed-device".into()),
+            Value::Float64(23.5),
+        ]];
+        let definition = database.catalog.tables.get("telemetry").unwrap().clone();
+        let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let bytes = encode_segment_v2(
+            &definition.schema,
+            &rows,
+            definition.id.0,
+            definition.schema_revision,
+            &column_ids,
+        ).unwrap();
+        let table_dir = path.join("data").join("telemetry");
+        let file_id = next_segment_id(&table_dir).unwrap();
+        let intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::AnfSegment,
+            table_id: definition.id.0,
+            schema_revision: definition.schema_revision,
+            file_id,
+            file_len: bytes.len() as u64,
+            sha256: chronicle::sha256(&bytes),
+        };
+        let staging = stage_wal_artifact(&table_dir, &intent, &bytes).unwrap();
+        database.commit_wal_intent(&intent, b"fault-injected committed ANF insert").unwrap();
+        assert!(staging.is_file());
+        drop(database); // Simulates a stop after durable COMMIT but before final publication.
+
+        let reopened = Database::open(&path).unwrap();
+        let actual_rows = reopened.scan("telemetry").unwrap();
+        assert_eq!(actual_rows, rows);
+        assert_eq!(actual_rows.len(), 1);
+        assert_eq!(actual_rows[0][1], Value::Utf8("replayed-device".into()));
+        assert!(table_dir.join(intent.artifact_kind.final_file_name(file_id)).is_file());
+        assert!(!staging.exists());
+
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn database_open_replays_committed_staged_chronicle_before_rebuilding_index() {
+        let path = temp_path();
+        let mut database = Database::open(&path).unwrap();
+        database.create_table("telemetry", sample_schema()).unwrap();
+        let batch_id = BatchId::from_bytes([0xB2; 16]).unwrap();
+        let rows = vec![vec![
+            Value::TimestampMicros(5_000),
+            Value::Utf8("replayed-chronicle-device".into()),
+            Value::Float64(25.5),
+        ]];
+
+        let definition = database.catalog.tables.get("telemetry").unwrap().clone();
+        let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let payload = encode_segment_v2(
+            &definition.schema,
+            &rows,
+            definition.id.0,
+            definition.schema_revision,
+            &column_ids,
+        ).unwrap();
+        let sequence = database.chronicle_indices.get(&definition.id).unwrap()
+            .next_sequence().unwrap();
+        let (record_bytes, _metadata) = chronicle::encode_record(
+            definition.id.0,
+            batch_id,
+            sequence,
+            definition.schema_revision,
+            rows.len() as u64,
+            &payload,
+        ).unwrap();
+        let table_dir = path.join("data").join("telemetry");
+        let file_id = next_segment_id(&table_dir).unwrap();
+        let intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::ChronicleRecord,
+            table_id: definition.id.0,
+            schema_revision: definition.schema_revision,
+            file_id,
+            file_len: record_bytes.len() as u64,
+            sha256: chronicle::sha256(&record_bytes),
+        };
+        let staging = stage_wal_artifact(&table_dir, &intent, &record_bytes).unwrap();
+        database.commit_wal_intent(&intent, b"fault-injected committed Chronicle ingest").unwrap();
+        assert!(staging.is_file());
+        drop(database); // Crash after durable COMMIT and before Chronicle final-name publication.
+
+        let mut reopened = Database::open(&path).unwrap();
+        let stats = reopened.ingestion_stats("telemetry").unwrap();
+        assert_eq!(stats.accepted_batches, 1);
+        assert_eq!(stats.accepted_rows, 1);
+        assert_eq!(reopened.scan("telemetry").unwrap(), rows);
+        let duplicate = reopened.ingest_batch("telemetry", batch_id, &rows).unwrap();
+        assert_eq!(duplicate.outcome, IngestOutcome::Duplicate);
+        assert_eq!(duplicate.ingestion_sequence, 1);
+        assert!(!staging.exists());
+        assert!(table_dir.join(intent.artifact_kind.final_file_name(file_id)).is_file());
+
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn database_open_discards_incomplete_staged_intent_and_appends_abort() {
+        let path = temp_path();
+        let mut database = Database::open(&path).unwrap();
+        database.create_table("telemetry", sample_schema()).unwrap();
+        let definition = database.catalog.tables.get("telemetry").unwrap().clone();
+        let rows = vec![vec![
+            Value::TimestampMicros(4_000),
+            Value::Utf8("uncommitted-device".into()),
+            Value::Float64(24.5),
+        ]];
+        let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        let bytes = encode_segment_v2(
+            &definition.schema,
+            &rows,
+            definition.id.0,
+            definition.schema_revision,
+            &column_ids,
+        ).unwrap();
+        let table_dir = path.join("data").join("telemetry");
+        let file_id = next_segment_id(&table_dir).unwrap();
+        let intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::AnfSegment,
+            table_id: definition.id.0,
+            schema_revision: definition.schema_revision,
+            file_id,
+            file_len: bytes.len() as u64,
+            sha256: chronicle::sha256(&bytes),
+        };
+        let staging = stage_wal_artifact(&table_dir, &intent, &bytes).unwrap();
+        let transaction_id = database.wal.next_sequence();
+        database.wal.begin_transaction(transaction_id, b"fault-injected incomplete ANF insert").unwrap();
+        database.wal.append_mutation(transaction_id, &intent.encode().unwrap()).unwrap();
+        database.wal.sync().unwrap();
+        drop(database); // Simulates a stop after intent but before COMMIT.
+
+        let reopened = Database::open(&path).unwrap();
+        assert!(reopened.scan("telemetry").unwrap().is_empty());
+        assert!(!staging.exists());
+        assert!(!table_dir.join(intent.artifact_kind.final_file_name(file_id)).exists());
+        let report = read_wal(path.join("wal").join("database.anwl")).unwrap();
+        assert!(report.is_clean());
+        assert_eq!(report.records.last().unwrap().kind, WalRecordKind::Abort);
+
+        drop(reopened);
         fs::remove_dir_all(path).unwrap();
     }
 
