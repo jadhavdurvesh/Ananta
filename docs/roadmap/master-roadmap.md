@@ -703,7 +703,7 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Exercise the ANF insert and Chronicle ingest paths at every checkpoint; reopen twice, verify row/file counts, and verify Chronicle receipt reconstruction plus duplicate BatchId resolution.
 - [x] Add subprocess-termination tests at WAL MUTATION, durable COMMIT and final-name link for both ANF and Chronicle; reopen after process exit and reopen a second time to verify rows, receipts, and artifact counts.
 - [x] WAL-protect `create_table`, nullable-column addition, column rename and column reorder with ordered schema-snapshot + versioned-catalog multi-intent transactions; replay committed catalog mutations before later data writes.
-- [x] Add in-process and subprocess crash/reopen coverage for DDL after WAL COMMIT, schema publication, versioned catalog publication and canonical catalog replacement.
+- [x] Add in-process and subprocess crash/reopen coverage for DDL after WAL COMMIT, schema publication, versioned catalog publication, canonical replacement-temp sync, atomic rename before directory sync, and completed canonical catalog replacement.
 - [ ] Integrate compaction manifests, active-Weave pointers, Capsule and Navigation Map publication with explicit WAL intents.
 - [ ] Add checkpoint installation, WAL rotation and retention only after replay coverage is proven.
 
