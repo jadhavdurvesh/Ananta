@@ -35,7 +35,7 @@ pub use chronicle::{BatchId, IngestOutcome, IngestResult, IngestionStats};
 pub use capsule::{CapsuleColumnStats, CapsuleMetadata};
 pub use navigation_map::{CapsuleScanDiagnostics, CapsuleScanRequest, CapsuleScanResult, ColumnRangePredicate};
 use schema_snapshot::{SchemaSnapshot, SchemaSnapshotConsistencyReport};
-use segment_publication::{cleanup_orphan_segment_temps, publish_segment, publish_chronicle, publish_capsule, publish_navigation_map, DatabaseLock};
+use segment_publication::{cleanup_orphan_segment_temps, publish_segment, publish_chronicle, DatabaseLock};
 use chronicle::{encode_record, extract_payload, inspect_file as inspect_chronicle_file, inspect_reader as inspect_chronicle_reader, scan_table_index, BatchReceipt, PayloadReader, TableChronicleIndex};
 use capsule::{decode_capsule, derive_column_stats, derive_temporal_bounds, encode_capsule};
 use navigation_map::{file_sha256, map_filename, range_may_match, value_matches, NavigationMap, NavigationMapEntry};
@@ -503,6 +503,27 @@ impl Database {
                             .map_err(|_| WalRecoveryError::FileConflict("active pointer WAL replay failed"))?;
                     }
                     Ok(weave_root)
+                }
+                WalArtifactKind::Capsule => {
+                    let Some((table_name, _definition)) = catalog.tables.iter()
+                        .find(|(_, definition)| definition.id.0 == intent.table_id)
+                    else {
+                        return Err(WalRecoveryError::MissingTableId(intent.table_id));
+                    };
+                    Ok(root.join("data").join(table_name).join("capsules"))
+                }
+                WalArtifactKind::NavigationMap => {
+                    let Some((table_name, definition)) = catalog.tables.iter()
+                        .find(|(_, definition)| definition.id.0 == intent.table_id)
+                    else {
+                        return Err(WalRecoveryError::MissingTableId(intent.table_id));
+                    };
+                    if definition.schema_revision != intent.schema_revision {
+                        return Err(WalRecoveryError::FileConflict(
+                            "Navigation Map schema revision differs from the catalog",
+                        ));
+                    }
+                    Ok(root.join("data").join(table_name).join("capsules"))
                 }
                 WalArtifactKind::CompactionOutputManifest => {
                     let Some((table_name, definition)) = catalog.tables.iter()
@@ -1217,7 +1238,7 @@ impl Database {
     /// The current logical schema is used for the derived ANF payload. Historical source
     /// batches are resolved by stable ColumnId. No Chronicle records are removed or hidden.
     pub fn build_capsule(
-        &self,
+        &mut self,
         table: &str,
         capsule_id: u64,
         generation: u64,
@@ -1313,7 +1334,21 @@ impl Database {
         let capsule_bytes = encode_capsule(metadata, &payload)?;
         let capsule_directory = self.root.join("data").join(table).join("capsules");
         fs::create_dir_all(&capsule_directory)?;
-        publish_capsule(&capsule_directory, capsule_id, generation, &capsule_bytes)
+        let intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::Capsule,
+            table_id: definition.id.0,
+            // Capsule generations are independent from logical schema revisions.
+            // AMUT v1 keeps this generation in the existing revision slot; the
+            // Capsule header carries and validates its actual schema revision.
+            schema_revision: generation,
+            file_id: capsule_id,
+            file_len: u64::try_from(capsule_bytes.len()).map_err(|_| DbError::LengthOverflow)?,
+            sha256: chronicle::sha256(&capsule_bytes),
+        };
+        stage_wal_artifact(&capsule_directory, &intent, &capsule_bytes)
+            .map_err(|error| DbError::Wal(error.to_string()))?;
+        self.commit_wal_intent(&intent, b"Capsule build_capsule")?;
+        self.publish_wal_intent(&capsule_directory, &intent)
     }
 
     /// Verify every Capsule and Chronicle file pinned by a canonical compaction input manifest.
@@ -1620,7 +1655,7 @@ impl Database {
     /// A new generation is published as a separate .nvm file and never overwrites a
     /// previous map generation. The map is an index only; Capsule files remain authoritative.
     pub fn build_navigation_map(
-        &self,
+        &mut self,
         table: &str,
         map_generation: u64,
     ) -> Result<PathBuf, DbError> {
@@ -1654,7 +1689,18 @@ impl Database {
             entries,
         };
         let bytes = map.encode()?;
-        publish_navigation_map(&capsule_directory, map_generation, &bytes)
+        let intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::NavigationMap,
+            table_id: definition.id.0,
+            schema_revision: definition.schema_revision,
+            file_id: map_generation,
+            file_len: u64::try_from(bytes.len()).map_err(|_| DbError::LengthOverflow)?,
+            sha256: chronicle::sha256(&bytes),
+        };
+        stage_wal_artifact(&capsule_directory, &intent, &bytes)
+            .map_err(|error| DbError::Wal(error.to_string()))?;
+        self.commit_wal_intent(&intent, b"Navigation Map build_navigation_map")?;
+        self.publish_wal_intent(&capsule_directory, &intent)
     }
 
     /// Scan derived Capsules with exact row predicates and optional safe Navigation Map pruning.
