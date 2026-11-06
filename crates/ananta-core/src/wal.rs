@@ -263,6 +263,97 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Atomically replace the current WAL with a new log whose first frame
+    /// anchors a separately synced, checksummed database checkpoint manifest.
+    ///
+    /// This operation is currently enabled on Unix, where rename atomically
+    /// replaces the existing pathname while the old file handle remains open.
+    /// Other targets fail closed until a platform-specific atomic replace is
+    /// implemented; they never emulate replacement with delete-then-rename.
+    pub(crate) fn replace_with_checkpoint(&mut self, payload: &[u8]) -> Result<(), WalError> {
+        self.ensure_healthy()?;
+        if !self.active_transactions.is_empty() {
+            return Err(WalError::InvalidRecord(
+                "WAL rotation requires no open transactions".into(),
+            ));
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = payload;
+            return Err(WalError::Io(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "atomic WAL replacement is not implemented on this platform",
+            )));
+        }
+
+        #[cfg(unix)]
+        {
+            self.file.sync_all()?;
+            let parent = self.path.parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let filename = self.path.file_name()
+                .ok_or(WalError::InvalidHeader)?
+                .to_string_lossy();
+            let temporary = parent.join(format!(".{filename}.checkpoint.tmp"));
+
+            match fs::symlink_metadata(&temporary) {
+                Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(&temporary)?,
+                Ok(_) => return Err(WalError::InvalidRecord(
+                    "WAL checkpoint temporary path is not a regular file".into(),
+                )),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(WalError::Io(error)),
+            }
+
+            let checkpoint = WalRecord {
+                sequence: 1,
+                transaction_id: 0,
+                kind: WalRecordKind::Checkpoint,
+                payload: payload.to_vec(),
+            };
+            apply_transaction_record(&mut BTreeMap::new(), &checkpoint)?;
+            let encoded = encode_record(&checkpoint)?;
+            let mut staged = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            staged.write_all(FILE_MAGIC)?;
+            staged.write_all(&FILE_VERSION.to_le_bytes())?;
+            staged.write_all(&(FILE_HEADER_LEN as u16).to_le_bytes())?;
+            staged.write_all(&encoded)?;
+            staged.flush()?;
+            staged.sync_all()?;
+            drop(staged);
+            sync_wal_directory(parent)?;
+            crate::wal_recovery::maybe_crash_after(
+                crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointTempSynced,
+            );
+
+            // POSIX rename atomically replaces the WAL directory entry. Until
+            // this point the old complete log remains the authoritative path.
+            fs::rename(&temporary, &self.path)?;
+            crate::wal_recovery::maybe_crash_after(
+                crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointRenamedBeforeDirectorySync,
+            );
+            sync_wal_directory(parent)?;
+            crate::wal_recovery::maybe_crash_after(
+                crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointDirectorySync,
+            );
+
+            let replacement = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&self.path)?;
+            self.file = replacement;
+            self.next_sequence = 2;
+            self.active_transactions.clear();
+            self.poisoned = false;
+            Ok(())
+        }
+    }
+
     fn append(
         &mut self,
         kind: WalRecordKind,
@@ -311,6 +402,11 @@ impl WalWriter {
             Ok(())
         }
     }
+}
+
+#[cfg(unix)]
+fn sync_wal_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
 }
 
 /// Read and verify a WAL. Complete frames are checksum/sequence/transaction
