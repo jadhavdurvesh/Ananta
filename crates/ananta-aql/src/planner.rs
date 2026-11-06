@@ -388,6 +388,35 @@ mod tests{
     }
 
     #[test]
+    fn explain_uses_fresh_database_statistics_cache_and_drops_it_after_write(){
+        let(mut db,root)=fixture();
+        let _analysis=ananta_execution::analyze_table_and_persist(&db,"telemetry",1).unwrap();
+        let query=crate::parse("SELECT device FROM telemetry WHERE value >= 0.5").unwrap();
+
+        let fresh=explain(&db,&query,&ParameterBindings::default(),PlannerOptions::default()).unwrap();
+        assert!(fresh.table_statistics.analyzed_snapshot_available);
+        assert_eq!(fresh.table_statistics.row_count,Some(1));
+        let value_stats=fresh.table_statistics.columns.iter()
+            .find(|column|column.name=="value").unwrap();
+        assert_eq!(value_stats.null_count,Some(0));
+        assert!(value_stats.approximate_distinct_count.is_some());
+        assert_eq!(value_stats.histogram_bucket_count,1);
+        assert!(fresh.render().contains("analyzed_snapshot=true"));
+
+        // A newly published segment changes the inventory fingerprint, so the
+        // planner must stop using the old cache and report unknown cardinality.
+        db.insert_batch("telemetry",&[
+            vec![Value::TimestampMicros(20),Value::Utf8("b".into()),Value::Float64(2.0)],
+        ]).unwrap();
+        let stale=explain(&db,&query,&ParameterBindings::default(),PlannerOptions::default()).unwrap();
+        assert!(!stale.table_statistics.analyzed_snapshot_available);
+        assert_eq!(stale.table_statistics.row_count,None);
+        assert!(stale.notes.iter().any(|note|note.contains("no fresh ANALYZE cache")));
+
+        drop(db);fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn explain_keeps_unknown_statistics_unknown(){
         let root=std::env::temp_dir().join("ananta-empty-plan");
         let _=fs::remove_dir_all(&root);
