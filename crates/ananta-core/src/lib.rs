@@ -3417,6 +3417,51 @@ mod tests {
     }
 
     #[test]
+    fn catalog_wal_recovery_replays_create_table_at_every_ddl_publication_boundary() {
+        use crate::wal_recovery::WalRecoveryCrashPoint::*;
+
+        for point in [
+            AfterWalCommit,
+            AfterSchemaSnapshotPublished,
+            AfterCatalogSnapshotPublished,
+            AfterCanonicalCatalogPublished,
+        ] {
+            let path = temp_path();
+            let mut database = Database::open(&path).unwrap();
+            crate::wal_recovery::arm_wal_recovery_crash_point(point);
+            let interruption = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                database.create_table("telemetry", sample_schema())
+            }));
+            assert!(interruption.is_err(), "DDL checkpoint {point:?} was not reached");
+            drop(database);
+
+            let expected_schema = sample_schema();
+            let recovered = Database::open(&path).unwrap();
+            assert_eq!(recovered.schema("telemetry").unwrap(), &expected_schema, "at {point:?}");
+            assert_eq!(recovered.catalog_revision(), 1);
+            assert!(recovered.table_id("telemetry").is_ok());
+            assert!(recovered.scan("telemetry").unwrap().is_empty());
+            assert!(SchemaSnapshot::path(
+                &path,
+                recovered.table_id("telemetry").unwrap(),
+                1,
+            ).unwrap().is_file());
+            assert!(path.join("catalog").join("catalog-00000000000000000001.anc").is_file());
+            assert!(recovered.check_schema_snapshot_consistency().unwrap().is_clean());
+            drop(recovered);
+
+            // Every historical catalog mutation must remain idempotent on a
+            // second startup after the canonical catalog was recovered.
+            let reopened = Database::open(&path).unwrap();
+            assert_eq!(reopened.schema("telemetry").unwrap(), &expected_schema);
+            assert_eq!(reopened.catalog_revision(), 1);
+            assert!(reopened.check_schema_snapshot_consistency().unwrap().is_clean());
+            drop(reopened);
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
     fn nullable_column_refuses_to_overwrite_conflicting_orphan_snapshot() {
         let path = temp_path();
         let mut db = Database::open(&path).unwrap();
