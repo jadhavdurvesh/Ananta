@@ -193,3 +193,15 @@ The core test build exposes one-shot interruption checkpoints after each operati
 The Database-level tests run both `insert_batch` and `ingest_batch` through every checkpoint. Pre-COMMIT interruptions must reopen with no visible row or receipt and no canonical staging file. Post-COMMIT interruptions must reopen with exactly one immutable artifact; Chronicle receipts must be rebuilt and an identical BatchId retry must resolve as a duplicate. Every case is opened a second time to check replay idempotence.
 
 These checkpoints are deterministic in-process panic injections at the same code boundaries. They prove that recovery handles the resulting filesystem/WAL states, but they are not a substitute for subprocess-kill tests, block-device fault injection, or real power-loss testing. Those remain part of the M6.2 validation backlog.
+
+
+## 12. Subprocess termination validation
+
+The unit-test binary includes a narrowly scoped worker test that can be launched as a child process. The child exits with code 86 at selected recovery checkpoints without running Rust destructors, leaving the database writer-lock file stale as a real abruptly terminated process would.
+
+The parent test waits for child exit before removing that stale lock, then opens the database and verifies recovery. The matrix currently covers:
+- ANF and Chronicle interruption after a durable staging artifact and WAL MUTATION but before COMMIT: recovery publishes no rows/receipts and removes staging files.
+- ANF and Chronicle interruption immediately after durable COMMIT: recovery publishes exactly one artifact.
+- ANF and Chronicle interruption immediately after final-name link but before the directory-sync checkpoint: recovery verifies the final artifact and completes cleanup.
+
+Every subprocess case is reopened a second time. Chronicle committed cases also verify receipt reconstruction and identical BatchId duplicate resolution. These are process-termination tests on the test filesystem; they still do not simulate power loss, volatile controller caches, or storage-device write reordering. Extend the subprocess matrix to the remaining sync/cleanup boundaries and add filesystem-level fault injection before claiming the full M6.2 crash matrix complete.
