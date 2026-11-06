@@ -768,6 +768,12 @@ impl Database {
     /// references the manifest; subsequent transactions are replayed after it.
     /// Full replay is retained for every transaction written after the marker.
     pub fn create_checkpoint(&mut self) -> Result<CheckpointReport, DbError> {
+        #[cfg(not(unix))]
+        {
+            return Err(DbError::Wal(
+                "atomic WAL checkpoint rotation is currently supported only on Unix".into(),
+            ));
+        }
         self.ensure_operational()?;
         let consistency = self.check_consistency(1024)?;
         if !consistency.inventory.temporary_files.is_empty() {
