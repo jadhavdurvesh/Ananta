@@ -132,11 +132,11 @@ Until these tests pass on actual Database mutation paths, the engine must contin
 
 ## Implemented recovery primitives
 
-The core crate now exposes AMUT v1 typed mutation intents for ANF segment and Chronicle record artifacts. The fixed-width envelope carries TableId, schema revision, preallocated file ID, exact file length and SHA-256. Final and staging filenames are derived from artifact kind and numeric ID; the WAL payload does not contain an arbitrary filesystem path.
+The core crate exposes AMUT v1 typed mutation intents for ANF segments, Chronicle records, immutable schema snapshots and versioned catalog snapshots. The fixed-width envelope carries TableId, schema revision, artifact-specific file ID, exact file length and SHA-256. Final and staging filenames are derived from artifact kind and numeric ID; the WAL payload does not contain an arbitrary filesystem path.
 
 The recovery planner consumes an already-verified WalReadReport and classifies transactions into committed redo work, incomplete staging cleanup work, or explicitly aborted work. Committed and incomplete transaction lists preserve BEGIN order in the WAL. Unit tests cover intent round-trip, canonical naming, malformed artifact kinds, zero IDs, unsupported intent versions and committed/incomplete/aborted classification.
 
-These primitives do not yet publish or replay database files; Database::open and the ANF/Chronicle write paths are the next integration stage.
+These primitives are connected to `Database::open` and to the ANF, Chronicle and supported catalog DDL write paths. Compaction/Weave/Capsule/Navigation Map publication is still outside the current replay boundary.
 
 
 ## Implemented staged publication and replay driver
@@ -145,19 +145,19 @@ The core recovery module now provides staging, publishing and discard helpers. S
 
 The recover_staged_artifacts driver consumes a verified WAL report, publishes all committed intents, discards only staging names owned by incomplete transactions, appends explicit ABORT records, and syncs those markers. Its tests cover committed replay, repeat replay, incomplete cleanup, missing committed artifacts, conflicting final checksums and canonical file derivation.
 
-These helpers are still not invoked by Database::open or the insert/ingest mutation methods. The production integration checkboxes remain open until that wiring and process-interruption tests are committed.
+The helpers are invoked by `Database::open`, `insert_batch`, `ingest_batch` and the shared catalog DDL publication path. The test suite includes deterministic interruption coverage and child-process termination cases; execution of the newly added DDL tests remains outstanding in the current environment.
 
 
 ## Initial Database integration status
 
-The core Database now owns a WAL writer at catalog-independent path wal/database.anwl. Database::open acquires the exclusive writer lock, validates/truncates the WAL through the M6.1 reader, replays committed ANF/Chronicle artifact intents, discards staged files for incomplete transactions and appends ABORT markers before it rebuilds per-table Chronicle receipt indexes.
+The core Database owns a WAL writer at catalog-independent path `wal/database.anwl`. `Database::open` acquires the exclusive writer lock, validates/truncates the WAL through the M6.1 reader, replays committed ANF/Chronicle and catalog metadata intents in transaction order, discards staged files for incomplete transactions and appends ABORT markers before it rebuilds per-table Chronicle receipt indexes.
 
 Database::insert_batch and Database::ingest_batch now stage and sync complete immutable artifacts, append AMUT v1 BEGIN/MUTATION/COMMIT intent records using OnCommit sync, and publish the final filename with no-replace semantics. A failed/uncertain WAL or final-publication outcome marks the current Database handle recovery-required; data-facing APIs reject further use through that handle and ask the caller to reopen.
 
-Integration tests cover normal ANF/Chronicle close/reopen, fault injection after a durable ANF COMMIT but before final publication, the equivalent Chronicle replay with receipt-index reconstruction and duplicate BatchId behavior, and uncommitted intent discard/ABORT. More publication-boundary crash points, catalog DDL, compaction/Weave publication and checkpoint/rotation remain open. This is not yet a general ACID transaction implementation.
+Integration tests cover normal ANF/Chronicle close/reopen, deterministic interruptions across their staging/WAL/publication boundaries, subprocess termination around WAL commit/publication, catalog DDL replay and DDL publication crash points. DDL subprocess tests were added but not executed in the current environment. Compaction/Weave/Capsule/Navigation Map publication and checkpoint/rotation remain open. This is not a general ACID transaction implementation.
 
 
-The current Database integration also synchronises the WAL directory after header creation, and synchronises both the data root and newly-created table directory during table creation. This closes the parent-directory entry durability gap for the initial ANF/Chronicle write path on platforms where directory fsync is supported.
+The current Database integration synchronises the WAL directory after header creation, and synchronises the data root/table directory before catalog DDL COMMIT as well as before staged data publication. Directory fsync is applied on platforms that support it.
 
 
 ## Error compatibility at recovery boundaries
@@ -201,12 +201,11 @@ These checkpoints are deterministic in-process panic injections at the same code
 
 The unit-test binary includes a narrowly scoped worker test that can be launched as a child process. The child exits with code 86 at selected recovery checkpoints without running Rust destructors, leaving the database writer-lock file stale as a real abruptly terminated process would.
 
-The parent test waits for child exit before removing that stale lock, then opens the database and verifies recovery. The matrix currently covers:
-- ANF and Chronicle interruption after a durable staging artifact and WAL MUTATION but before COMMIT: recovery publishes no rows/receipts and removes staging files.
-- ANF and Chronicle interruption immediately after durable COMMIT: recovery publishes exactly one artifact.
-- ANF and Chronicle interruption immediately after final-name link but before the directory-sync checkpoint: recovery verifies the final artifact and completes cleanup.
+The parent test waits for child exit before removing that stale lock, then opens the database and verifies recovery. The matrix covers:
+- ANF and Chronicle interruption after a durable staging artifact and WAL MUTATION but before COMMIT, immediately after durable COMMIT, and immediately after final-name link.
+- Catalog DDL interruption after durable COMMIT, schema snapshot publication, versioned catalog publication, canonical replacement-temp sync, atomic rename before directory sync, and completed canonical catalog replacement.
 
-Every subprocess case is reopened a second time. Chronicle committed cases also verify receipt reconstruction and identical BatchId duplicate resolution. These are process-termination tests on the test filesystem; they still do not simulate power loss, volatile controller caches, or storage-device write reordering. Extend the subprocess matrix to the remaining sync/cleanup boundaries and add filesystem-level fault injection before claiming the full M6.2 crash matrix complete.
+Every subprocess case is reopened a second time. Chronicle committed cases also verify receipt reconstruction and identical BatchId duplicate resolution. DDL cases verify catalog/schema revisions, the new column and immutable snapshot consistency. These are process-termination tests on the test filesystem; they do not simulate power loss, volatile controller caches, or storage-device write reordering. Extend the subprocess matrix to all remaining sync/cleanup boundaries and add filesystem-level fault injection before claiming the full M6.2 crash matrix complete.
 
 
 ## 13. Catalog DDL WAL implementation boundary
