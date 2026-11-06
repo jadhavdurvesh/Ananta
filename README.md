@@ -37,9 +37,13 @@ AQL v0.1 is implemented as a native Rust language crate, not SQL passed through 
 
 - [AQL v0.1 grammar and semantics](docs/specifications/aql-v0.1.md)
 
+## Native execution v0.1 status
+
+The separate Rust `ananta-execution` crate introduces the M5 pull-based operator runtime over the existing owned `ananta_core::RecordBatch` representation. M5.1 includes typed vector-schema validation, a native storage scan adapter, projection with aliases/repeated columns, NULL-aware filter predicates, a global limit operator, cancellation, and per-batch/transition resource budgets. It does not add a second storage format or yet replace the AQL executor; AQL planner integration remains part of M5.4.
+
 ## Master execution roadmap
 
-The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M4.2 — AQL parser and representation.** M1, M2 and M3 are complete. M3 delivered bounded ChronoWeave candidate execution, three layout strategies, provenance verification, active-generation promotion/rollback, crash recovery and reproducible benchmark evidence.
+The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M5.2 — aggregation and group-by operators.** M1, M2 and M3 are complete. M3 delivered bounded ChronoWeave candidate execution, three layout strategies, provenance verification, active-generation promotion/rollback, crash recovery and reproducible benchmark evidence.
 
 ## Native design documents
 

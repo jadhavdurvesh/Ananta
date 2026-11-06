@@ -11,6 +11,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ananta-execution"
+version = "0.1.0"
+dependencies = [
+ "ananta-core",
+ "ananta-types",
+]
+
+[[package]]
 name = "ananta-format"
 version = "0.1.0"
 dependencies = [

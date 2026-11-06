@@ -1,0 +1,12 @@
+[package]
+name = "ananta-execution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ananta-core = { path = "../ananta-core" }
+ananta-types = { path = "../ananta-types" }
+
+[lints]
+workspace = true

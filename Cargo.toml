@@ -4,6 +4,7 @@ members = [
     "crates/ananta-types",
     "crates/ananta-format",
     "crates/ananta-core",
+    "crates/ananta-execution",
     "crates/ananta-aql",
 ]
 

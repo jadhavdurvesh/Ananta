@@ -5,7 +5,7 @@
 **Owner:** DMJ  
 **Current release target:** 0.1.0 — Native Storage Prototype  
 **Roadmap status:** Active; review this file before starting work outside the current milestone
-**Current focus:** M3.1 compaction foundation; M2 exit gate is complete
+**Current focus:** M5.2 aggregation and group-by operators; M5.1 execution model is complete
 
 ---
 
@@ -296,7 +296,7 @@ Specification: `docs/specifications/column-rename-reorder-v0.1.md`.
 
 Table rename/drop, column drop, type changes and non-null additions remain deferred until path identity, tombstones, backfill and compaction protocols are designed.
 
-## M1.3 Implement bounded read batches — current work
+## M1.3 Implement bounded read batches — complete
 - [x] Define the columnar RecordBatch and streaming iterator contract.
 - [x] Set batch row bounds to 1–65,536, with a 1,000,000-cell output ceiling and optional row limits.
 - [x] Define a fixed 64 KiB checksum scratch buffer and selected-column batch memory model.
@@ -569,16 +569,20 @@ Specification: docs/specifications/aql-v0.1.md
 **Goal:** build the actual analytical engine as native execution operators over ANANTA storage batches.
 
 ## M5.1 Execution model
-- [ ] Define vector batch schema.
-- [ ] Define operator interface.
-- [ ] Define batch ownership/lifetime rules.
-- [ ] Define operator errors and cancellation.
-- [ ] Define memory limits and resource accounting.
-- [ ] Implement scan operator.
-- [ ] Implement projection operator.
-- [ ] Implement filter operator.
-- [ ] Implement limit operator.
-- [ ] Add operator-level unit tests.
+- [x] Define vector batch schema.
+- [x] Define operator interface.
+- [x] Define batch ownership/lifetime rules.
+- [x] Define operator errors and cancellation.
+- [x] Define memory limits and resource accounting.
+- [x] Implement scan operator.
+- [x] Implement projection operator.
+- [x] Implement filter operator.
+- [x] Implement limit operator.
+- [x] Add operator-level unit tests.
+
+Specification: docs/specifications/vector-execution-v0.1.md.
+
+**M5.1 status:** Complete as the first reusable operator runtime. The canonical vector batch reuses ananta-core RecordBatch; scan/projection/filter/limit are pull-based, filters use three-valued NULL logic, cancellation is cooperative, and the execution context enforces row/cell/working-set ceilings. AQL is not yet routed through these operators; that integration is planned for M5.4.
 
 ## M5.2 Aggregation
 - [ ] Define aggregate state interface.
@@ -899,18 +903,12 @@ A task is done only when all applicable items are true:
 
 # 15. Immediate next actions
 
-Do these in order. Do not skip ahead.
+Continue M5 in order. Do not begin M6 durability work or M7 interfaces before the analytical engine exit gate is met.
 
-1. [ ] Check latest GitHub Actions run for `main`.
-2. [ ] If queued, inspect the runner; do not create many duplicate CI runs.
-3. [ ] If failed, read the failing job logs and fix only those failures.
-4. [ ] Run `cargo fmt --all -- --check`.
-5. [ ] Run `cargo test --workspace --all-targets`.
-6. [ ] Run `cargo clippy --workspace --all-targets`.
-7. [ ] Run `cargo run -p ananta-core --example basic` from a clean checkout.
-8. [ ] Inspect the generated `ananta-data` directory and segment files.
-9. [ ] Add/repair tests for issues found in the storage correctness review.
-10. [ ] Mark M0 complete only after all exit criteria pass.
-11. [ ] Start M1 with exactly one small PR: the ANF format/golden-fixture and safety work package.
+1. Define aggregate state and null/overflow/determinism contracts for M5.2.
+2. Implement COUNT, SUM, MIN, MAX and AVG over bounded vector batches.
+3. Add GROUP BY with deterministic typed grouping keys and high-cardinality/resource-limit tests.
+4. Validate empty inputs, all-NULL inputs, mixed NULL values, integer overflow and floating-point edge cases.
+5. Record correctness and resource metrics before starting M5.3 time-series operators.
 
-**Current focus: M1.3 — design and implement bounded read batches. Column/table drops, type changes and non-null additions remain disabled.**
+**Current focus: M5.2 — aggregation and group-by operators.**
