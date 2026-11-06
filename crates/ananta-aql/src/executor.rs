@@ -1227,7 +1227,7 @@ mod tests {
     fn computed_projection_falls_back_without_changing_semantics() {
         let (db, root, _) = fixture();
         let query = crate::parse(
-            "SELECT reading + 1 AS next_reading FROM telemetry WHERE reading >= 20"
+            "SELECT reading + 1.0 AS next_reading FROM telemetry WHERE reading >= 20"
         ).unwrap();
         let mut iterator = execute(&db, &query, &ParameterBindings::default(), 2, None).unwrap();
         assert!(!iterator.used_native_execution());
