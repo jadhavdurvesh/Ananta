@@ -270,7 +270,7 @@ impl WalWriter {
     /// replaces the existing pathname while the old file handle remains open.
     /// Other targets fail closed until a platform-specific atomic replace is
     /// implemented; they never emulate replacement with delete-then-rename.
-    pub(crate) fn replace_with_checkpoint(&mut self, payload: &[u8]) -> Result<(), WalError> {
+    pub(crate) fn replace_with_checkpoint(&mut self, base_sequence: u64, payload: &[u8]) -> Result<(), WalError> {
         self.ensure_healthy()?;
         if !self.active_transactions.is_empty() {
             return Err(WalError::InvalidRecord(
@@ -307,8 +307,16 @@ impl WalWriter {
                 Err(error) => return Err(WalError::Io(error)),
             }
 
+            let checkpoint_sequence = base_sequence
+                .checked_add(1)
+                .ok_or(WalError::SequenceOverflow)?;
+            if self.next_sequence != checkpoint_sequence {
+                return Err(WalError::InvalidRecord(
+                    "checkpoint base sequence differs from the WAL high-water mark".into(),
+                ));
+            }
             let checkpoint = WalRecord {
-                sequence: 1,
+                sequence: checkpoint_sequence,
                 transaction_id: 0,
                 kind: WalRecordKind::Checkpoint,
                 payload: payload.to_vec(),
@@ -347,7 +355,7 @@ impl WalWriter {
                 .append(true)
                 .open(&self.path)?;
             self.file = replacement;
-            self.next_sequence = 2;
+            self.next_sequence = base_sequence.checked_add(2).ok_or(WalError::SequenceOverflow)?;
             self.active_transactions.clear();
             self.poisoned = false;
             Ok(())
@@ -496,16 +504,23 @@ pub fn read_wal(path: impl AsRef<Path>) -> Result<WalReadReport, WalError> {
         let sequence = u64::from_le_bytes(
             content[0..8].try_into().map_err(|_| WalError::Corrupt("invalid sequence"))?,
         );
-        let expected_sequence = report.last_sequence
-            .checked_add(1)
-            .ok_or(WalError::SequenceOverflow)?;
-        if sequence != expected_sequence {
-            return Err(WalError::Corrupt("sequence is not contiguous"));
-        }
         let transaction_id = u64::from_le_bytes(
             content[8..16].try_into().map_err(|_| WalError::Corrupt("invalid transaction ID"))?,
         );
         let kind = WalRecordKind::from_byte(content[16])?;
+        let expected_sequence = if report.records.is_empty()
+            && kind == WalRecordKind::Checkpoint
+            && transaction_id == 0
+        {
+            // A rotated WAL begins with its checkpoint at the previous
+            // high-water mark plus one, preserving globally monotonic IDs.
+            sequence
+        } else {
+            report.last_sequence.checked_add(1).ok_or(WalError::SequenceOverflow)?
+        };
+        if sequence == 0 || sequence != expected_sequence {
+            return Err(WalError::Corrupt("sequence is not contiguous"));
+        }
         let payload = content[17..].to_vec();
         let record = WalRecord {
             sequence,
