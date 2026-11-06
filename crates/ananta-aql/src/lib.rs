@@ -6,6 +6,7 @@ mod vector;
 mod aggregate;
 mod timeseries;
 mod planner;
+mod vectorized;
 
 pub use ananta_types::DataType;
 pub use lexer::{lex, Token, TokenKind};
@@ -29,6 +30,7 @@ pub use planner::{
     explain, extract_timestamp_range, ExplainPlan, PhysicalPlanNode, PlannerOptions,
     ColumnStatistics, TableStatistics,
 };
+pub use vectorized::{execute_vectorized, execute_vectorized_source};
 
 pub const AQL_VERSION: &str = "0.1";
 
