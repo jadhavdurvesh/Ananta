@@ -33,7 +33,7 @@ This is an experimental first vertical slice, not a complete or production-ready
 
 ## AQL v0.1 status
 
-AQL is being implemented as a native Rust language crate, not as SQL passed through to another database. The current M4 foundation includes a lexer, source-spanned SELECT AST/parser, typed literal tokens, quoted identifiers and safe named/positional binding validation. Query execution and catalog semantic validation are the next M4.3 work.
+AQL v0.1 is implemented as a native Rust language crate, not SQL passed through to another database. It includes a source-spanned lexer/parser and AST, structural validation, logical plans, catalog-aware name/type resolution, parameter binding, NULL-aware predicates, projections, limits, timestamp comparisons and bounded typed result batches. The embedded API executes against ANANTA's native scan batches; joins, aggregation, ordering and physical query optimisation remain future work.
 
 - [AQL v0.1 grammar and semantics](docs/specifications/aql-v0.1.md)
 
