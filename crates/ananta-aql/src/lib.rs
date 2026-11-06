@@ -28,8 +28,12 @@ pub use timeseries::{
     bucketed_aggregate, filter_time_range, latest_per_series, time_bucket_start, TimeRange,
 };
 pub use planner::{
-    explain, extract_timestamp_range, ExplainPlan, PhysicalPlanNode, PlannerOptions,
-    ColumnStatistics, TableStatistics,
+    explain as explain_plan, extract_timestamp_range, ExplainPlan, PhysicalPlanNode,
+    PlannerOptions, ColumnStatistics, TableStatistics,
+};
+pub use ananta_execution::{
+    analyze_table, ColumnStatistics as AnalyzedColumnStatistics,
+    HistogramBucket, StatisticsFormatError, TableStatistics as AnalyzedTableStatistics,
 };
 pub use vectorized::{execute_vectorized, execute_vectorized_source, execute_vectorized_source_with_options, execute_vectorized_with_options};
 

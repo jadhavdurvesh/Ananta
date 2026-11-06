@@ -80,7 +80,7 @@ pub fn execute_vectorized_with_options(
 
     let scan_columns=if options.enable_projection_pushdown{&required_names}else{&all_names};
     let mut root:Box<dyn PhysicalOperator>=if let Some(capsule)=capsule_scan{
-        Box::new(capsule)
+        capsule
     }else{
         Box::new(ScanOperator::new(database,&table,scan_columns,batch_rows).map_err(vector_error)?)
     };
