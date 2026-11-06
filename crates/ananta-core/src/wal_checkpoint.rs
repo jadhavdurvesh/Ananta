@@ -144,10 +144,7 @@ pub(crate) fn create_checkpoint(
     Ok((reference, report))
 }
 
-/// Validate the manifest selected by the checkpoint marker and every immutable
-/// file that existed when the snapshot was installed. Later mutable catalog and
-/// active-pointer replacement paths are intentionally excluded from the manifest.
-/// Remove superseded, canonical checkpoint manifests only after the
+/// Remove superseded canonical checkpoint manifests only after the
 /// replacement WAL has been synced and validated. The manifest referenced by
 /// the active WAL is always retained.
 pub(crate) fn prune_superseded_checkpoint_manifests(
@@ -195,6 +192,10 @@ fn is_canonical_checkpoint_name(name: &str) -> bool {
         && value.parse::<u64>().is_ok_and(|sequence| format!("{sequence:020}") == value)
 }
 
+/// Validate the manifest selected by the checkpoint marker and every
+/// immutable file recorded when the checkpoint was installed. Canonical catalog
+/// and active-pointer changes are exempted only when a committed post-checkpoint
+/// WAL intent owns that path.
 pub(crate) fn validate_checkpoint(
     root: &Path,
     payload: &[u8],
