@@ -710,8 +710,12 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Integrate Navigation Map publication with explicit WAL intent, map identity verification, and referenced Capsule length/SHA-256/metadata validation during redo.
 - [x] Add post-COMMIT interruption/reopen/idempotence coverage for Capsule and Navigation Map publication.
 - [x] Add subprocess crash/reopen coverage for Capsule and Navigation Map at WAL MUTATION, durable COMMIT and final-name link; verify data, artifacts, consistency and a second reopen.
-- [ ] Add checkpoint installation, WAL rotation and retention only after replay coverage is proven.
-- [ ] Extend Capsule/Navigation Map subprocess coverage to every staging/sync/cleanup checkpoint and add broader filesystem fault injection.
+- [x] Add ANCP v1 immutable checkpoint manifests with SHA-256 inventory of stable database artifacts and a WAL checkpoint reference.
+- [x] Validate checkpoint references and recorded artifacts on startup; validate mutable catalog/active-pointer fingerprints unless a committed post-checkpoint intent owns the update.
+- [x] Atomically rotate ANWL on Unix to a sequence-1 checkpoint anchor after manifest publication; preserve redo for all later WAL transactions.
+- [x] Add subprocess crash/reopen coverage at checkpoint-manifest temp sync/publication and WAL temp sync/rename/directory-sync boundaries.
+- [x] Extend Capsule/Navigation Map subprocess crash coverage to all 12 staging, WAL, final-publication and cleanup checkpoints for both artifact types.
+- [ ] Define checkpoint-manifest archive retention/pruning and Windows atomic-replacement support; do not use delete-then-rename.
 
 **Guarantee boundary:** ANF insert, Chronicle ingest, table creation, nullable-column addition, column rename, column reorder, active Weave promotion/rollback/fallback pointers, immutable compaction candidate-directory/OWM publication, Capsule publication and Navigation Map publication use WAL-backed redo. Capsule intent uses the AMUT v1 revision field for its independent generation; the embedded Capsule header retains and validates the logical schema revision. Navigation Map redo verifies all referenced immutable Capsule files before accepting the map. General multi-operation application transactions remain outside this boundary; do not claim general ACID semantics.
 
@@ -728,7 +732,8 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 - [x] Add lock-conflict and idempotency/conflicting-BatchId regression tests.
 - [x] Define cancellation boundary: scan iterators can be cancelled by dropping them; the current nonblocking lock acquisition and absence of public multi-call transactions mean transaction wait-timeout APIs are not applicable yet.
 - [x] Document per-operation durability and the explicit absence of general multi-operation ACID transactions.
-- [ ] Add multi-process reader/writer stress tests and platform-specific lock validation.
+- [x] Add repeated cross-process writer-lock denial probes while another process owns the database.
+- [ ] Add platform-specific lock validation and multi-process stress on supported operating systems.
 
 ## M6.4 Operational integrity
 - [x] Add bounded-memory database consistency checker for WAL, logical scans, Chronicle, Capsules and Navigation Maps.
@@ -738,7 +743,8 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 - [x] Add backup verification and fresh-directory restore validation through normal database open/recovery plus consistency scan.
 - [x] Test backup/restore into a new directory and backup-manifest corruption rejection (tests added; execution validation outstanding).
 - [x] Document corruption repair boundaries and fail-closed recovery guidance.
-- [ ] Add large-database, crash-during-backup and cross-platform durability tests.
+- [x] Add backup subprocess interruption tests after copied-file sync, manifest sync and final directory rename; verify incomplete backup absence or complete backup restore.
+- [ ] Add large-database and cross-platform backup/directory-durability tests.
 
 ## M6 exit gate
 - [ ] Fault-injection tests pass.
@@ -747,7 +753,7 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 - [ ] Locking rules are enforced.
 - [ ] Backup/restore integrity tests pass.
 
-**Deliverable:** Reliable single-node engine milestone. No cluster claims. M6 implementation slices are present, but the exit gate remains open until the Rust test suite and remaining crash/platform validation are run; M6.2 checkpoint installation/rotation is still deliberately deferred.
+**Deliverable:** Reliable single-node engine milestone. No cluster claims. M6 implementation slices are present, but the exit gate remains open until the Rust test suite and remaining crash/platform validation are run; ANWL checkpoint installation and Unix rotation are implemented; checkpoint archive pruning and Windows atomic replacement remain deferred.
 
 ---
 
@@ -965,9 +971,9 @@ A task is done only when all applicable items are true:
 # 15. Immediate next actions
 
 1. Run the complete Rust workspace test, formatting and lint suites on a Rust 1.75+ toolchain; resolve every regression before closing M6.
-2. Expand Capsule/Navigation Map subprocess fault injection to every staging, flush, file-sync, directory-sync, final-publication and cleanup checkpoint.
-3. Design and implement a verified checkpoint snapshot before enabling any WAL rotation or prefix retention; until then retain and replay the full ANWL log.
-4. Run large-database backup/restore tests, crash-during-backup tests, and Unix/Windows lock and directory-durability validation.
+2. Run the expanded Capsule/Navigation Map, checkpoint and backup subprocess crash suites on a Rust 1.75+ environment.
+3. Add checkpoint archive pruning only after a documented retention policy and restore/rollback tests; implement Windows atomic replacement before enabling rotation there.
+4. Run large-database backup/restore and Unix/Windows lock and directory-durability validation.
 5. Close the M6 exit gate only when recovery, transaction-scope, locking and backup/restore tests have actually passed. Then begin M7 native server and developer interfaces.
 
 **Current focus: M6 validation and closeout. M7 is next only after the M6 exit gate is satisfied.**
