@@ -5,7 +5,7 @@
 **Owner:** DMJ  
 **Current release target:** 0.1.0 — Native Storage Prototype  
 **Roadmap status:** Active; review this file before starting work outside the current milestone
-**Current focus:** M5.3 time-series implementation validation; M5.1 and M5.2 are complete
+**Current focus:** M5.4 planner, explain and statistics; M5.1–M5.3 are complete
 
 ---
 
@@ -615,17 +615,21 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 
 **Validation boundary:** time-series operators reuse the M5.2 group-state and resource controls. Timezone conversion, calendar buckets, gap filling, windows, watermarks and AQL integration remain deferred.
 
-## M5.4 Planner and optimisation
-- [ ] Define logical plan.
-- [ ] Define physical plan.
-- [ ] Implement projection pushdown.
-- [ ] Implement predicate pushdown.
-- [ ] Implement time/capsule pruning.
-- [ ] Add table/column statistics.
-- [ ] Add cardinality estimates.
-- [ ] Add explain output.
-- [ ] Compare planned and actual rows/bytes.
-- [ ] Test optimiser correctness against optimiser-disabled results.
+## M5.4 Planner and optimisation — native AQL path submitted for CI validation
+- [x] Define logical plan.
+- [x] Define initial physical operator pipeline.
+- [x] Implement direct-column projection pushdown into storage scan.
+- [x] Implement supported WHERE predicate execution through native filter.
+- [x] Implement safe LIMIT pushdown when no filter can discard rows.
+- [ ] Implement explain output.
+- [ ] Add table/column statistics and cardinality estimates.
+- [ ] Add cost estimates for projected scans and filters.
+- [ ] Integrate time/Capsule pruning only with verified complete-coverage semantics.
+- [x] Add optimiser-disabled reference execution and compare simple optimized query results.
+- [ ] Expand optimizer equivalence tests across all supported expression forms.
+- [ ] Compare actual rows/bytes with planned estimates.
+
+**M5.4 scope note:** AQL direct-column projections and supported predicates use the native scan/filter/project/limit operators. Unsupported computed projection expressions fall back to the existing evaluator. Capsule pruning is not enabled for general table scans because derived Capsule coverage is not yet proven complete for every table; correctness takes precedence over pruning.
 
 ## M5 exit gate
 - [ ] First AQL queries execute through native operators.
@@ -910,10 +914,11 @@ A task is done only when all applicable items are true:
 
 # 15. Immediate next actions
 
-1. Complete CI validation for the M5.3 time-series operators.
-2. If CI is green, mark M5.3 complete and begin M5.4 planner/optimisation.
-3. Integrate the native execution operators with AQL using a compiled physical plan.
-4. Add projection/predicate pushdown and Navigation Map time-range pruning only where results remain identical to the unoptimised plan.
-5. Record explain output and measured rows/bytes; compare optimiser-on and optimiser-off results.
+1. Run and fix the M5.4 native AQL integration workflow.
+2. Add physical EXPLAIN output with the chosen operator tree and pushdown decisions.
+3. Add table and per-column statistics with explicit exact/estimated provenance.
+4. Add cardinality and projected-scan cost estimates; compare estimates with measured rows/bytes.
+5. Add optimiser-on/off equivalence tests for predicates, NULLs, projections, aliases, limits and cancellation.
+6. Only add Capsule/Navigation Map pruning to table queries when full coverage can be proven.
 
-**Current focus: M5.3 — time-series implementation validation.**
+**Current focus: M5.4 — explain output and statistics.**

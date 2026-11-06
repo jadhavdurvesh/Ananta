@@ -139,6 +139,13 @@ pub struct ExecutionContext {
 
 impl ExecutionContext {
     pub fn new(config: ExecutionConfig) -> Result<Self, ExecutionError> {
+        Self::with_cancellation(config, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn with_cancellation(
+        config: ExecutionConfig,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self, ExecutionError> {
         if config.max_batch_rows == 0
             || config.max_batch_cells == 0
             || config.max_working_set_bytes == 0
@@ -149,7 +156,7 @@ impl ExecutionContext {
         }
         Ok(Self {
             config,
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancelled,
             metrics: ExecutionMetrics::default(),
         })
     }
@@ -405,13 +412,65 @@ impl ScanOperator {
         table: &str,
         batch_rows: usize,
     ) -> Result<Self, ExecutionError> {
+        let column_count = database.schema(table)?.len();
+        let columns = (0..column_count).collect::<Vec<_>>();
+        Self::new_projected(database, table, &columns, batch_rows)
+    }
+
+    /// Construct a storage scan that reads only the requested logical columns.
+    /// Column indices are resolved against the current table schema and their
+    /// order (including intentional duplicates) is preserved.
+    pub fn new_projected(
+        database: &Database,
+        table: &str,
+        column_indices: &[usize],
+        batch_rows: usize,
+    ) -> Result<Self, ExecutionError> {
+        Self::new_projected_with_limit(database, table, column_indices, batch_rows, None)
+    }
+
+    /// Projected storage scan with an optional storage-level row ceiling. The
+    /// caller must only push a limit here when no filtering operator can discard
+    /// rows before that limit is applied.
+    pub fn new_projected_with_limit(
+        database: &Database,
+        table: &str,
+        column_indices: &[usize],
+        batch_rows: usize,
+        row_limit: Option<u64>,
+    ) -> Result<Self, ExecutionError> {
         if batch_rows == 0 {
             return Err(ExecutionError::InvalidPlan(
                 "scan batch_rows must be greater than zero".into(),
             ));
         }
-        let schema = VectorSchema::from_storage(database.schema(table)?)?;
-        let input = database.scan_batches(table, batch_rows)?;
+        if column_indices.is_empty() {
+            return Err(ExecutionError::InvalidPlan(
+                "projected scan requires at least one column".into(),
+            ));
+        }
+        let storage_schema = database.schema(table)?;
+        let mut columns = Vec::with_capacity(column_indices.len());
+        let mut names = Vec::with_capacity(column_indices.len());
+        for index in column_indices {
+            let column = storage_schema.columns().get(*index).ok_or_else(|| {
+                ExecutionError::InvalidPlan(format!(
+                    "projected scan references missing column {index}"
+                ))
+            })?;
+            columns.push(column.clone());
+            names.push(column.name.as_str());
+        }
+        let schema = VectorSchema::new(columns)?;
+        let input = match row_limit.and_then(|limit| usize::try_from(limit).ok()) {
+            Some(limit) => database.scan_columns_batches_with_limit(
+                table,
+                &names,
+                batch_rows,
+                limit,
+            )?,
+            None => database.scan_columns_batches(table, &names, batch_rows)?,
+        };
         Ok(Self {
             input,
             schema,
@@ -811,6 +870,9 @@ impl ExecutionOperator for FilterOperator {
 
             let mut selected = Vec::with_capacity(input.row_count);
             for row in 0..input.row_count {
+                if row % 1024 == 0 {
+                    context.check_cancelled()?;
+                }
                 if self.predicate.evaluate(&input, row)? == TruthValue::True {
                     selected.push(row);
                 }

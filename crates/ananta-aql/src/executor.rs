@@ -3,8 +3,14 @@ use crate::{
     Literal, ParameterBindings, ParameterRef, Projection, Query, Statement, UnaryOperator,
 };
 use ananta_core::{Database, DbError, ScanBatchIter};
+use ananta_execution::{
+    ComparisonOperator as NativeComparison, ExecutionContext, ExecutionError, ExecutionOperator,
+    FilterOperator, FilterPredicate, LimitOperator, Operand, ProjectionField, ProjectionOperator,
+    ScanOperator,
+};
 use ananta_types::{Column, DataType, Schema, Value};
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
@@ -19,6 +25,8 @@ pub enum AqlErrorCode {
     Arithmetic,
     Cancelled,
     Storage,
+    ResourceLimit,
+    Execution,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,13 +87,28 @@ struct CompiledProjection {
     column: Column,
 }
 
+struct NativeAqlExecution {
+    operator: Box<dyn ExecutionOperator>,
+    context: ExecutionContext,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AqlExecutionMetrics {
+    pub output_batches: u64,
+    pub output_rows: u64,
+    /// Estimated owned output payload, not allocator RSS or total query memory.
+    pub output_bytes: u64,
+}
+
 pub struct AqlResultIter {
-    input: ScanBatchIter,
+    input: Option<ScanBatchIter>,
+    native: Option<NativeAqlExecution>,
     projection: Vec<CompiledProjection>,
     predicate: Option<CompiledExpr>,
     bindings: ParameterBindings,
     remaining_limit: Option<u64>,
     cancellation: Option<Arc<AtomicBool>>,
+    metrics: AqlExecutionMetrics,
     finished: bool,
 }
 
@@ -96,14 +119,78 @@ pub fn execute(
     batch_rows: usize,
     cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<AqlResultIter, AqlExecutionError> {
+    execute_with_options(database, query, bindings, batch_rows, cancellation, true)
+}
+
+/// Execute with the native physical optimizer enabled or disabled. The disabled
+/// path is retained as a correctness reference and fallback for expressions
+/// that are not yet lowerable to native vector operators.
+pub fn execute_with_options(
+    database: &Database,
+    query: &Query,
+    bindings: &ParameterBindings,
+    batch_rows: usize,
+    cancellation: Option<Arc<AtomicBool>>,
+    optimizer_enabled: bool,
+) -> Result<AqlResultIter, AqlExecutionError> {
     crate::validate_ast(query).map_err(from_parse_error)?;
     bindings.validate_for(query).map_err(from_parse_error)?;
+    if batch_rows == 0 {
+        return Err(query_error(
+            AqlErrorCode::InvalidQuery,
+            "AQL batch_rows must be greater than zero",
+            crate::Span::default(),
+        ));
+    }
     let Statement::Select(select) = &query.statement;
     let source = resolve_table_name(database, &select.source)?;
     let schema = database.schema(&source).map_err(from_storage_error)?.clone();
 
-    let projection = match &select.projection {
-        Projection::All => schema.columns().iter().enumerate().map(|(index, column)| {
+    let projection = compile_projection(select, &schema, &source, bindings)?;
+    let predicate = compile_predicate(select, &schema, &source, bindings)?;
+
+    let native = if optimizer_enabled {
+        try_build_native_pipeline(
+            database,
+            &source,
+            &schema,
+            &projection,
+            predicate.as_ref(),
+            bindings,
+            select.limit,
+            batch_rows,
+            cancellation.clone(),
+        )?
+    } else {
+        None
+    };
+    let input = if native.is_none() {
+        Some(database.scan_batches(&source, batch_rows).map_err(from_storage_error)?)
+    } else {
+        None
+    };
+
+    Ok(AqlResultIter {
+        input,
+        native,
+        projection,
+        predicate,
+        bindings: bindings.clone(),
+        remaining_limit: select.limit,
+        cancellation,
+        metrics: AqlExecutionMetrics::default(),
+        finished: false,
+    })
+}
+
+fn compile_projection(
+    select: &crate::SelectStatement,
+    schema: &Schema,
+    source: &str,
+    bindings: &ParameterBindings,
+) -> Result<Vec<CompiledProjection>, AqlExecutionError> {
+    match &select.projection {
+        Projection::All => Ok(schema.columns().iter().enumerate().map(|(index, column)| {
             CompiledProjection {
                 expression: CompiledExpr {
                     kind: CompiledExprKind::Column(index),
@@ -113,13 +200,11 @@ pub fn execute(
                 },
                 column: column.clone(),
             }
-        }).collect(),
+        }).collect()),
         Projection::Items(items) => {
             let mut compiled = Vec::with_capacity(items.len());
             for (index, item) in items.iter().enumerate() {
-                let expression = compile_expr(
-                    &item.expression, &schema, &source, bindings,
-                )?;
+                let expression = compile_expr(&item.expression, schema, source, bindings)?;
                 let data_type = expression.data_type.ok_or_else(|| query_error(
                     AqlErrorCode::TypeMismatch,
                     "an untyped NULL cannot be projected without an explicit CAST",
@@ -139,32 +224,31 @@ pub fn execute(
                     column: Column::new(name, data_type, nullable),
                 });
             }
-            compiled
+            Ok(compiled)
         }
-    };
+    }
+}
 
-    let predicate = match &select.selection {
+fn compile_predicate(
+    select: &crate::SelectStatement,
+    schema: &Schema,
+    source: &str,
+    bindings: &ParameterBindings,
+) -> Result<Option<CompiledExpr>, AqlExecutionError> {
+    match &select.selection {
         Some(expression) => {
-            let compiled = compile_expr(expression, &schema, &source, bindings)?;
+            let compiled = compile_expr(expression, schema, source, bindings)?;
             if compiled.data_type.is_some_and(|kind| kind != DataType::Boolean) {
-                return Err(query_error(AqlErrorCode::TypeMismatch,
-                    "WHERE expression must have type BOOLEAN", expression.span));
+                return Err(query_error(
+                    AqlErrorCode::TypeMismatch,
+                    "WHERE expression must have type BOOLEAN",
+                    expression.span,
+                ));
             }
-            Some(compiled)
+            Ok(Some(compiled))
         }
-        None => None,
-    };
-
-    let input = database.scan_batches(&source, batch_rows).map_err(from_storage_error)?;
-    Ok(AqlResultIter {
-        input,
-        projection,
-        predicate,
-        bindings: bindings.clone(),
-        remaining_limit: select.limit,
-        cancellation,
-        finished: false,
-    })
+        None => Ok(None),
+    }
 }
 
 pub fn execute_source(
@@ -182,17 +266,58 @@ impl Iterator for AqlResultIter {
     type Item = Result<AqlResultBatch, AqlExecutionError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished || self.remaining_limit == Some(0) {
+        if self.finished {
+            return None;
+        }
+
+        let cancelled = self.is_cancelled();
+        if let Some(native) = self.native.as_mut() {
+            if cancelled {
+                native.context.cancel();
+            }
+            let next_batch = native.operator.next_batch(&mut native.context);
+            return match next_batch {
+                Ok(Some(batch)) => {
+                    let result = AqlResultBatch {
+                        schema: batch.columns.iter().map(|column| column.column.clone()).collect(),
+                        columns: batch.columns.into_iter().map(|column| column.values).collect(),
+                        row_count: batch.row_count,
+                    };
+                    self.record_metrics(&result);
+                    Some(Ok(result))
+                }
+                Ok(None) => {
+                    self.finished = true;
+                    None
+                }
+                Err(error) => {
+                    self.finished = true;
+                    Some(Err(from_execution_error(error)))
+                }
+            };
+        }
+
+        if self.remaining_limit == Some(0) {
             self.finished = true;
             return None;
         }
         loop {
             if self.is_cancelled() {
                 self.finished = true;
-                return Some(Err(query_error(AqlErrorCode::Cancelled,
-                    "AQL query was cancelled", crate::Span::default())));
+                return Some(Err(query_error(
+                    AqlErrorCode::Cancelled,
+                    "AQL query was cancelled",
+                    crate::Span::default(),
+                )));
             }
-            let input = match self.input.next() {
+            let next_input = match self.input.as_mut() {
+                Some(input) => input.next(),
+                None => {
+                    self.finished = true;
+                    return None;
+                }
+            };
+            let input = match next_input {
                 Some(Ok(batch)) => batch,
                 Some(Err(error)) => {
                     self.finished = true;
@@ -209,8 +334,11 @@ impl Iterator for AqlResultIter {
             for row_index in 0..input.row_count {
                 if self.is_cancelled() {
                     self.finished = true;
-                    return Some(Err(query_error(AqlErrorCode::Cancelled,
-                        "AQL query was cancelled", crate::Span::default())));
+                    return Some(Err(query_error(
+                        AqlErrorCode::Cancelled,
+                        "AQL query was cancelled",
+                        crate::Span::default(),
+                    )));
                 }
                 if self.remaining_limit == Some(0) {
                     self.finished = true;
@@ -222,19 +350,30 @@ impl Iterator for AqlResultIter {
                         Ok(Value::Boolean(false) | Value::Null) => continue,
                         Ok(_) => {
                             self.finished = true;
-                            return Some(Err(query_error(AqlErrorCode::TypeMismatch,
-                                "WHERE expression did not evaluate to BOOLEAN", predicate.span)));
+                            return Some(Err(query_error(
+                                AqlErrorCode::TypeMismatch,
+                                "WHERE expression did not evaluate to BOOLEAN",
+                                predicate.span,
+                            )));
                         }
-                        Err(error) => { self.finished = true; return Some(Err(error)); }
+                        Err(error) => {
+                            self.finished = true;
+                            return Some(Err(error));
+                        }
                     }
                 }
                 for (index, selected) in self.projection.iter().enumerate() {
                     match evaluate(&selected.expression, &input, row_index, &self.bindings) {
                         Ok(value) => output_columns[index].push(value),
-                        Err(error) => { self.finished = true; return Some(Err(error)); }
+                        Err(error) => {
+                            self.finished = true;
+                            return Some(Err(error));
+                        }
                     }
                 }
-                if let Some(limit) = &mut self.remaining_limit { *limit -= 1; }
+                if let Some(limit) = &mut self.remaining_limit {
+                    *limit -= 1;
+                }
             }
             let row_count = output_columns.first().map_or(0, Vec::len);
             if row_count == 0 {
@@ -244,8 +383,13 @@ impl Iterator for AqlResultIter {
                 }
                 continue;
             }
-            let schema = self.projection.iter().map(|item| item.column.clone()).collect();
-            return Some(Ok(AqlResultBatch { schema, columns: output_columns, row_count }));
+            let result = AqlResultBatch {
+                schema: self.projection.iter().map(|item| item.column.clone()).collect(),
+                columns: output_columns,
+                row_count,
+            };
+            self.record_metrics(&result);
+            return Some(Ok(result));
         }
     }
 }
@@ -253,6 +397,22 @@ impl Iterator for AqlResultIter {
 impl AqlResultIter {
     pub fn is_cancelled(&self) -> bool {
         self.cancellation.as_ref().is_some_and(|flag| flag.load(AtomicOrdering::Acquire))
+    }
+
+    pub fn used_native_execution(&self) -> bool {
+        self.native.is_some()
+    }
+
+    pub fn metrics(&self) -> &AqlExecutionMetrics {
+        &self.metrics
+    }
+
+    fn record_metrics(&mut self, batch: &AqlResultBatch) {
+        self.metrics.output_batches = self.metrics.output_batches.saturating_add(1);
+        self.metrics.output_rows = self.metrics.output_rows
+            .saturating_add(u64::try_from(batch.row_count).unwrap_or(u64::MAX));
+        self.metrics.output_bytes = self.metrics.output_bytes
+            .saturating_add(estimate_result_batch_bytes(batch));
     }
 }
 
@@ -632,6 +792,322 @@ fn cast_supported(source: DataType, target: DataType) -> bool {
 fn arithmetic_error(span: crate::Span, message: &str) -> AqlExecutionError {
     query_error(AqlErrorCode::Arithmetic, message, span)
 }
+fn try_build_native_pipeline(
+    database: &Database,
+    table: &str,
+    schema: &Schema,
+    projection: &[CompiledProjection],
+    predicate: Option<&CompiledExpr>,
+    bindings: &ParameterBindings,
+    limit: Option<u64>,
+    batch_rows: usize,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> Result<Option<NativeAqlExecution>, AqlExecutionError> {
+    let native_predicate = match predicate {
+        Some(expression) => match compiled_filter_predicate(expression, bindings) {
+            Some(predicate) => Some(predicate),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+
+    let mut required_columns = BTreeSet::new();
+    for item in projection {
+        let CompiledExprKind::Column(index) = &item.expression.kind else {
+            return Ok(None);
+        };
+        required_columns.insert(*index);
+    }
+    if let Some(predicate) = &native_predicate {
+        collect_filter_columns(predicate, &mut required_columns);
+    }
+    if required_columns.is_empty() {
+        return Ok(None);
+    }
+    let scan_columns = required_columns.iter().copied().collect::<Vec<_>>();
+    let scan_mapping = scan_columns
+        .iter()
+        .enumerate()
+        .map(|(scan_index, logical_index)| (*logical_index, scan_index))
+        .collect::<BTreeMap<_, _>>();
+
+    let pushed_scan_limit = if native_predicate.is_none() { limit } else { None };
+    let scan = ScanOperator::new_projected_with_limit(
+        database,
+        table,
+        &scan_columns,
+        batch_rows,
+        pushed_scan_limit,
+    )
+    .map_err(from_execution_error)?;
+    let mut operator: Box<dyn ExecutionOperator> = Box::new(scan);
+
+    if let Some(predicate) = native_predicate {
+        let predicate = remap_filter_columns(predicate, &scan_mapping)?;
+        operator = Box::new(
+            FilterOperator::new(operator, predicate).map_err(from_execution_error)?,
+        );
+    }
+
+    let fields = projection
+        .iter()
+        .map(|item| {
+            let CompiledExprKind::Column(index) = &item.expression.kind else {
+                return Err(query_error(
+                    AqlErrorCode::Execution,
+                    "native projection contains a computed expression",
+                    item.expression.span,
+                ));
+            };
+            let scan_index = scan_mapping.get(index).copied().ok_or_else(|| {
+                query_error(
+                    AqlErrorCode::Execution,
+                    "native projection column was not included in the scan",
+                    item.expression.span,
+                )
+            })?;
+            Ok(ProjectionField::new(scan_index, item.column.clone()))
+        })
+        .collect::<Result<Vec<_>, AqlExecutionError>>()?;
+    operator = Box::new(
+        ProjectionOperator::new(operator, fields).map_err(from_execution_error)?,
+    );
+    if let Some(limit) = limit {
+        operator = Box::new(LimitOperator::new(operator, limit));
+    }
+
+    let cancellation = cancellation.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let context = ExecutionContext::with_cancellation(Default::default(), cancellation)
+        .map_err(from_execution_error)?;
+    let _ = schema; // schema was used to compile and validate every logical column reference.
+    Ok(Some(NativeAqlExecution { operator, context }))
+}
+
+fn compiled_filter_predicate(
+    expression: &CompiledExpr,
+    bindings: &ParameterBindings,
+) -> Option<FilterPredicate> {
+    match &expression.kind {
+        CompiledExprKind::Literal(Literal::Boolean(value)) => {
+            Some(FilterPredicate::Constant(*value))
+        }
+        CompiledExprKind::Parameter(parameter) => {
+            match binding_value(parameter, bindings, expression.span).ok()? {
+                Value::Boolean(value) => Some(FilterPredicate::Constant(*value)),
+                _ => None,
+            }
+        }
+        CompiledExprKind::Column(index)
+            if expression.data_type == Some(DataType::Boolean) =>
+        {
+            Some(FilterPredicate::Compare {
+                left: Operand::Column(*index),
+                operator: NativeComparison::Equal,
+                right: Operand::Literal(Value::Boolean(true)),
+            })
+        }
+        CompiledExprKind::Unary {
+            operator: UnaryOperator::Not,
+            expression,
+        } => Some(FilterPredicate::Not(Box::new(
+            compiled_filter_predicate(expression, bindings)?,
+        ))),
+        CompiledExprKind::IsNull {
+            expression,
+            negated,
+        } => Some(FilterPredicate::IsNull {
+            operand: compiled_operand(expression, bindings)?,
+            negated: *negated,
+        }),
+        CompiledExprKind::Binary {
+            left,
+            operator: BinaryOperator::And,
+            right,
+        } => Some(FilterPredicate::And(
+            Box::new(compiled_filter_predicate(left, bindings)?),
+            Box::new(compiled_filter_predicate(right, bindings)?),
+        )),
+        CompiledExprKind::Binary {
+            left,
+            operator: BinaryOperator::Or,
+            right,
+        } => Some(FilterPredicate::Or(
+            Box::new(compiled_filter_predicate(left, bindings)?),
+            Box::new(compiled_filter_predicate(right, bindings)?),
+        )),
+        CompiledExprKind::Binary {
+            left,
+            operator,
+            right,
+        } => {
+            let operator = match operator {
+                BinaryOperator::Equal => NativeComparison::Equal,
+                BinaryOperator::NotEqual => NativeComparison::NotEqual,
+                BinaryOperator::Less => NativeComparison::LessThan,
+                BinaryOperator::LessEqual => NativeComparison::LessThanOrEqual,
+                BinaryOperator::Greater => NativeComparison::GreaterThan,
+                BinaryOperator::GreaterEqual => NativeComparison::GreaterThanOrEqual,
+                _ => return None,
+            };
+            Some(FilterPredicate::Compare {
+                left: compiled_operand(left, bindings)?,
+                operator,
+                right: compiled_operand(right, bindings)?,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn compiled_operand(
+    expression: &CompiledExpr,
+    bindings: &ParameterBindings,
+) -> Option<Operand> {
+    match &expression.kind {
+        CompiledExprKind::Column(index) => Some(Operand::Column(*index)),
+        CompiledExprKind::Literal(literal) => {
+            Some(Operand::Literal(literal_value(literal)))
+        }
+        CompiledExprKind::Parameter(parameter) => binding_value(
+            parameter,
+            bindings,
+            expression.span,
+        )
+        .ok()
+        .cloned()
+        .map(Operand::Literal),
+        _ => None,
+    }
+}
+
+fn collect_filter_columns(
+    predicate: &FilterPredicate,
+    output: &mut BTreeSet<usize>,
+) {
+    match predicate {
+        FilterPredicate::Constant(_) => {}
+        FilterPredicate::Compare { left, right, .. } => {
+            collect_operand_column(left, output);
+            collect_operand_column(right, output);
+        }
+        FilterPredicate::IsNull { operand, .. } => {
+            collect_operand_column(operand, output);
+        }
+        FilterPredicate::And(left, right) | FilterPredicate::Or(left, right) => {
+            collect_filter_columns(left, output);
+            collect_filter_columns(right, output);
+        }
+        FilterPredicate::Not(inner) => collect_filter_columns(inner, output),
+    }
+}
+
+fn collect_operand_column(operand: &Operand, output: &mut BTreeSet<usize>) {
+    if let Operand::Column(index) = operand {
+        output.insert(*index);
+    }
+}
+
+fn remap_filter_columns(
+    predicate: FilterPredicate,
+    mapping: &BTreeMap<usize, usize>,
+) -> Result<FilterPredicate, AqlExecutionError> {
+    let remap_operand = |operand: Operand| -> Result<Operand, AqlExecutionError> {
+        match operand {
+            Operand::Column(index) => mapping
+                .get(&index)
+                .copied()
+                .map(Operand::Column)
+                .ok_or_else(|| query_error(
+                    AqlErrorCode::Execution,
+                    format!("predicate column {index} was not included in the physical scan"),
+                    crate::Span::default(),
+                )),
+            literal => Ok(literal),
+        }
+    };
+    Ok(match predicate {
+        FilterPredicate::Constant(value) => FilterPredicate::Constant(value),
+        FilterPredicate::Compare { left, operator, right } => FilterPredicate::Compare {
+            left: remap_operand(left)?,
+            operator,
+            right: remap_operand(right)?,
+        },
+        FilterPredicate::IsNull { operand, negated } => FilterPredicate::IsNull {
+            operand: remap_operand(operand)?,
+            negated,
+        },
+        FilterPredicate::And(left, right) => FilterPredicate::And(
+            Box::new(remap_filter_columns(*left, mapping)?),
+            Box::new(remap_filter_columns(*right, mapping)?),
+        ),
+        FilterPredicate::Or(left, right) => FilterPredicate::Or(
+            Box::new(remap_filter_columns(*left, mapping)?),
+            Box::new(remap_filter_columns(*right, mapping)?),
+        ),
+        FilterPredicate::Not(inner) => {
+            FilterPredicate::Not(Box::new(remap_filter_columns(*inner, mapping)?))
+        }
+    })
+}
+
+fn estimate_result_batch_bytes(batch: &AqlResultBatch) -> u64 {
+    let mut total = std::mem::size_of::<AqlResultBatch>();
+    total = total.saturating_add(
+        batch.schema.capacity().saturating_mul(std::mem::size_of::<Column>()),
+    );
+    total = total.saturating_add(
+        batch.columns.capacity().saturating_mul(std::mem::size_of::<Vec<Value>>()),
+    );
+    for (column, values) in batch.schema.iter().zip(&batch.columns) {
+        total = total.saturating_add(column.name.capacity());
+        total = total.saturating_add(
+            values.capacity().saturating_mul(std::mem::size_of::<Value>()),
+        );
+        for value in values {
+            total = total.saturating_add(match value {
+                Value::Utf8(text) => text.capacity(),
+                Value::Binary(bytes) => bytes.capacity(),
+                _ => 0,
+            });
+        }
+    }
+    u64::try_from(total).unwrap_or(u64::MAX)
+}
+
+fn from_execution_error(error: ExecutionError) -> AqlExecutionError {
+    match error {
+        ExecutionError::Storage(error) => from_storage_error(error),
+        ExecutionError::Cancelled => query_error(
+            AqlErrorCode::Cancelled,
+            "AQL query was cancelled",
+            crate::Span::default(),
+        ),
+        ExecutionError::ResourceLimit { resource, actual, limit } => query_error(
+            AqlErrorCode::ResourceLimit,
+            format!("execution resource limit exceeded for {resource}: {actual} > {limit}"),
+            crate::Span::default(),
+        ),
+        ExecutionError::ArithmeticOverflow => query_error(
+            AqlErrorCode::Arithmetic,
+            "execution arithmetic overflow",
+            crate::Span::default(),
+        ),
+        ExecutionError::AggregateOverflow(function) => query_error(
+            AqlErrorCode::Arithmetic,
+            format!("{function} aggregate overflow"),
+            crate::Span::default(),
+        ),
+        other @ (ExecutionError::InvalidSchema(_)
+        | ExecutionError::InvalidBatch(_)
+        | ExecutionError::InvalidPlan(_)
+        | ExecutionError::TypeMismatch(_)) => query_error(
+            AqlErrorCode::Execution,
+            other.to_string(),
+            crate::Span::default(),
+        ),
+    }
+}
+
 fn query_error(code: AqlErrorCode, message: impl Into<String>, span: crate::Span) -> AqlExecutionError {
     AqlExecutionError { code, message: message.into(), span }
 }
@@ -701,6 +1177,74 @@ mod tests {
             .take(2).map(|row| vec![row[1].clone(), row[2].clone()]).collect::<Vec<_>>();
         assert_eq!(actual, expected);
         assert_eq!(output[0].schema[0].name, "device");
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn simple_aql_queries_use_native_operators_and_match_reference_execution() {
+        let (db, root, _) = fixture();
+        let query = crate::parse(
+            "SELECT device, reading FROM telemetry WHERE reading >= :minimum LIMIT 2"
+        ).unwrap();
+        let bindings = ParameterBindings {
+            named: [("minimum".into(), Value::Float64(25.0))].into_iter().collect(),
+            positional: vec![],
+        };
+
+        let mut optimized = execute(&db, &query, &bindings, 1, None).unwrap();
+        assert!(optimized.used_native_execution());
+        let optimized_rows = optimized.by_ref()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .flat_map(|batch| (0..batch.row_count).map(|row| batch.row(row).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(optimized.metrics().output_rows, 2);
+        assert!(optimized.metrics().output_bytes > 0);
+
+        let mut reference = execute_with_options(&db, &query, &bindings, 1, None, false).unwrap();
+        assert!(!reference.used_native_execution());
+        let reference_rows = reference.by_ref()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .flat_map(|batch| (0..batch.row_count).map(|row| batch.row(row).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(optimized_rows, reference_rows);
+        assert_eq!(
+            optimized_rows,
+            vec![
+                vec![Value::Utf8("b".into()), Value::Float64(25.0)],
+                vec![Value::Utf8("d".into()), Value::Float64(30.0)],
+            ]
+        );
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn computed_projection_falls_back_without_changing_semantics() {
+        let (db, root, _) = fixture();
+        let query = crate::parse(
+            "SELECT reading + 1 AS next_reading FROM telemetry WHERE reading >= 20"
+        ).unwrap();
+        let mut iterator = execute(&db, &query, &ParameterBindings::default(), 2, None).unwrap();
+        assert!(!iterator.used_native_execution());
+        let rows = iterator
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .flat_map(|batch| (0..batch.row_count).map(|row| batch.row(row).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Float64(21.0)],
+                vec![Value::Float64(26.0)],
+                vec![Value::Float64(31.0)],
+            ]
+        );
         drop(db);
         fs::remove_dir_all(root).unwrap();
     }

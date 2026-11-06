@@ -3,6 +3,15 @@
 version = 3
 
 [[package]]
+name = "ananta-aql"
+version = "0.1.0"
+dependencies = [
+ "ananta-core",
+ "ananta-execution",
+ "ananta-types",
+]
+
+[[package]]
 name = "ananta-core"
 version = "0.1.0"
 dependencies = [
