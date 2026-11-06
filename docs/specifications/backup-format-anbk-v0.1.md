@@ -1,7 +1,7 @@
 # ANANTA Backup Container ANBK v1
 
 **Milestone:** M6.4 — operational integrity  
-**Status:** Initial full-directory backup and fresh-directory restore APIs implemented; execution validation outstanding.
+**Status:** Full-directory backup and fresh-directory restore APIs implemented. Subprocess interruption tests cover copied-file sync, manifest sync and final directory rename; execution validation is outstanding.
 
 ## 1. Purpose and scope
 
@@ -68,4 +68,4 @@ ANANTA does not attempt automatic repair of conflicting committed artifacts, che
 
 SHA-256 detects accidental corruption and binds manifest entries to file contents; it is not authentication or a digital signature. ANBK v1 has no encryption or access-control layer: protect the backup directory using operating-system permissions and trusted storage. Backups reject symbolic links and do not preserve ownership/ACL metadata or special filesystem attributes. Directory syncing is implemented on Unix; portable standard-library directory-entry flushing is not available on all targets.
 
-The current implementation is a full local directory backup. Crash/power-loss validation, Windows-specific durability validation, external destination media, and large-scale backup performance tests remain outstanding.
+The current implementation is a full local directory backup. Subprocess tests stop after a copied file is synced, after the manifest is synced, and after final directory rename before its parent sync. The incomplete cases must leave the requested destination absent; the post-rename case must verify and restore successfully. These tests have not been run in the current development environment. Physical power-loss validation, Windows-specific durability validation, external destination media, and large-scale backup performance tests remain outstanding.
