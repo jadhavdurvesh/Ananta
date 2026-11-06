@@ -21,6 +21,8 @@ const INTENT_LEN: usize = 4 + 2 + 1 + 8 + 8 + 8 + 8 + 32;
 pub enum WalArtifactKind {
     AnfSegment = 1,
     ChronicleRecord = 2,
+    SchemaSnapshot = 3,
+    CatalogSnapshot = 4,
 }
 
 impl WalArtifactKind {
@@ -28,6 +30,8 @@ impl WalArtifactKind {
         match value {
             1 => Ok(Self::AnfSegment),
             2 => Ok(Self::ChronicleRecord),
+            3 => Ok(Self::SchemaSnapshot),
+            4 => Ok(Self::CatalogSnapshot),
             _ => Err(WalRecoveryError::CorruptIntent("unknown artifact kind")),
         }
     }
@@ -36,6 +40,8 @@ impl WalArtifactKind {
         match self {
             Self::AnfSegment => format!("segment-{file_id:020}.anf"),
             Self::ChronicleRecord => format!("segment-{file_id:020}.chr"),
+            Self::SchemaSnapshot => format!("schema-{file_id:020}.ans"),
+            Self::CatalogSnapshot => format!("catalog-{file_id:020}.anc"),
         }
     }
 
@@ -43,6 +49,8 @@ impl WalArtifactKind {
         match self {
             Self::AnfSegment => format!(".segment-{file_id:020}.tmp"),
             Self::ChronicleRecord => format!(".chronicle-{file_id:020}.tmp"),
+            Self::SchemaSnapshot => format!(".schema-{file_id:020}.tmp"),
+            Self::CatalogSnapshot => format!(".catalog-{file_id:020}.tmp"),
         }
     }
 }
@@ -265,6 +273,9 @@ pub(crate) enum WalRecoveryCrashPoint {
     AfterPublishDirectorySync,
     AfterStagingNameRemoved,
     AfterCleanupDirectorySync,
+    AfterSchemaSnapshotPublished,
+    AfterCatalogSnapshotPublished,
+    AfterCanonicalCatalogPublished,
 }
 
 #[cfg(test)]
@@ -551,6 +562,33 @@ fn verify_artifact_identity(
             if metadata.schema_revision != intent.schema_revision {
                 return Err(WalRecoveryError::ChronicleCorrupt(
                     "record schema revision differs from committed WAL intent",
+                ));
+            }
+        }
+        WalArtifactKind::SchemaSnapshot => {
+            let bytes = fs::read(path).map_err(io_error)?;
+            let snapshot = crate::schema_snapshot::SchemaSnapshot::decode(&bytes)
+                .map_err(|_| WalRecoveryError::FileConflict("schema snapshot is invalid"))?;
+            if snapshot.table_id().0 != intent.table_id
+                || snapshot.revision() != intent.schema_revision
+                || intent.file_id != intent.schema_revision
+            {
+                return Err(WalRecoveryError::FileConflict(
+                    "schema snapshot identity differs from committed WAL intent",
+                ));
+            }
+        }
+        WalArtifactKind::CatalogSnapshot => {
+            let mut bytes = Vec::new();
+            File::open(path).map_err(io_error)?.read_to_end(&mut bytes).map_err(io_error)?;
+            let catalog = crate::decode_catalog_v2(&bytes)
+                .map_err(|_| WalRecoveryError::FileConflict("catalog snapshot is invalid"))?;
+            let table_matches = catalog.tables.values().any(|table| {
+                table.id.0 == intent.table_id && table.schema_revision == intent.schema_revision
+            });
+            if catalog.revision != intent.file_id || !table_matches {
+                return Err(WalRecoveryError::FileConflict(
+                    "catalog snapshot identity differs from committed WAL intent",
                 ));
             }
         }
