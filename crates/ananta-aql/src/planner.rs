@@ -43,9 +43,9 @@ pub struct TableStatistics {
 pub enum PhysicalPlanNode {
     Scan { table:String, columns:Vec<String>, estimated_rows:Option<u64>,
         projection_pushed_down:bool, capsule_map_generation:Option<u64> },
-    Filter { predicate:String, pushed_to_scan:bool },
+    Filter { predicate:String, pushed_to_scan:bool, estimated_rows:Option<u64> },
     Project { columns:Vec<String> },
-    Limit { rows:u64 },
+    Limit { rows:u64, estimated_rows:Option<u64> },
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExplainPlan {
@@ -80,13 +80,189 @@ impl ExplainPlan {
                         columns.join(", "),display_option(*estimated_rows),projection_pushed_down,
                         capsule_map_generation.map_or_else(||"disabled".into(),|v|v.to_string()))
                 }
-                PhysicalPlanNode::Filter{predicate,pushed_to_scan}=>format!("FILTER {predicate} predicate_pushdown={pushed_to_scan}"),
+                PhysicalPlanNode::Filter{predicate,pushed_to_scan,estimated_rows}=>format!(
+                    "FILTER {predicate} predicate_pushdown={pushed_to_scan} estimated_rows={}",
+                    display_option(*estimated_rows)),
                 PhysicalPlanNode::Project{columns}=>format!("PROJECT [{}]",columns.join(", ")),
-                PhysicalPlanNode::Limit{rows}=>format!("LIMIT {rows}"),
+                PhysicalPlanNode::Limit{rows,estimated_rows}=>format!(
+                    "LIMIT {rows} estimated_rows={}",display_option(*estimated_rows)),
             });
         }
         lines.extend(self.notes.iter().map(|note|format!("NOTE {note}")));
         lines.join("\n")
+    }
+}
+
+fn estimate_rows(rows:u64,selectivity:f64)->u64{
+    ((rows as f64)*selectivity.clamp(0.0,1.0))
+        .round()
+        .min(u64::MAX as f64) as u64
+}
+
+fn estimate_predicate_selectivity(
+    expression:&Expr,
+    statistics:&ananta_execution::TableStatistics,
+    schema:&ananta_types::Schema,
+    table:&str,
+    bindings:&ParameterBindings,
+)->Option<f64>{
+    match &expression.kind {
+        ExprKind::Literal(Literal::Boolean(value))=>Some(if *value{1.0}else{0.0}),
+        ExprKind::IsNull{expression:inner,negated}=>{
+            let index=planner_column_index(inner,schema,table)?;
+            if statistics.scanned_rows==0{return Some(0.0);}
+            let null_fraction=statistics.columns.get(index)?.null_count as f64
+                / statistics.scanned_rows as f64;
+            Some(if *negated{1.0-null_fraction}else{null_fraction})
+        }
+        ExprKind::Unary{operator:UnaryOperator::Not,expression:inner}=>
+            Some(1.0-estimate_predicate_selectivity(inner,statistics,schema,table,bindings)?),
+        ExprKind::Binary{left,operator:BinaryOperator::And,right}=>{
+            Some(
+                estimate_predicate_selectivity(left,statistics,schema,table,bindings)?
+                * estimate_predicate_selectivity(right,statistics,schema,table,bindings)?
+            )
+        }
+        ExprKind::Binary{left,operator:BinaryOperator::Or,right}=>{
+            let left=estimate_predicate_selectivity(left,statistics,schema,table,bindings)?;
+            let right=estimate_predicate_selectivity(right,statistics,schema,table,bindings)?;
+            Some((left+right-left*right).clamp(0.0,1.0))
+        }
+        ExprKind::Binary{left,operator,right}=>{
+            estimate_comparison_selectivity(left,*operator,right,statistics,schema,table,bindings)
+        }
+        _=>None,
+    }
+}
+
+fn estimate_comparison_selectivity(
+    left:&Expr,
+    operator:BinaryOperator,
+    right:&Expr,
+    statistics:&ananta_execution::TableStatistics,
+    schema:&ananta_types::Schema,
+    table:&str,
+    bindings:&ParameterBindings,
+)->Option<f64>{
+    let (index,value,operator)=match (
+        planner_column_index(left,schema,table),
+        literal_or_parameter(right,bindings),
+    ){
+        (Some(index),Some(value))=>(index,value,operator),
+        _=>match(
+            planner_column_index(right,schema,table),
+            literal_or_parameter(left,bindings),
+        ){
+            (Some(index),Some(value))=>(index,value,reverse_operator(operator)?),
+            _=>return None,
+        }
+    };
+    let column=statistics.columns.get(index)?;
+    if statistics.scanned_rows==0||matches!(value,Value::Null){return Some(0.0);}
+    let non_null=column.non_null_count as f64/statistics.scanned_rows as f64;
+    if non_null<=0.0{return Some(0.0);}
+
+    if matches!(operator,BinaryOperator::Equal|BinaryOperator::NotEqual){
+        let distinct=column.approximate_distinct_count.max(1) as f64;
+        let equal=(non_null/distinct).min(non_null);
+        return Some(if operator==BinaryOperator::Equal{equal}else{(non_null-equal).max(0.0)});
+    }
+
+    let less=histogram_cdf(column,&value,false)?;
+    let less_equal=histogram_cdf(column,&value,true)?;
+    let fraction=match operator{
+        BinaryOperator::Less=>less,
+        BinaryOperator::LessEqual=>less_equal,
+        BinaryOperator::Greater=>1.0-less_equal,
+        BinaryOperator::GreaterEqual=>1.0-less,
+        _=>return None,
+    };
+    Some((non_null*fraction).clamp(0.0,1.0))
+}
+
+fn planner_column_index(
+    expression:&Expr,
+    schema:&ananta_types::Schema,
+    table:&str,
+)->Option<usize>{
+    let ExprKind::Column(reference)=&expression.kind else{return None;};
+    let identifier=reference.parts.last()?;
+    if reference.parts.len()==2{
+        let qualifier=&reference.parts[0];
+        let matches=if qualifier.quoted{qualifier.value==table}
+            else{qualifier.value.eq_ignore_ascii_case(table)};
+        if !matches{return None;}
+    }
+    schema.columns().iter().position(|column|{
+        if identifier.quoted{column.name==identifier.value}
+        else{column.name.eq_ignore_ascii_case(&identifier.value)}
+    })
+}
+
+fn reverse_operator(operator:BinaryOperator)->Option<BinaryOperator>{
+    Some(match operator{
+        BinaryOperator::Less=>BinaryOperator::Greater,
+        BinaryOperator::LessEqual=>BinaryOperator::GreaterEqual,
+        BinaryOperator::Greater=>BinaryOperator::Less,
+        BinaryOperator::GreaterEqual=>BinaryOperator::LessEqual,
+        BinaryOperator::Equal=>BinaryOperator::Equal,
+        BinaryOperator::NotEqual=>BinaryOperator::NotEqual,
+        _=>return None,
+    })
+}
+
+fn histogram_cdf(
+    column:&ananta_execution::ColumnStatistics,
+    target:&Value,
+    inclusive:bool,
+)->Option<f64>{
+    let histogram=&column.histogram;
+    let sample_total=histogram.iter().map(|bucket|bucket.sample_count).sum::<u64>() as f64;
+    if sample_total<=0.0{return None;}
+    let mut matched=0.0_f64;
+    for bucket in histogram{
+        let lower=stat_compare(target,&bucket.lower_bound);
+        let upper=stat_compare(target,&bucket.upper_bound);
+        let count=bucket.sample_count as f64;
+        if upper==std::cmp::Ordering::Greater{
+            matched+=count;
+            continue;
+        }
+        if lower==std::cmp::Ordering::Less{
+            break;
+        }
+        let equality_mass=(sample_total/column.approximate_distinct_count.max(1) as f64)
+            .min(count);
+        if upper==std::cmp::Ordering::Equal{
+            matched+=if inclusive{count}else{(count-equality_mass).max(0.0)};
+            break;
+        }
+        if lower==std::cmp::Ordering::Equal{
+            if inclusive{matched+=equality_mass;}
+            break;
+        }
+        let fraction=match(
+            planner_numeric_value(&bucket.lower_bound),
+            planner_numeric_value(&bucket.upper_bound),
+            planner_numeric_value(target),
+        ){
+            (Some(minimum),Some(maximum),Some(value)) if maximum>minimum=>
+                ((value-minimum)/(maximum-minimum)).clamp(0.0,1.0),
+            _=>0.5,
+        };
+        matched+=count*fraction;
+        break;
+    }
+    Some((matched/sample_total).clamp(0.0,1.0))
+}
+
+fn planner_numeric_value(value:&Value)->Option<f64>{
+    match value{
+        Value::Int32(value)=>Some(f64::from(*value)),
+        Value::Int64(value)=>Some(*value as f64),
+        Value::TimestampMicros(value)=>Some(*value as f64),
+        Value::Float64(value) if value.is_finite()=>Some(*value),
+        _=>None,
     }
 }
 
@@ -225,16 +401,29 @@ pub fn explain(
         table:table.clone(),columns,estimated_rows:statistics.row_count,
         projection_pushed_down,capsule_map_generation,
     }];
+    let mut estimated_rows_after_filter=statistics.row_count;
     if let Some(predicate)=&select.selection{
+        estimated_rows_after_filter=analyzed_statistics.as_ref()
+            .and_then(|analysis|estimate_predicate_selectivity(
+                predicate,analysis,schema,&table,bindings,
+            ))
+            .and_then(|selectivity|statistics.row_count.map(|rows|estimate_rows(rows,selectivity)));
         physical.push(PhysicalPlanNode::Filter{
             predicate:format!("{predicate:?}"),
             pushed_to_scan:options.enable_predicate_pushdown,
+            estimated_rows:estimated_rows_after_filter,
         });
     }
     if !matches!(select.projection,Projection::All){
         physical.push(PhysicalPlanNode::Project{columns:projection_columns(&select.projection)});
     }
-    if let Some(rows)=select.limit{physical.push(PhysicalPlanNode::Limit{rows});}
+    if let Some(rows)=select.limit{
+        estimated_rows_after_filter=estimated_rows_after_filter.map(|estimated|estimated.min(rows));
+        physical.push(PhysicalPlanNode::Limit{
+            rows,
+            estimated_rows:estimated_rows_after_filter,
+        });
+    }
     let mut notes=Vec::new();
     if statistics.row_count.is_none(){notes.push("table statistics unavailable; cardinality is unknown".into());}
     if statistics.analyzed_snapshot_available {
@@ -439,7 +628,7 @@ mod tests{
     fn explain_uses_fresh_database_statistics_cache_and_drops_it_after_write(){
         let(mut db,root)=fixture();
         let _analysis=ananta_execution::analyze_table_and_persist(&db,"telemetry",1).unwrap();
-        let query=crate::parse("SELECT device FROM telemetry WHERE value >= 0.5").unwrap();
+        let query=crate::parse("SELECT device FROM telemetry WHERE value >= 0.5 LIMIT 1").unwrap();
 
         let fresh=explain(&db,&query,&ParameterBindings::default(),PlannerOptions::default()).unwrap();
         assert!(fresh.table_statistics.analyzed_snapshot_available);
@@ -450,6 +639,14 @@ mod tests{
         assert!(value_stats.approximate_distinct_count.is_some());
         assert_eq!(value_stats.histogram_bucket_count,1);
         assert!(fresh.render().contains("analyzed_snapshot=true"));
+        assert!(fresh.physical.iter().any(|node|matches!(
+            node,
+            PhysicalPlanNode::Filter{estimated_rows:Some(1),..}
+        )));
+        assert!(fresh.physical.iter().any(|node|matches!(
+            node,
+            PhysicalPlanNode::Limit{rows:1,estimated_rows:Some(1)}
+        )));
 
         // A newly published segment changes the inventory fingerprint, so the
         // planner must stop using the old cache and report unknown cardinality.
@@ -464,6 +661,40 @@ mod tests{
         drop(db);fs::remove_dir_all(root).unwrap();
     }
 
+
+    #[test]
+    fn explain_uses_histogram_boundaries_for_inclusive_and_exclusive_ranges(){
+        let n=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root=std::env::temp_dir().join(format!("ananta-plan-histogram-boundaries-{n}"));
+        let mut db=Database::open(&root).unwrap();
+        db.create_table("readings",Schema::new(vec![
+            Column::new("id",DataType::Int64,false),
+            Column::new("value",DataType::Int64,false),
+        ]).unwrap()).unwrap();
+        db.insert_batch("readings",&[
+            vec![Value::Int64(1),Value::Int64(1)],
+            vec![Value::Int64(2),Value::Int64(2)],
+            vec![Value::Int64(3),Value::Int64(3)],
+            vec![Value::Int64(4),Value::Int64(4)],
+        ]).unwrap();
+        ananta_execution::analyze_table_and_persist(&db,"readings",2).unwrap();
+
+        let estimate=|sql:&str| {
+            let query=crate::parse(sql).unwrap();
+            let plan=explain(&db,&query,&ParameterBindings::default(),PlannerOptions::default()).unwrap();
+            plan.physical.iter().find_map(|node|match node{
+                PhysicalPlanNode::Filter{estimated_rows,..}=>*estimated_rows,
+                _=>None,
+            }).unwrap()
+        };
+        assert_eq!(estimate("SELECT id FROM readings WHERE value >= 3"),2);
+        assert_eq!(estimate("SELECT id FROM readings WHERE value > 3"),1);
+        assert_eq!(estimate("SELECT id FROM readings WHERE value <= 2"),2);
+        assert_eq!(estimate("SELECT id FROM readings WHERE value < 2"),1);
+
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn explain_keeps_unknown_statistics_unknown(){

@@ -926,7 +926,7 @@ A task is done only when all applicable items are true:
 
 1. Complete M5.4 CI validation for native AQL execution, EXPLAIN and table analysis.
 2. Compare physical estimates against runtime rows/bytes on representative tables.
-3. Add explicit cache refresh policies and improve cost-based decisions using persisted histogram statistics.
+3. Add explicit cache refresh policies and improve cost-based decisions across more physical operator types.
 4. Prove Capsule coverage semantics before integrating Navigation Map pruning with full table scans.
 5. Expand optimizer-on/off equivalence tests; keep unsupported expressions on the reference evaluator until lowered.
 

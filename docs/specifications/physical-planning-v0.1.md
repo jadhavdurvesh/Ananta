@@ -47,6 +47,12 @@ AqlExecutionMetrics records measured output batches, output rows and output cell
 
 These counters describe returned output, not rows scanned or bytes read from disk. Scan input bytes are decoded value-body bytes, not bytes physically read from ANF/Chronicle files. Runtime physical file I/O counters and operator-by-operator timings remain future profiling work. A fixture-level plan/profile comparison checks estimated output rows against actual output rows and separately asserts decoded scan input and returned value-body bytes.
 
+## 4. Filter and LIMIT cardinality estimates
+
+When a fresh analyzed snapshot is available, the vectorized physical explain tree estimates row counts after Filter and Limit nodes. Equality uses approximate NDV and the non-NULL fraction; IS NULL / IS NOT NULL uses exact NULL counts; AND / OR / NOT combine child selectivities; numeric, timestamp and ordered scalar range comparisons use sampled histogram buckets, with exact min/max and interpolation behavior encoded in the histogram estimate. LIMIT caps the estimated rows after its child operator.
+
+The physical plan reports the estimate on the Filter and Limit nodes. It remains an estimate, not a runtime measurement. With no fresh analysis snapshot, the planner reports unknown filter/limit cardinality unless it can prove an exact full-table row count from complete Capsule coverage. Runtime output metrics remain separate.
+
 ## 5. Encoded-byte and payload estimate
 
 Chronicle accepted encoded-byte counters are reported separately from analyzed batch payload. The explicit table analyzer measures scanned rows and sums estimated owned batch-payload sizes. A projected payload estimate scales that analysis value by the fraction of columns required by the query, assuming uniform per-column payload. This is a planning heuristic; variable-length values and storage layout can make actual operator allocations differ.
