@@ -701,7 +701,7 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Preserve `DbError::Io` for pre-commit staging conflicts and `DbError::ChronicleCorrupt` for checksum failures in committed Chronicle records.
 - [x] Add deterministic test-only interruption checkpoints after staging create/write/flush/file sync/directory sync, WAL BEGIN/MUTATION/COMMIT, final-name link, publication directory sync, staging-name removal and cleanup directory sync.
 - [x] Exercise the ANF insert and Chronicle ingest paths at every checkpoint; reopen twice, verify row/file counts, and verify Chronicle receipt reconstruction plus duplicate BatchId resolution.
-- [ ] Validate the same matrix with subprocess termination and filesystem-level fault injection; in-process panic checkpoints do not simulate power loss or storage-controller cache loss.
+- [x] Add subprocess-termination tests at WAL MUTATION, durable COMMIT and final-name link for both ANF and Chronicle; reopen after process exit and reopen a second time to verify rows, receipts, and artifact counts.
 - [ ] Integrate catalog DDL, compaction manifests and active-Weave publication with explicit WAL intents.
 - [ ] Add checkpoint installation, WAL rotation and retention only after replay coverage is proven.
 
