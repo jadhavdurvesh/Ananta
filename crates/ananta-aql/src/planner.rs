@@ -19,11 +19,21 @@ impl Default for PlannerOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnStatistics {
+    pub name:String,
+    pub data_type:DataType,
+    pub null_count:Option<u64>,
+    pub minimum:Option<Value>,
+    pub maximum:Option<Value>,
+}
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableStatistics {
     pub row_count:Option<u64>,
     pub ingestion_batches:Option<u64>,
     pub encoded_bytes:Option<u64>,
+    pub capsule_coverage_complete:bool,
+    pub columns:Vec<ColumnStatistics>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhysicalPlanNode {
@@ -46,10 +56,16 @@ pub struct ExplainPlan {
 impl ExplainPlan {
     pub fn render(&self)->String{
         let mut lines=vec![format!("AQL {}",self.language_version)];
-        lines.push(format!("Statistics: rows={}, batches={}, encoded_bytes={}",
+        lines.push(format!("Statistics: rows={}, batches={}, encoded_bytes={}, capsule_coverage_complete={}",
             display_option(self.table_statistics.row_count),
             display_option(self.table_statistics.ingestion_batches),
-            display_option(self.table_statistics.encoded_bytes)));
+            display_option(self.table_statistics.encoded_bytes),
+            self.table_statistics.capsule_coverage_complete));
+        for column in &self.table_statistics.columns {
+            lines.push(format!("COLUMN_STATS {} type={} nulls={} min={:?} max={:?}",
+                column.name,column.data_type,display_option(column.null_count),
+                column.minimum,column.maximum));
+        }
         for node in &self.physical{
             lines.push(match node{
                 PhysicalPlanNode::Scan{table,columns,estimated_rows,projection_pushed_down,capsule_map_generation}=>{
@@ -64,6 +80,19 @@ impl ExplainPlan {
         }
         lines.extend(self.notes.iter().map(|note|format!("NOTE {note}")));
         lines.join("\n")
+    }
+}
+
+fn stat_compare(left:&Value,right:&Value)->std::cmp::Ordering {
+    match (left,right) {
+        (Value::Boolean(a),Value::Boolean(b))=>a.cmp(b),
+        (Value::Int32(a),Value::Int32(b))=>a.cmp(b),
+        (Value::Int64(a),Value::Int64(b))=>a.cmp(b),
+        (Value::Float64(a),Value::Float64(b))=>a.total_cmp(b),
+        (Value::Utf8(a),Value::Utf8(b))=>a.cmp(b),
+        (Value::TimestampMicros(a),Value::TimestampMicros(b))=>a.cmp(b),
+        (Value::Binary(a),Value::Binary(b))=>a.cmp(b),
+        _=>std::cmp::Ordering::Equal,
     }
 }
 
@@ -98,10 +127,47 @@ pub fn explain(
         all.iter().map(|column|column.name.clone()).collect()
     };
     let stats=database.ingestion_stats(&table).map_err(|e|e.to_string())?;
+    let capsule_coverage_complete=database.capsules_cover_chronicle(&table).map_err(|e|e.to_string())?;
+    let mut column_statistics=Vec::new();
+    if capsule_coverage_complete {
+        let capsules=database.verified_capsule_metadata(&table).map_err(|e|e.to_string())?;
+        for (index,column) in all.iter().enumerate() {
+            let column_id=database.column_id(&table,&column.name).map_err(|e|e.to_string())?.0;
+            let mut null_count=Some(0_u64);
+            let mut minimum:Option<Value>=None;
+            let mut maximum:Option<Value>=None;
+            for capsule in &capsules {
+                if let Some(stat)=capsule.columns.iter().find(|stat|stat.column_id==column_id) {
+                    null_count=Some(null_count.unwrap_or(0).saturating_add(stat.null_count));
+                    if let Some(value)=&stat.minimum {
+                        if minimum.as_ref().map_or(true,|current|stat_compare(value,current).is_lt()) {
+                            minimum=Some(value.clone());
+                        }
+                    }
+                    if let Some(value)=&stat.maximum {
+                        if maximum.as_ref().map_or(true,|current|stat_compare(value,current).is_gt()) {
+                            maximum=Some(value.clone());
+                        }
+                    }
+                } else {
+                    null_count=None;
+                    minimum=None;
+                    maximum=None;
+                }
+            }
+            column_statistics.push(ColumnStatistics {
+                name:column.name.clone(),data_type:column.data_type,
+                null_count,minimum,maximum,
+            });
+            let _=index;
+        }
+    }
     let statistics=TableStatistics{
         row_count:if stats.accepted_batches==0{None}else{Some(stats.accepted_rows)},
         ingestion_batches:if stats.accepted_batches==0{None}else{Some(stats.accepted_batches)},
         encoded_bytes:if stats.accepted_batches==0{None}else{Some(stats.accepted_encoded_bytes)},
+        capsule_coverage_complete,
+        columns:column_statistics,
     };
     let timestamp_range=select.selection.as_ref().and_then(|expr|extract_timestamp_range(expr,schema,&table,bindings).ok().flatten());
     let capsule_map_generation=if let (Some(generation),Some(_range))=(options.navigation_map_generation,&timestamp_range){
