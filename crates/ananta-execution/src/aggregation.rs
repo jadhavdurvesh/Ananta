@@ -635,7 +635,7 @@ fn estimate_group_state_bytes(
         .checked_add(encoded_key.len())
         .and_then(|value| {
             value.checked_add(
-                keys.capacity()
+                keys.len()
                     .checked_mul(size_of::<Value>())?,
             )
         })
