@@ -109,7 +109,7 @@ The initial DDL WAL integration now covers `create_table`, `add_nullable_column`
 
 At startup, committed metadata intents are replayed in WAL transaction and intent order before subsequent ANF/Chronicle intents are resolved. This ordering permits a committed table creation or schema change to be replayed before later data writes for that table. Recovery verifies catalog bytes, schema identity, TableId, schema revision, canonical revision progression, immutable destination conflicts and directory types; it fails closed rather than overwriting mismatched artifacts. Stale catalog replacement temps are removed under the exclusive writer lock before catalog loading, and unowned canonical metadata staging temps are cleaned only after WAL recovery.
 
-Table drop, compaction manifests, active-Weave pointer swaps, Capsule and Navigation Map creation are not covered by this DDL integration. They must not be described as WAL-protected until they have explicit redo intents and crash-point tests.
+Table drop, Capsule and Navigation Map creation are not covered by the DDL integration. Active Weave pointer and compaction candidate publication are covered by their separate WAL protocols below.
 
 ## 9. Checkpoint and log retention
 
@@ -226,3 +226,14 @@ Startup replays committed pointer revisions in WAL order after catalog metadata 
 If startup detects that an active generation is damaged but a retained previous generation verifies, the fallback pointer revision is itself committed to the WAL. This prevents recovery from silently changing the active generation outside the log.
 
 The existing compaction integration test now injects interruption after versioned pointer publication, immediately after WAL COMMIT for a later promotion, and after canonical pointer rename but before directory fsync during rollback. Reopen is expected to restore/verify the committed pointer and preserve logical scans. These tests are committed but have not been executed here. The immutable candidate directory rename and OWM1 manifest publication still occur outside WAL and remain the next compaction-publication task.
+
+
+## 15. Immutable compaction candidate publication
+
+After an OWM1 candidate directory has been fully written and verified, the executor syncs the staged directory and appends a `CompactionOutputManifest` AMUT v1 intent. The intent is stored as a versioned `candidate-{wal-sequence}.owm` file in the table's Weave root. It is staged and file/directory-synced before the durable WAL COMMIT. Only after COMMIT does the executor publish the versioned manifest and rename the complete `.stage-{job}-a{attempt}` directory to its canonical `weave-{weave_id}-g{generation}` name, followed by a Weave-root directory sync.
+
+The OWM1 body supplies the exact TableId, schema revision, job/attempt, input fingerprint, WeaveId/generation, and all data/provenance artifact lengths and SHA-256 values. Recovery publishes committed versioned manifest intents in WAL order, derives the only permitted stage/final directory names from the checksummed OWM1 identity, verifies the embedded CIM1 and every referenced data/PVM artifact, completes the directory rename if needed, re-syncs the parent directory, and invokes the existing full candidate verifier. The compaction-job journal is reconciled only after this recovery step, so a committed candidate is not marked Interrupted merely because the process stopped before its directory rename or Completed journal event.
+
+Incomplete intents have their staged manifest removed by generic WAL recovery; the existing compaction-job recovery then marks the Publishing attempt Interrupted and removes its uncommitted stage directory. Canonical unowned manifest temp files are also cleaned after WAL replay. Fully published historical candidates remain immutable across later schema revisions; an unfinished committed candidate for an obsolete schema fails closed.
+
+The existing compaction execution fixture injects interruptions after durable WAL COMMIT, after versioned OWM publication, and after the candidate-directory rename but before parent-directory sync. Reopen must reconstruct the final candidate, verify its full input/output/provenance identity, and preserve the logical table scan. These tests are committed but have not been executed in this environment. Candidate execution/promotion remains separate: this WAL intent publishes an immutable candidate only and does not make it active.

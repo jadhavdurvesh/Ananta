@@ -25,6 +25,7 @@ pub enum WalArtifactKind {
     SchemaSnapshot = 3,
     CatalogSnapshot = 4,
     ActiveWeavePointer = 5,
+    CompactionOutputManifest = 6,
 }
 
 impl WalArtifactKind {
@@ -35,6 +36,7 @@ impl WalArtifactKind {
             3 => Ok(Self::SchemaSnapshot),
             4 => Ok(Self::CatalogSnapshot),
             5 => Ok(Self::ActiveWeavePointer),
+            6 => Ok(Self::CompactionOutputManifest),
             _ => Err(WalRecoveryError::CorruptIntent("unknown artifact kind")),
         }
     }
@@ -46,6 +48,7 @@ impl WalArtifactKind {
             Self::SchemaSnapshot => format!("schema-{file_id:020}.ans"),
             Self::CatalogSnapshot => format!("catalog-{file_id:020}.anc"),
             Self::ActiveWeavePointer => format!("pointer-{file_id:020}.awp"),
+            Self::CompactionOutputManifest => format!("candidate-{file_id:020}.owm"),
         }
     }
 
@@ -56,6 +59,7 @@ impl WalArtifactKind {
             Self::SchemaSnapshot => format!(".schema-{file_id:020}.tmp"),
             Self::CatalogSnapshot => format!(".catalog-{file_id:020}.tmp"),
             Self::ActiveWeavePointer => format!(".pointer-{file_id:020}.tmp"),
+            Self::CompactionOutputManifest => format!(".candidate-{file_id:020}.tmp"),
         }
     }
 }
@@ -287,6 +291,9 @@ pub(crate) enum WalRecoveryCrashPoint {
     AfterActiveWeaveCanonicalPublished,
     AfterActivePointerTempSynced,
     AfterActivePointerRenamedBeforeDirectorySync,
+    AfterCompactionWalCommitted,
+    AfterCompactionManifestPublished,
+    AfterCompactionDirectoryRenamedBeforeSync,
 }
 
 #[cfg(test)]
@@ -637,6 +644,27 @@ fn verify_artifact_identity(
                 ));
             }
         }
+        WalArtifactKind::CompactionOutputManifest => {
+            let metadata = fs::metadata(path).map_err(io_error)?;
+            if metadata.len() > 64 * 1024 * 1024 {
+                return Err(WalRecoveryError::FileConflict(
+                    "compaction output manifest exceeds size limit",
+                ));
+            }
+            let capacity = usize::try_from(metadata.len())
+                .map_err(|_| WalRecoveryError::FileConflict("compaction manifest length is too large"))?;
+            let mut bytes = Vec::with_capacity(capacity);
+            File::open(path).map_err(io_error)?.read_to_end(&mut bytes).map_err(io_error)?;
+            let manifest = crate::CompactionOutputManifest::decode(&bytes)
+                .map_err(|_| WalRecoveryError::FileConflict("compaction output manifest is invalid"))?;
+            if manifest.table_id != intent.table_id
+                || manifest.target_schema_revision != intent.schema_revision
+            {
+                return Err(WalRecoveryError::FileConflict(
+                    "compaction output manifest identity differs from committed WAL intent",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -713,6 +741,18 @@ mod tests {
         assert_eq!(WalMutationIntent::decode(&bytes).unwrap(), original);
         assert_eq!(original.artifact_kind.final_file_name(91), "segment-00000000000000000091.anf");
         assert_eq!(original.artifact_kind.staging_file_name(91), ".segment-00000000000000000091.tmp");
+
+        let candidate = WalMutationIntent {
+            artifact_kind: WalArtifactKind::CompactionOutputManifest,
+            table_id: 4,
+            schema_revision: 2,
+            file_id: 92,
+            file_len: 164,
+            sha256: [92; 32],
+        };
+        assert_eq!(candidate.artifact_kind.final_file_name(92), "candidate-00000000000000000092.owm");
+        assert_eq!(candidate.artifact_kind.staging_file_name(92), ".candidate-00000000000000000092.tmp");
+        assert_eq!(WalMutationIntent::decode(&candidate.encode().unwrap()).unwrap(), candidate);
 
         let mut corrupt = bytes;
         corrupt[6] = 0xff;

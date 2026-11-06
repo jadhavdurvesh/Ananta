@@ -305,3 +305,8 @@ The reproducible CI example creates 10,000 telemetry rows in ten Chronicle batch
 The initial performance conclusion is intentionally conservative: the current full-table scan decodes every selected Weave artifact and does not exploit physical ordering for range pruning or query planning. Time-first/entity-first therefore do not reduce rows decoded in the current workload and add sorting/merge work. No performance benefit is claimed; append-only remains the default. This negative result is documented in docs/research/chrono-weave-m3-report.md. The mixed layout was evaluated against this workload and is not justified; it remains unimplemented.
 
 Linux process CPU time is sampled from procfs and the system clock-tick rate. Non-Linux platforms return null; wall time is not presented as CPU time. The benchmark is a synthetic single-node prototype workload, not a production performance claim.
+
+
+## 17. WAL publication boundary
+
+The immutable candidate directory and OWM1 output manifest are now published under the M6.2 WAL protocol. The committed OWM1 intent identifies the complete staged candidate and recovery completes the stage-to-final directory rename before the CJE1 job journal is reconciled. This does not promote the candidate to active visibility; AWP1 promotion remains a separate WAL-backed operation.

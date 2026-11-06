@@ -196,7 +196,7 @@ impl Database {
     /// Build an immutable candidate Weave using finite resource budgets and bounded
     /// output artifacts. The resulting directory is not the active table generation.
     pub fn execute_compaction(
-        &self,
+        &mut self,
         table: &str,
         input: &CompactionInputManifest,
         weave_id: u64,
@@ -205,6 +205,7 @@ impl Database {
         limits: CompactionResourceLimits,
         cancel: Option<&AtomicBool>,
     ) -> Result<CompactionExecutionReport, DbError> {
+        self.ensure_operational()?;
         let started = Instant::now();
         let cpu_started = process_cpu_time_micros();
         limits.validate().map_err(|e| DbError::CompactionExecution(e.to_string()))?;
@@ -294,6 +295,7 @@ impl Database {
             return finish_cancelled(&mut journal, &journal_path, progress);
         }
         fs::create_dir(&stage_dir)?;
+        sync_directory(&weave_root)?;
         let input_manifest_bytes = input.encode()?;
         progress.temporary_bytes = u64::try_from(input_manifest_bytes.len()).map_err(|_| DbError::LengthOverflow)?;
         limits.check(&CompactionProgress {
@@ -519,7 +521,34 @@ impl Database {
             if fs::symlink_metadata(&final_dir).is_ok() {
                 return Err(DbError::CompactionPreflight("candidate generation already exists at publication"));
             }
+
+            // The whole immutable candidate is durable before its OWM1
+            // publication intent is committed. The WAL stores the manifest as
+            // a stable versioned file; OWM1 identifies both stage and final dirs.
+            let manifest_transaction = self.wal.next_sequence();
+            let manifest_intent = crate::WalMutationIntent {
+                artifact_kind: crate::WalArtifactKind::CompactionOutputManifest,
+                table_id: definition.id.0,
+                schema_revision: definition.schema_revision,
+                file_id: manifest_transaction,
+                file_len: u64::try_from(manifest_bytes.len()).map_err(|_| DbError::LengthOverflow)?,
+                sha256: sha256(&manifest_bytes),
+            };
+            crate::stage_wal_artifact(&weave_root, &manifest_intent, &manifest_bytes)
+                .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
+            self.commit_wal_intent(&manifest_intent, b"publish_compaction_candidate")?;
+            crate::wal_recovery::maybe_crash_after(
+                crate::wal_recovery::WalRecoveryCrashPoint::AfterCompactionWalCommitted,
+            );
+            let _versioned_manifest = self.publish_wal_intent(&weave_root, &manifest_intent)?;
+            crate::wal_recovery::maybe_crash_after(
+                crate::wal_recovery::WalRecoveryCrashPoint::AfterCompactionManifestPublished,
+            );
+
             fs::rename(&stage_dir, &final_dir)?;
+            crate::wal_recovery::maybe_crash_after(
+                crate::wal_recovery::WalRecoveryCrashPoint::AfterCompactionDirectoryRenamedBeforeSync,
+            );
             sync_directory(&weave_root)?;
             append_state(&mut journal, &journal_path, CompactionJobState::Completed, progress)?;
 
@@ -555,7 +584,8 @@ impl Database {
                                 }
                             }
                         }
-                    } else if state != CompactionJobState::Publishing || !final_dir.exists() {
+                    } else if !self.recovery_required
+                        && (state != CompactionJobState::Publishing || !final_dir.exists()) {
                         if let Ok(event) = journal.append(CompactionJobState::Failed, progress) {
                             let _ = append_compaction_journal_event(&journal_path, &event);
                         }
@@ -1101,6 +1131,47 @@ mod tests {
             assert!(report.temporary_bytes >= report.output_bytes);
         }
 
+        // Candidate directory publication is now WAL-backed. Exercise the
+        // durable commit, versioned OWM publication, and directory-rename
+        // boundaries; every reopen must complete the same immutable candidate.
+        for (offset, point) in [
+            (0_u8, crate::wal_recovery::WalRecoveryCrashPoint::AfterCompactionWalCommitted),
+            (1_u8, crate::wal_recovery::WalRecoveryCrashPoint::AfterCompactionManifestPublished),
+            (2_u8, crate::wal_recovery::WalRecoveryCrashPoint::AfterCompactionDirectoryRenamedBeforeSync),
+        ] {
+            let job_id = crate::CompactionJobId::from_bytes([63 + offset; 16]).unwrap();
+            let input = CompactionInputManifest {
+                table_id: table_id.0,
+                job_id,
+                attempt: 1,
+                target_schema_revision: 1,
+                first_sequence: 1,
+                last_sequence: 2,
+                expected_row_count: 4,
+                capsules: capsules.clone(),
+                receipts: receipts.clone(),
+            };
+            let weave_id = 150 + u64::from(offset);
+            crate::wal_recovery::arm_wal_recovery_crash_point(point);
+            let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                db.execute_compaction(
+                    "telemetry",
+                    &input,
+                    weave_id,
+                    1,
+                    WeaveLayoutProfile::AppendOnly,
+                    limits,
+                    None,
+                )
+            }));
+            assert!(interrupted.is_err(), "compaction crash point {point:?} was not reached");
+            drop(db);
+            db = Database::open(&root).unwrap();
+            let recovered = db.verify_compaction_candidate("telemetry", &input, weave_id, 1).unwrap();
+            assert_eq!(recovered.weave_id, weave_id);
+            assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
+        }
+
         assert_eq!(first_timestamps[0], Value::TimestampMicros(300));
         assert_eq!(first_timestamps[1], Value::TimestampMicros(100));
         assert_eq!(first_entities[2], Value::Utf8("a".into()));
@@ -1147,6 +1218,184 @@ mod tests {
 
 
 impl Database {
+    /// Finish WAL-committed OWM1 candidate-directory publications before
+    /// compaction journals are reconciled. The immutable manifest snapshot is
+    /// the WAL anchor; its CIM1 identity determines the only permitted stage
+    /// and final directory names.
+    pub(crate) fn recover_compaction_candidate_publications(&self) -> Result<(), DbError> {
+        for (table, definition) in &self.catalog.tables {
+            let weave_root = self.root.join("data").join(table).join("weaves");
+            let entries = match fs::read_dir(&weave_root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(DbError::Io(error)),
+            };
+            let mut entries_to_scan = Vec::new();
+            let mut removed_orphans = false;
+            for entry in entries {
+                let entry = entry?;
+                let filename = entry.file_name();
+                let filename = filename.to_string_lossy().into_owned();
+                let is_candidate_name = filename.starts_with("candidate-") && filename.ends_with(".owm");
+                if !entry.file_type()?.is_file() {
+                    if is_candidate_name {
+                        return Err(DbError::CompactionPreflight(
+                            "versioned candidate manifest is not a regular file",
+                        ));
+                    }
+                    continue;
+                }
+                if let Some(number) = filename.strip_prefix(".candidate-").and_then(|v| v.strip_suffix(".tmp")) {
+                    let canonical = number.len() == 20
+                        && number.bytes().all(|byte| byte.is_ascii_digit())
+                        && number.parse::<u64>().ok().map_or(false, |id| id != 0 && format!("{id:020}") == number);
+                    if canonical {
+                        fs::remove_file(entry.path())?;
+                        removed_orphans = true;
+                        continue;
+                    }
+                }
+                entries_to_scan.push((entry.path(), filename));
+            }
+            if removed_orphans {
+                sync_directory(&weave_root)?;
+            }
+            for (versioned_path, filename) in entries_to_scan {
+                let Some(number) = filename.strip_prefix("candidate-")
+                    .and_then(|value| value.strip_suffix(".owm")) else {
+                    continue;
+                };
+                if number.len() != 20 || !number.bytes().all(|byte| byte.is_ascii_digit())
+                    || number.parse::<u64>().ok().map_or(true, |id| id == 0 || format!("{id:020}") != number)
+                {
+                    return Err(DbError::CompactionExecution(
+                        "versioned candidate manifest filename is not canonical".into(),
+                    ));
+                }
+
+                let manifest_bytes = read_regular_file(&versioned_path)?;
+                let output = CompactionOutputManifest::decode(&manifest_bytes)
+                    .map_err(|error| DbError::CompactionExecution(error.to_string()))?;
+                if output.table_id != definition.id.0 {
+                    return Err(DbError::CompactionPreflight(
+                        "committed candidate manifest TableId mismatch",
+                    ));
+                }
+
+                let stage_dir = weave_root.join(format!(
+                    ".stage-{}-a{:020}",
+                    hex(output.job_id.as_bytes()),
+                    output.attempt,
+                ));
+                let final_dir = weave_root.join(format!(
+                    "weave-{:020}-g{:020}",
+                    output.weave_id,
+                    output.generation,
+                ));
+                let stage_exists = fs::symlink_metadata(&stage_dir)
+                    .map(|metadata| {
+                        if !metadata.file_type().is_dir() {
+                            Err(DbError::CompactionPreflight(
+                                "committed candidate staging path is not a real directory",
+                            ))
+                        } else { Ok(true) }
+                    })
+                    .unwrap_or_else(|error| {
+                        if error.kind() == std::io::ErrorKind::NotFound { Ok(false) }
+                        else { Err(DbError::Io(error)) }
+                    })?;
+                let final_exists = fs::symlink_metadata(&final_dir)
+                    .map(|metadata| {
+                        if !metadata.file_type().is_dir() {
+                            Err(DbError::CompactionPreflight(
+                                "committed candidate final path is not a real directory",
+                            ))
+                        } else { Ok(true) }
+                    })
+                    .unwrap_or_else(|error| {
+                        if error.kind() == std::io::ErrorKind::NotFound { Ok(false) }
+                        else { Err(DbError::Io(error)) }
+                    })?;
+                if stage_exists && final_exists {
+                    return Err(DbError::CompactionPreflight(
+                        "both staged and final directories exist for one committed candidate",
+                    ));
+                }
+                // A fully finalized historical candidate may outlive a later
+                // schema revision. It is immutable and no longer needs replay;
+                // an unfinished candidate at an old revision cannot be safely
+                // completed against the current table schema.
+                if output.target_schema_revision != definition.schema_revision {
+                    if final_exists && !stage_exists {
+                        continue;
+                    }
+                    return Err(DbError::CompactionPreflight(
+                        "unfinished committed candidate targets a different schema revision",
+                    ));
+                }
+                if !stage_exists && !final_exists {
+                    return Err(DbError::CompactionPreflight(
+                        "committed candidate is missing both staged and final directories",
+                    ));
+                }
+                let candidate_dir = if stage_exists { &stage_dir } else { &final_dir };
+                let staged_manifest = read_regular_file(&candidate_dir.join("manifest.owm"))?;
+                if staged_manifest != manifest_bytes {
+                    return Err(DbError::CompactionPreflight(
+                        "candidate directory OWM1 differs from committed WAL manifest",
+                    ));
+                }
+                let input_bytes = read_regular_file(&candidate_dir.join("input.cim"))?;
+                let input = CompactionInputManifest::decode(&input_bytes)?;
+                if input.table_id != output.table_id
+                    || input.job_id != output.job_id
+                    || input.attempt != output.attempt
+                    || input.target_schema_revision != output.target_schema_revision
+                    || input.first_sequence != output.first_sequence
+                    || input.last_sequence != output.last_sequence
+                    || input.expected_row_count != output.expected_row_count
+                    || input.fingerprint()? != output.input_manifest_sha256
+                {
+                    return Err(DbError::CompactionPreflight(
+                        "committed candidate CIM1/OWM1 identity mismatch",
+                    ));
+                }
+                for artifact in &output.artifacts {
+                    read_verified_artifact(
+                        &candidate_dir.join(artifact.data_relative_path()),
+                        artifact.data_file_len,
+                        artifact.data_file_sha256,
+                    )?;
+                    read_verified_artifact(
+                        &candidate_dir.join(artifact.provenance_relative_path()),
+                        artifact.provenance_file_len,
+                        artifact.provenance_file_sha256,
+                    )?;
+                }
+
+                if stage_exists {
+                    sync_directory(&stage_dir)?;
+                    fs::rename(&stage_dir, &final_dir)?;
+                }
+                // Also sync the parent on repeat opens: the prior process may
+                // have stopped after rename and before this directory fsync.
+                sync_directory(&weave_root)?;
+                let verified = self.verify_compaction_candidate(
+                    table,
+                    &input,
+                    output.weave_id,
+                    output.generation,
+                )?;
+                if verified != output {
+                    return Err(DbError::CompactionPreflight(
+                        "recovered candidate differs from committed OWM1 snapshot",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Reconcile candidate publication after a process interruption. A durable,
     /// independently verifiable final candidate completes a journal stopped at
     /// Publishing; all other unfinished attempts become Interrupted. Damaged

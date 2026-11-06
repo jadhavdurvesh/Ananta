@@ -704,7 +704,7 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Add subprocess-termination tests at WAL MUTATION, durable COMMIT and final-name link for both ANF and Chronicle; reopen after process exit and reopen a second time to verify rows, receipts, and artifact counts.
 - [x] WAL-protect `create_table`, nullable-column addition, column rename and column reorder with ordered schema-snapshot + versioned-catalog multi-intent transactions; replay committed catalog mutations before later data writes.
 - [x] Add in-process pre-COMMIT DDL interruption coverage for staging and incomplete WAL intents, plus in-process and subprocess crash/reopen coverage after WAL COMMIT, schema publication, versioned catalog publication, canonical replacement-temp sync, atomic rename before directory sync, and completed canonical catalog replacement.
-- [ ] Integrate immutable compaction candidate-directory/OWM publication with explicit WAL intents.
+- [x] WAL-protect immutable compaction candidate-directory/OWM publication with a versioned manifest intent; recover staged-to-final directory rename before compaction journal reconciliation.
 - [x] WAL-protect active Weave promotion, rollback and damaged-generation fallback using immutable versioned AWP snapshots; replay committed pointers before active-generation validation.
 - [ ] Integrate Capsule and Navigation Map publication with explicit WAL intents.
 - [ ] Add checkpoint installation, WAL rotation and retention only after replay coverage is proven.
