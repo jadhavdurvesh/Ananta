@@ -6803,6 +6803,25 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_replays_catalog_changes_and_revalidates_mutable_state() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let checkpoint = db.create_checkpoint().unwrap();
+        assert!(checkpoint.manifest_path.is_file());
+
+        db.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.table_schema_revision("telemetry").unwrap(), 2);
+        assert_eq!(reopened.schema("telemetry").unwrap().len(), 4);
+        reopened.check_consistency(1).unwrap();
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn checkpoint_manifest_mismatch_fails_database_open_closed() {
         let path = temp_path();
         let mut db = Database::open(&path).unwrap();
