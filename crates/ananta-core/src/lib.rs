@@ -788,7 +788,7 @@ impl Database {
         if !current.is_clean() || !self.wal.incomplete_transaction_ids().is_empty() {
             return Err(DbError::Wal("checkpoint requires a clean WAL with no open transactions".into()));
         }
-        let (reference, report) = crate::wal_checkpoint::create_checkpoint(
+        let (reference, mut report) = crate::wal_checkpoint::create_checkpoint(
             &self.root,
             current.last_sequence,
             self.catalog.revision,
