@@ -1,5 +1,9 @@
 pub mod aggregation;
+pub mod time_series;
 pub use aggregation::{AggregateFunction, AggregateSpec, GroupByOperator};
+pub use time_series::{
+    LatestPerSeriesOperator, TimeBucketOperator, TimestampBound, TimestampRangeOperator,
+};
 
 use ananta_core::{BatchColumn, Database, DbError, RecordBatch, ScanBatchIter};
 use ananta_types::{Column, DataType, Schema, Value};

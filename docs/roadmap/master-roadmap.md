@@ -5,7 +5,7 @@
 **Owner:** DMJ  
 **Current release target:** 0.1.0 — Native Storage Prototype  
 **Roadmap status:** Active; review this file before starting work outside the current milestone
-**Current focus:** M5.2 aggregate implementation validation; M5.1 execution model is complete
+**Current focus:** M5.3 time-series implementation validation; M5.1 and M5.2 are complete
 
 ---
 
@@ -584,7 +584,7 @@ Specification: docs/specifications/vector-execution-v0.1.md.
 
 **M5.1 status:** Complete as the first reusable operator runtime. The canonical vector batch reuses ananta-core RecordBatch; scan/projection/filter/limit are pull-based, filters use three-valued NULL logic, cancellation is cooperative, and the execution context enforces row/cell/working-set ceilings. AQL is not yet routed through these operators; that integration is planned for M5.4.
 
-## M5.2 Aggregation — implementation submitted for CI validation
+## M5.2 Aggregation — complete
 - [x] Define aggregate state interface.
 - [x] Implement count (COUNT(*) and COUNT(column)).
 - [x] Implement SUM for INT32, INT64 and FLOAT64.
@@ -599,18 +599,21 @@ Specification: docs/specifications/vector-execution-v0.1.md.
 
 Specification: docs/specifications/aggregation-v0.1.md.
 
-**Validation boundary:** source and tests are committed together; GitHub Actions remains the acceptance gate. GROUP BY is blocking and has no spill-to-disk in v0.1. AQL integration, ORDER BY and distributed/parallel aggregation remain deferred.
+**Exit status:** M5.2 passed the full Native Rust GitHub Actions workflow, including formatting, all workspace tests, Clippy, native AQL/storage examples and the existing storage/ChronoWeave benchmarks.
 
-## M5.3 Time-series analytics
-- [ ] Define time bucket semantics.
-- [ ] Define timezone and UTC behaviour.
-- [ ] Implement time-range filter.
-- [ ] Implement bucketed count.
-- [ ] Implement bucketed min/max/average.
-- [ ] Implement latest-value-per-series.
-- [ ] Test gaps and missing intervals.
-- [ ] Test late-arriving records.
-- [ ] Test boundary timestamps.
+## M5.3 Time-series analytics — implementation submitted for CI validation
+- [x] Define time bucket semantics (fixed-width, epoch-anchored, left-closed/right-open).
+- [x] Define UTC and signed microsecond behavior (including Euclidean floor for pre-epoch timestamps).
+- [x] Implement inclusive/exclusive timestamp range filter.
+- [x] Implement bucketed COUNT through the shared aggregate engine.
+- [x] Implement bucketed MIN/MAX/AVG through the shared aggregate engine.
+- [x] Implement latest-value-per-series.
+- [x] Define missing-interval behavior (no synthetic empty buckets).
+- [x] Test late-arriving records and negative/boundary timestamps.
+
+Specification: docs/specifications/time-series-execution-v0.1.md.
+
+**Validation boundary:** time-series operators reuse the M5.2 group-state and resource controls. Timezone conversion, calendar buckets, gap filling, windows, watermarks and AQL integration remain deferred.
 
 ## M5.4 Planner and optimisation
 - [ ] Define logical plan.
@@ -907,10 +910,10 @@ A task is done only when all applicable items are true:
 
 # 15. Immediate next actions
 
-1. Complete CI validation for the M5.2 aggregate and GROUP BY operators.
-2. If CI is green, mark M5.2 complete and begin M5.3 time-series semantics.
-3. Define UTC/microsecond bucket boundaries, empty bucket policy and late-arriving row behavior before implementing time-series operators.
-4. Add COUNT, MIN, MAX and AVG time-bucket operators with deterministic boundary tests.
-5. Keep AQL planner integration for M5.4 after the operator contracts stabilise.
+1. Complete CI validation for the M5.3 time-series operators.
+2. If CI is green, mark M5.3 complete and begin M5.4 planner/optimisation.
+3. Integrate the native execution operators with AQL using a compiled physical plan.
+4. Add projection/predicate pushdown and Navigation Map time-range pruning only where results remain identical to the unoptimised plan.
+5. Record explain output and measured rows/bytes; compare optimiser-on and optimiser-off results.
 
-**Current focus: M5.2 — aggregate implementation validation.**
+**Current focus: M5.3 — time-series implementation validation.**

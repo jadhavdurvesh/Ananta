@@ -573,7 +573,7 @@ fn compare_aggregate_values(left: &Value, right: &Value) -> Result<Ordering, Exe
     Ok(ordering)
 }
 
-fn encode_group_key(values: &[Value]) -> Result<Vec<u8>, ExecutionError> {
+pub(crate) fn encode_group_key(values: &[Value]) -> Result<Vec<u8>, ExecutionError> {
     let mut bytes = Vec::new();
     for value in values {
         match value {
