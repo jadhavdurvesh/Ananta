@@ -608,6 +608,14 @@ impl Database {
 
         let table_id = snapshot.table_id();
         let schema_revision = snapshot.revision();
+        let expected_catalog_revision = self.catalog.revision
+            .checked_add(1)
+            .ok_or(DbError::LengthOverflow)?;
+        if candidate.revision != expected_catalog_revision {
+            return Err(DbError::CorruptCatalog(
+                "catalog mutation revision is not the next revision",
+            ));
+        }
         let definition = candidate.tables.values()
             .find(|definition| definition.id == table_id)
             .ok_or(DbError::CorruptCatalog("catalog mutation snapshot TableId is missing"))?;
@@ -632,6 +640,30 @@ impl Database {
 
         let snapshot_bytes = snapshot.encode()?;
         let catalog_bytes = encode_catalog_v2(&candidate)?;
+        let catalog_replacement_temp = catalog_directory.join("catalog.anc.tmp");
+        match fs::symlink_metadata(&catalog_replacement_temp) {
+            Ok(_) => {
+                return Err(DbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "catalog replacement temporary path already exists",
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DbError::Io(error)),
+        }
+        verify_immutable_file_if_present(
+            &schema_path,
+            &snapshot_bytes,
+            "immutable schema snapshot conflict",
+        )?;
+        let catalog_snapshot_path = catalog_directory.join(
+            WalArtifactKind::CatalogSnapshot.final_file_name(candidate.revision),
+        );
+        verify_immutable_file_if_present(
+            &catalog_snapshot_path,
+            &catalog_bytes,
+            "immutable catalog snapshot conflict",
+        )?;
         let schema_intent = WalMutationIntent {
             artifact_kind: WalArtifactKind::SchemaSnapshot,
             table_id: table_id.0,
@@ -2358,6 +2390,25 @@ fn encode_catalog_v2(catalog: &Catalog) -> Result<Vec<u8>, DbError> {
     let decoded = decode_catalog_v2(&bytes)?;
     validate_catalog(&decoded)?;
     Ok(bytes)
+}
+
+fn verify_immutable_file_if_present(
+    path: &Path,
+    expected: &[u8],
+    conflict: &'static str,
+) -> Result<(), DbError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() == expected.len() as u64 => {
+            if fs::read(path)? == expected {
+                Ok(())
+            } else {
+                Err(DbError::CorruptCatalog(conflict))
+            }
+        }
+        Ok(_) => Err(DbError::CorruptCatalog(conflict)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DbError::Io(error)),
+    }
 }
 
 fn apply_catalog_snapshot_artifact(
