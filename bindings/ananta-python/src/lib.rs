@@ -25,7 +25,7 @@ fn parse_type(value: &str) -> PyResult<DataType> {
 }
 
 fn py_value_to_native(
-    py: Python<'_>,
+    _py: Python<'_>,
     value: &Bound<'_, PyAny>,
     data_type: DataType,
 ) -> PyResult<Value> {
