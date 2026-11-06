@@ -1,3 +1,6 @@
+pub mod aggregation;
+pub use aggregation::{AggregateFunction, AggregateSpec, GroupByOperator};
+
 use ananta_core::{BatchColumn, Database, DbError, RecordBatch, ScanBatchIter};
 use ananta_types::{Column, DataType, Schema, Value};
 use std::cmp::Ordering;
@@ -322,6 +325,7 @@ fn checked_add(left: usize, right: usize) -> Result<usize, ExecutionError> {
 #[derive(Debug)]
 pub enum ExecutionError {
     Storage(DbError),
+    AggregateOverflow(String),
     InvalidSchema(String),
     InvalidBatch(String),
     InvalidPlan(String),
@@ -339,6 +343,7 @@ impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Storage(error) => write!(f, "storage error: {error}"),
+            Self::AggregateOverflow(function) => write!(f, "{function} aggregate result exceeds the supported output range"),
             Self::InvalidSchema(message) => write!(f, "invalid execution schema: {message}"),
             Self::InvalidBatch(message) => write!(f, "invalid vector batch: {message}"),
             Self::InvalidPlan(message) => write!(f, "invalid execution plan: {message}"),

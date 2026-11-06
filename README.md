@@ -39,7 +39,7 @@ AQL v0.1 is implemented as a native Rust language crate, not SQL passed through 
 
 ## Native execution v0.1 status
 
-The separate Rust `ananta-execution` crate introduces the M5 pull-based operator runtime over the existing owned `ananta_core::RecordBatch` representation. M5.1 includes typed vector-schema validation, a native storage scan adapter, projection with aliases/repeated columns, NULL-aware filter predicates, a global limit operator, cancellation, and per-batch/transition resource budgets. It does not add a second storage format or yet replace the AQL executor; AQL planner integration remains part of M5.4.
+The separate Rust `ananta-execution` crate provides M5 pull-based operators over the existing owned `ananta_core::RecordBatch` representation. M5.1 provides typed vector-schema validation, a native storage scan adapter, projection with aliases/repeated columns, NULL-aware filters, a global limit operator, cancellation, and per-batch/transition resource budgets. M5.2 adds COUNT, SUM, MIN, MAX, AVG and deterministic GROUP BY with NULL semantics, checked integer overflow, bounded output batches and a distinct-group memory budget. AQL planner integration and time-series analytics remain later M5 work.
 
 ## Master execution roadmap
 

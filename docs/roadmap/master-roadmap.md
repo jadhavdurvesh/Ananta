@@ -5,7 +5,7 @@
 **Owner:** DMJ  
 **Current release target:** 0.1.0 — Native Storage Prototype  
 **Roadmap status:** Active; review this file before starting work outside the current milestone
-**Current focus:** M5.2 aggregation and group-by operators; M5.1 execution model is complete
+**Current focus:** M5.2 aggregate implementation validation; M5.1 execution model is complete
 
 ---
 
@@ -584,18 +584,22 @@ Specification: docs/specifications/vector-execution-v0.1.md.
 
 **M5.1 status:** Complete as the first reusable operator runtime. The canonical vector batch reuses ananta-core RecordBatch; scan/projection/filter/limit are pull-based, filters use three-valued NULL logic, cancellation is cooperative, and the execution context enforces row/cell/working-set ceilings. AQL is not yet routed through these operators; that integration is planned for M5.4.
 
-## M5.2 Aggregation
-- [ ] Define aggregate state interface.
-- [ ] Implement count.
-- [ ] Implement sum.
-- [ ] Implement min and max.
-- [ ] Implement average.
-- [ ] Define integer overflow behaviour.
-- [ ] Define floating-point determinism policy.
-- [ ] Define null handling for each aggregate.
-- [ ] Implement group-by.
-- [ ] Test empty inputs and empty groups.
-- [ ] Test high-cardinality grouping.
+## M5.2 Aggregation — implementation submitted for CI validation
+- [x] Define aggregate state interface.
+- [x] Implement count (COUNT(*) and COUNT(column)).
+- [x] Implement SUM for INT32, INT64 and FLOAT64.
+- [x] Implement MIN and MAX for supported ordered scalar types.
+- [x] Implement AVG for INT32, INT64 and FLOAT64.
+- [x] Define integer overflow behaviour (checked i128 accumulator; checked INT64 output).
+- [x] Define floating-point determinism policy (source-order IEEE-754 accumulation).
+- [x] Define NULL handling for each aggregate.
+- [x] Implement deterministic GROUP BY over canonical typed keys.
+- [x] Test empty scalar input and empty grouped input.
+- [x] Test high-cardinality groups, bounded output batches and group-state memory limit.
+
+Specification: docs/specifications/aggregation-v0.1.md.
+
+**Validation boundary:** source and tests are committed together; GitHub Actions remains the acceptance gate. GROUP BY is blocking and has no spill-to-disk in v0.1. AQL integration, ORDER BY and distributed/parallel aggregation remain deferred.
 
 ## M5.3 Time-series analytics
 - [ ] Define time bucket semantics.
@@ -903,12 +907,10 @@ A task is done only when all applicable items are true:
 
 # 15. Immediate next actions
 
-Continue M5 in order. Do not begin M6 durability work or M7 interfaces before the analytical engine exit gate is met.
+1. Complete CI validation for the M5.2 aggregate and GROUP BY operators.
+2. If CI is green, mark M5.2 complete and begin M5.3 time-series semantics.
+3. Define UTC/microsecond bucket boundaries, empty bucket policy and late-arriving row behavior before implementing time-series operators.
+4. Add COUNT, MIN, MAX and AVG time-bucket operators with deterministic boundary tests.
+5. Keep AQL planner integration for M5.4 after the operator contracts stabilise.
 
-1. Define aggregate state and null/overflow/determinism contracts for M5.2.
-2. Implement COUNT, SUM, MIN, MAX and AVG over bounded vector batches.
-3. Add GROUP BY with deterministic typed grouping keys and high-cardinality/resource-limit tests.
-4. Validate empty inputs, all-NULL inputs, mixed NULL values, integer overflow and floating-point edge cases.
-5. Record correctness and resource metrics before starting M5.3 time-series operators.
-
-**Current focus: M5.2 — aggregation and group-by operators.**
+**Current focus: M5.2 — aggregate implementation validation.**
