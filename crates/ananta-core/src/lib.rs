@@ -755,6 +755,7 @@ impl Database {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
                 Err(error) => return Err(DbError::Io(error)),
             }
+            self.validate_active_weave_integrity(table)?;
             report.tables_checked = report.tables_checked.checked_add(1).ok_or(DbError::LengthOverflow)?;
         }
         Ok(report)
