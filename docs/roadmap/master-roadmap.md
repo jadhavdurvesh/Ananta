@@ -5,7 +5,7 @@
 **Owner:** DMJ  
 **Current release target:** 0.1.0 — Native Storage Prototype  
 **Roadmap status:** Active; review this file before starting work outside the current milestone
-**Current focus:** M5.4 planner, explain and statistics; M5.1–M5.3 are complete
+**Current focus:** M6.2 WAL-backed recovery and crash-boundary validation; M5 is complete
 
 ---
 
@@ -677,7 +677,7 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Test complete corrupt frames, checksum mismatch, sequence gaps and bad commit digests.
 - [x] Test open transaction reporting, explicit abort after reopen, sync modes and invalid transaction ordering.
 
-**M6.1 boundary:** The ANWL v1 reader/writer is standalone. Database insert/ingest/catalog/compaction mutations are not yet routed through it, and there is no startup replay or rollback. These are M6.2 deliverables; no crash-recovery or ACID guarantee is claimed.
+**M6.1 boundary:** ANWL v1 framing is now used by the M6.2 ANF insert and Chronicle ingest publication paths. Catalog DDL, compaction/Weave publication, checkpoint installation and general transaction semantics remain outside this boundary; no general ACID guarantee is claimed.
 
 ## M6.2 Recovery — initial ANF/Chronicle WAL replay integrated
 - [x] Define startup recovery algorithm for immutable ANF/Chronicle artifacts.
@@ -699,7 +699,9 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Test Database::open fails closed and preserves a conflicting final artifact.
 - [x] Verify ANF embedded TableId/schema revision and Chronicle record TableId/schema revision against each committed intent before publication.
 - [x] Preserve `DbError::Io` for pre-commit staging conflicts and `DbError::ChronicleCorrupt` for checksum failures in committed Chronicle records.
-- [ ] Inject process interruption at every publication/fsync boundary and verify replay idempotence across repeated crashes.
+- [x] Add deterministic test-only interruption checkpoints after staging create/write/flush/file sync/directory sync, WAL BEGIN/MUTATION/COMMIT, final-name link, publication directory sync, staging-name removal and cleanup directory sync.
+- [x] Exercise the ANF insert and Chronicle ingest paths at every checkpoint; reopen twice, verify row/file counts, and verify Chronicle receipt reconstruction plus duplicate BatchId resolution.
+- [ ] Validate the same matrix with subprocess termination and filesystem-level fault injection; in-process panic checkpoints do not simulate power loss or storage-controller cache loss.
 - [ ] Integrate catalog DDL, compaction manifests and active-Weave publication with explicit WAL intents.
 - [ ] Add checkpoint installation, WAL rotation and retention only after replay coverage is proven.
 
@@ -957,4 +959,4 @@ A task is done only when all applicable items are true:
 4. Prove Capsule coverage semantics before integrating Navigation Map pruning with full table scans.
 5. Expand optimizer-on/off equivalence tests; keep unsupported expressions on the reference evaluator until lowered.
 
-**Current focus: M5.4 — CI validation and estimate accuracy.**
+**Current focus: M6.2 — WAL-backed ANF/Chronicle recovery and crash-boundary validation.**

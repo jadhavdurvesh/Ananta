@@ -43,7 +43,7 @@ The separate Rust `ananta-execution` crate provides M5 pull-based operators over
 
 ## Master execution roadmap
 
-The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M5.2 — aggregation and group-by operators.** M1, M2 and M3 are complete. M3 delivered bounded ChronoWeave candidate execution, three layout strategies, provenance verification, active-generation promotion/rollback, crash recovery and reproducible benchmark evidence.
+The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M6.2 — WAL-backed ANF/Chronicle recovery and crash-boundary validation.** M1, M2, M3, M4 and M5 are complete. M3 delivered bounded ChronoWeave candidate execution, three layout strategies, provenance verification, active-generation promotion/rollback, crash recovery and reproducible benchmark evidence.
 
 ## Native design documents
 
@@ -179,7 +179,7 @@ The example creates a deterministic 2,048-row telemetry dataset, persists ANALYZ
 The standalone ANWL WAL reader additionally tests truncated frame-body recovery, sequence-gap rejection and transaction commit-digest validation. Database write-path integration and startup replay remain M6.2 work.
 
 
-M6.2 is being developed against a redo-only staged-file publication protocol. Its crash matrix, mutation-intent envelope, recovery ordering, Chronicle idempotency rules and fail-closed cases are specified in docs/specifications/wal-recovery-v0.1.md. This remains design work until Database mutation paths and startup replay are implemented and fault-injection tested.
+M6.2 now routes `insert_batch` and `ingest_batch` through staged, checksummed AMUT intents and durable WAL COMMIT before no-replace artifact publication. `Database::open` replays committed artifacts before rebuilding Chronicle receipts and fails closed on missing or conflicting files. Test-only interruption checkpoints cover staging writes/syncs, WAL records, final-name publication and cleanup; ANF and Chronicle restart tests reopen twice and verify idempotence. Subprocess-kill/physical power-loss tests, catalog DDL, compaction/Weave WAL intents and checkpoint/rotation remain outstanding. See `docs/specifications/wal-recovery-v0.1.md`.
 
 
 M6.2 now includes typed AMUT v1 mutation intents and a tested recovery-plan classifier for committed, incomplete and aborted WAL transactions. These are primitives only; Database::open replay and ANF/Chronicle mutation-path integration remain in progress.

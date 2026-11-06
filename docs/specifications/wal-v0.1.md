@@ -1,11 +1,11 @@
 # ANANTA Write-Ahead Log Format v0.1
 
 **Milestone:** M6.1 — WAL framing and append primitives  
-**Status:** Implemented as a standalone subsystem; database mutation replay is M6.2 work.
+**Status:** The standalone framing subsystem is implemented and is consumed by M6.2 ANF/Chronicle mutation replay; catalog DDL and compaction publication remain outside WAL coverage.
 
 ## 1. Scope and guarantee boundary
 
-The WAL module provides versioned append-only record framing, checksums, sequence validation, transaction markers, append/sync policies, and incomplete-tail detection. It is not yet the database's source of truth and is not yet called by Database::insert_batch, Database::ingest_batch, catalog DDL, or compaction publication. Until M6.2 connects WAL records to actual mutation payloads and startup replay, enabling this module alone does not make database writes crash-recoverable.
+The WAL module provides versioned append-only record framing, checksums, sequence validation, transaction markers, append/sync policies, and incomplete-tail detection. Database::insert_batch and Database::ingest_batch now write AMUT intents and use startup redo for immutable ANF/Chronicle artifact publication. Catalog DDL, compaction/Weave publication, checkpoint installation and general multi-operation transactions are not yet WAL-backed.
 
 The WAL stores opaque mutation payloads. Their operation-specific schemas and replay handlers belong to the database/recovery layer, not the framing layer.
 
@@ -82,15 +82,16 @@ On open, the writer truncates only an incomplete final frame to the reader's las
 
 ## 7. Relationship to ANF, Chronicle and catalog files
 
-ANF segments and Chronicle records remain immutable data artifacts. The intended M6.2 write protocol is:
+ANF segments and Chronicle records remain immutable data artifacts. The implemented initial M6.2 ANF/Chronicle write protocol is:
 
-1. Append the transaction's BEGIN and complete mutation intent records.
-2. Make the required WAL durability boundary explicit according to the selected sync policy.
-3. Publish immutable ANF/Chronicle data and any receipt/catalog metadata using their existing publication protocols.
-4. Append COMMIT only after all operation-specific publication steps have succeeded.
-5. On startup, validate WAL frames and reconcile committed intent with published files; incomplete transactions must not be replayed as committed.
+1. Encode and validate the complete immutable ANF segment or Chronicle record.
+2. Stage the artifact under its canonical temporary name with create_new; flush and sync the file, then sync the table directory.
+3. Append WAL BEGIN and the AMUT v1 mutation intent.
+4. Append COMMIT using the OnCommit policy, making the intent durable before final-name publication.
+5. Publish the staged file with a no-replace hard link; verify its length, SHA-256 and embedded TableId/schema revision; sync the directory, remove the staging name, and sync the directory again.
+6. On startup, validate WAL frames, redo committed intents idempotently, discard only staging files owned by incomplete intents, append durable ABORT markers, and rebuild Chronicle indexes from published records.
 
-This ordering is a design target, not an implemented guarantee in M6.1. M6.2 must settle idempotent replay keys, file inventory verification, and interruption points before the Database write paths are wired to the WAL.
+This order is implemented for ANF insert and Chronicle ingest. It does not cover catalog DDL, compaction/Weave publication or general multi-operation transactions. Deterministic in-process interruption tests exercise every stage/WAL/publication boundary; subprocess-kill and physical power-loss testing remain outstanding.
 
 ## 8. Validation coverage
 
@@ -98,9 +99,8 @@ The WAL tests cover header creation and transaction/commit/checkpoint round trip
 
 ## 9. M6.1 non-goals
 
-- No database mutation is currently recorded to the WAL.
-- No startup replay or rollback is implemented.
-- No atomic commit relationship exists yet between WAL, ANF/Chronicle, catalog or Weave files.
-- No WAL rotation, checkpoint installation or retention policy.
+- Only immutable ANF insert and Chronicle ingest artifacts are covered by the initial WAL redo protocol.
+- Catalog DDL, compaction manifests, active-Weave swaps, Capsule and Navigation Map publication are not WAL-backed.
+- No WAL rotation, checkpoint installation or retention policy is implemented.
 - No concurrent writers; the existing database-wide exclusive writer lock remains unchanged.
-- No claim of ACID transactions or crash-recoverable database writes.
+- No general multi-operation ACID transaction guarantee is claimed.
