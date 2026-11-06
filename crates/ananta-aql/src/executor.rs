@@ -96,8 +96,81 @@ struct NativeAqlExecution {
 pub struct AqlExecutionMetrics {
     pub output_batches: u64,
     pub output_rows: u64,
-    /// Estimated owned output payload, not allocator RSS or total query memory.
+    pub output_cells: u64,
+    /// Measured value-body bytes returned to the caller. This excludes vector,
+    /// descriptor, allocator and storage-file overhead; it is not disk I/O bytes.
+    pub output_value_payload_bytes: u64,
+    /// Estimated owned result-batch footprint, not allocator RSS or total query memory.
     pub output_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AqlPhysicalPlan {
+    pub table: String,
+    pub native_execution: bool,
+    pub scan_columns: Vec<String>,
+    pub predicate_pushed: bool,
+    pub storage_limit_pushed: bool,
+    pub chronicle_accepted_rows: u64,
+    pub chronicle_accepted_encoded_bytes: u64,
+    pub estimated_rows_after_filter: u64,
+    pub estimated_output_rows: u64,
+    pub estimated_projected_encoded_bytes: u64,
+    pub notes: Vec<String>,
+}
+
+impl AqlPhysicalPlan {
+    pub fn explain(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!("ANANTA PHYSICAL PLAN — {}", self.table));
+        lines.push(format!(
+            "  Native vector execution: {}",
+            if self.native_execution { "enabled" } else { "fallback" }
+        ));
+        lines.push(format!(
+            "  Scan: {}",
+            if self.native_execution {
+                format!("projected columns [{}]", self.scan_columns.join(", "))
+            } else {
+                "all table columns (reference evaluator)".to_owned()
+            }
+        ));
+        if self.predicate_pushed {
+            lines.push("  Filter: native vector predicate".to_owned());
+        } else {
+            lines.push("  Filter: reference evaluator".to_owned());
+        }
+        lines.push("  Projection: output expressions".to_owned());
+        if self.storage_limit_pushed {
+            lines.push("  Limit: pushed into bounded storage scan".to_owned());
+        } else {
+            lines.push("  Limit: applied by execution operator/evaluator".to_owned());
+        }
+        lines.push(format!(
+            "  Chronicle table rows: {} (ingestion index)",
+            self.chronicle_accepted_rows
+        ));
+        lines.push(format!(
+            "  Chronicle encoded bytes: {} (ingestion index)",
+            self.chronicle_accepted_encoded_bytes
+        ));
+        lines.push(format!(
+            "  Estimated rows after filter: {}",
+            self.estimated_rows_after_filter
+        ));
+        lines.push(format!(
+            "  Estimated output rows: {}",
+            self.estimated_output_rows
+        ));
+        lines.push(format!(
+            "  Estimated projected encoded bytes: {}",
+            self.estimated_projected_encoded_bytes
+        ));
+        for note in &self.notes {
+            lines.push(format!("  Note: {note}"));
+        }
+        lines.join("\n")
+    }
 }
 
 pub struct AqlResultIter {
@@ -248,6 +321,134 @@ fn compile_predicate(
             Ok(Some(compiled))
         }
         None => Ok(None),
+    }
+}
+
+/// Compile and explain the physical path without consuming table rows.
+/// Cardinality and projected-byte figures are estimates; persisted Chronicle
+/// ingestion counters are reported separately as measured accounting values.
+pub fn explain(
+    database: &Database,
+    query: &Query,
+    bindings: &ParameterBindings,
+    optimizer_enabled: bool,
+) -> Result<AqlPhysicalPlan, AqlExecutionError> {
+    crate::validate_ast(query).map_err(from_parse_error)?;
+    bindings.validate_for(query).map_err(from_parse_error)?;
+    let Statement::Select(select) = &query.statement;
+    let table = resolve_table_name(database, &select.source)?;
+    let schema = database.schema(&table).map_err(from_storage_error)?.clone();
+    let projection = compile_projection(select, &schema, &table, bindings)?;
+    let predicate = compile_predicate(select, &schema, &table, bindings)?;
+    let native_predicate = match predicate.as_ref() {
+        Some(expression) => compiled_filter_predicate(expression, bindings),
+        None => None,
+    };
+    let direct_projection = projection.iter().all(|item| {
+        matches!(&item.expression.kind, CompiledExprKind::Column(_))
+    });
+    let mut required_columns = BTreeSet::new();
+    for item in &projection {
+        if let CompiledExprKind::Column(index) = &item.expression.kind {
+            required_columns.insert(*index);
+        }
+    }
+    if let Some(predicate) = &native_predicate {
+        collect_filter_columns(predicate, &mut required_columns);
+    }
+    let native_execution = optimizer_enabled
+        && direct_projection
+        && predicate.as_ref().map_or(true, |_| native_predicate.is_some())
+        && !required_columns.is_empty();
+    let scan_columns = if native_execution {
+        required_columns.iter().map(|index| schema.columns()[*index].name.clone()).collect::<Vec<_>>()
+    } else {
+        schema.columns().iter().map(|column| column.name.clone()).collect::<Vec<_>>()
+    };
+    let stats = database.ingestion_stats(&table).map_err(from_storage_error)?;
+    let table_rows = stats.accepted_rows;
+    let selectivity = predicate.as_ref()
+        .map(estimate_compiled_selectivity)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let estimated_rows_after_filter = (table_rows as f64 * selectivity)
+        .round()
+        .min(u64::MAX as f64) as u64;
+    let estimated_output_rows = select.limit
+        .map_or(estimated_rows_after_filter, |limit| estimated_rows_after_filter.min(limit));
+    let projected_fraction = if native_execution && !schema.columns().is_empty() {
+        scan_columns.len() as f64 / schema.columns().len() as f64
+    } else {
+        1.0
+    };
+    let estimated_projected_encoded_bytes =
+        (stats.accepted_encoded_bytes as f64 * projected_fraction)
+            .round()
+            .min(u64::MAX as f64) as u64;
+
+    let predicate_pushed = native_execution && predicate.is_some();
+    let storage_limit_pushed =
+        native_execution && predicate.is_none() && select.limit.is_some();
+    let mut notes = vec![
+        "row cardinality uses a fixed selectivity heuristic, not collected column histograms".to_owned(),
+        "projected bytes assume uniform encoded column widths; actual I/O can differ".to_owned(),
+        "Chronicle row/byte values are accepted-ingestion counters, not an execution profile".to_owned(),
+    ];
+    if !native_execution {
+        notes.push(
+            "query uses the reference evaluator because a projection or predicate is not yet lowerable".to_owned(),
+        );
+    }
+    Ok(AqlPhysicalPlan {
+        table,
+        native_execution,
+        scan_columns,
+        predicate_pushed,
+        storage_limit_pushed,
+        chronicle_accepted_rows: stats.accepted_rows,
+        chronicle_accepted_encoded_bytes: stats.accepted_encoded_bytes,
+        estimated_rows_after_filter,
+        estimated_output_rows,
+        estimated_projected_encoded_bytes,
+        notes,
+    })
+}
+
+fn estimate_compiled_selectivity(expression: &CompiledExpr) -> f64 {
+    match &expression.kind {
+        CompiledExprKind::Literal(Literal::Boolean(true)) => 1.0,
+        CompiledExprKind::Literal(Literal::Boolean(false)) => 0.0,
+        CompiledExprKind::IsNull { negated, .. } => if *negated { 0.9 } else { 0.1 },
+        CompiledExprKind::Unary {
+            operator: UnaryOperator::Not,
+            expression,
+        } => 1.0 - estimate_compiled_selectivity(expression),
+        CompiledExprKind::Binary {
+            left,
+            operator: BinaryOperator::And,
+            right,
+        } => estimate_compiled_selectivity(left) * estimate_compiled_selectivity(right),
+        CompiledExprKind::Binary {
+            left,
+            operator: BinaryOperator::Or,
+            right,
+        } => {
+            let left = estimate_compiled_selectivity(left);
+            let right = estimate_compiled_selectivity(right);
+            left + right - left * right
+        }
+        CompiledExprKind::Binary { operator: BinaryOperator::Equal, .. } => 0.1,
+        CompiledExprKind::Binary { operator: BinaryOperator::NotEqual, .. } => 0.9,
+        CompiledExprKind::Binary {
+            operator: BinaryOperator::Less
+                | BinaryOperator::LessEqual
+                | BinaryOperator::Greater
+                | BinaryOperator::GreaterEqual,
+            ..
+        } => 0.33,
+        CompiledExprKind::Column(_) => 0.5,
+        CompiledExprKind::Parameter(_) => 0.5,
+        _ => 0.5,
     }
 }
 
@@ -411,6 +612,12 @@ impl AqlResultIter {
         self.metrics.output_batches = self.metrics.output_batches.saturating_add(1);
         self.metrics.output_rows = self.metrics.output_rows
             .saturating_add(u64::try_from(batch.row_count).unwrap_or(u64::MAX));
+        let cells = batch.columns.iter()
+            .map(|column| u64::try_from(column.len()).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add);
+        self.metrics.output_cells = self.metrics.output_cells.saturating_add(cells);
+        self.metrics.output_value_payload_bytes = self.metrics.output_value_payload_bytes
+            .saturating_add(measured_value_payload_bytes(batch));
         self.metrics.output_bytes = self.metrics.output_bytes
             .saturating_add(estimate_result_batch_bytes(batch));
     }
@@ -1050,6 +1257,20 @@ fn remap_filter_columns(
     })
 }
 
+fn measured_value_payload_bytes(batch: &AqlResultBatch) -> u64 {
+    batch.columns.iter().flatten().fold(0_u64, |total, value| {
+        let value_bytes = match value {
+            Value::Null => 0,
+            Value::Boolean(_) => 1,
+            Value::Int32(_) => 4,
+            Value::Int64(_) | Value::TimestampMicros(_) | Value::Float64(_) => 8,
+            Value::Utf8(text) => u64::try_from(text.len()).unwrap_or(u64::MAX),
+            Value::Binary(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        };
+        total.saturating_add(value_bytes)
+    })
+}
+
 fn estimate_result_batch_bytes(batch: &AqlResultBatch) -> u64 {
     let mut total = std::mem::size_of::<AqlResultBatch>();
     total = total.saturating_add(
@@ -1202,6 +1423,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(optimized.metrics().output_rows, 2);
         assert!(optimized.metrics().output_bytes > 0);
+        assert_eq!(optimized.metrics().output_cells, 4);
+        assert_eq!(optimized.metrics().output_value_payload_bytes, 18);
 
         let mut reference = execute_with_options(&db, &query, &bindings, 1, None, false).unwrap();
         assert!(!reference.used_native_execution());
@@ -1227,7 +1450,7 @@ mod tests {
     fn computed_projection_falls_back_without_changing_semantics() {
         let (db, root, _) = fixture();
         let query = crate::parse(
-            "SELECT reading + 1.0 AS next_reading FROM telemetry WHERE reading >= 20"
+            "SELECT reading + 1.0 AS next_reading FROM telemetry WHERE reading >= 20.0"
         ).unwrap();
         let mut iterator = execute(&db, &query, &ParameterBindings::default(), 2, None).unwrap();
         assert!(!iterator.used_native_execution());
@@ -1245,6 +1468,38 @@ mod tests {
                 vec![Value::Float64(31.0)],
             ]
         );
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explain_reports_projection_filter_and_safe_limit_pushdown() {
+        let (db, root, _) = fixture();
+        let query = crate::parse(
+            "SELECT device FROM telemetry WHERE reading >= 25.0 LIMIT 2"
+        ).unwrap();
+        let plan = explain(&db, &query, &ParameterBindings::default(), true).unwrap();
+        assert!(plan.native_execution);
+        assert!(plan.predicate_pushed);
+        assert!(!plan.storage_limit_pushed);
+        assert_eq!(plan.scan_columns, vec!["device", "reading"]);
+        assert_eq!(plan.chronicle_accepted_rows, 4);
+        assert!(plan.estimated_rows_after_filter <= 4);
+        assert!(plan.estimated_output_rows <= 2);
+        assert!(plan.explain().contains("native vector predicate"));
+
+        let no_filter = crate::parse("SELECT device FROM telemetry LIMIT 2").unwrap();
+        let limit_plan = explain(
+            &db,
+            &no_filter,
+            &ParameterBindings::default(),
+            true,
+        ).unwrap();
+        assert!(limit_plan.native_execution);
+        assert!(limit_plan.storage_limit_pushed);
+
+        let reference = explain(&db, &query, &ParameterBindings::default(), false).unwrap();
+        assert!(!reference.native_execution);
         drop(db);
         fs::remove_dir_all(root).unwrap();
     }
