@@ -102,6 +102,7 @@ The WAL tests cover header creation and transaction/commit/checkpoint round trip
 - Only immutable ANF insert and Chronicle ingest artifacts are covered by the initial WAL redo protocol.
 - Catalog DDL, compaction manifests, active-Weave swaps, Capsule and Navigation Map publication are not WAL-backed.
 - ANCP checkpoint installation and Unix WAL rotation are implemented.
-- Checkpoint-manifest pruning/retention and Windows atomic replacement remain unsupported.
+- Superseded ANCP manifests are pruned only after the active checkpoint anchor is durable; the manifest referenced by the active WAL is retained.
+- Windows atomic replacement remains unsupported; checkpoint rotation is Unix-only.
 - No concurrent writers; the existing database-wide exclusive writer lock remains unchanged.
 - No general multi-operation ACID transaction guarantee is claimed.

@@ -765,8 +765,8 @@ impl Database {
     ///
     /// The checkpoint manifest is synced first and fingerprints the immutable
     /// storage/schema artifacts that form the database state at this boundary.
-    /// The replacement WAL contains a single sequence-1 CHECKPOINT frame that
-    /// references the manifest; subsequent transactions are replayed after it.
+    /// The replacement WAL begins with a CHECKPOINT frame at the previous
+    /// high-water sequence plus one; future transactions retain monotonic IDs.
     /// Full replay is retained for every transaction written after the marker.
     pub fn create_checkpoint(&mut self) -> Result<CheckpointReport, DbError> {
         #[cfg(not(unix))]
@@ -788,7 +788,7 @@ impl Database {
         if !current.is_clean() || !self.wal.incomplete_transaction_ids().is_empty() {
             return Err(DbError::Wal("checkpoint requires a clean WAL with no open transactions".into()));
         }
-        let (reference, report) = crate::wal_checkpoint::create_checkpoint(
+        let (reference, mut report) = crate::wal_checkpoint::create_checkpoint(
             &self.root,
             current.last_sequence,
             self.catalog.revision,
@@ -802,9 +802,21 @@ impl Database {
                 "checkpoint WAL replacement was uncertain: {error}",
             )));
         }
-        let rotated = read_wal(&wal_path)
-            .map_err(|error| DbError::Wal(error.to_string()))?;
-        validate_checkpoint_records(&self.root, &rotated, &self.catalog)?;
+        let rotated = match read_wal(&wal_path) {
+            Ok(report) => report,
+            Err(error) => {
+                self.recovery_required = true;
+                return Err(DbError::RecoveryRequired(format!(
+                    "checkpoint WAL was replaced but could not be re-read: {error}",
+                )));
+            }
+        };
+        if let Err(error) = validate_checkpoint_records(&self.root, &rotated, &self.catalog) {
+            self.recovery_required = true;
+            return Err(DbError::RecoveryRequired(format!(
+                "checkpoint WAL anchor failed validation after replacement: {error}",
+            )));
+        }
         if rotated.records.len() != 1
             || rotated.last_sequence != current.last_sequence.saturating_add(1)
             || !rotated.is_clean()
@@ -814,6 +826,13 @@ impl Database {
                 "rotated WAL did not reopen as a clean checkpoint anchor".into(),
             ));
         }
+        let current_manifest_path = report.manifest_path.clone();
+        report.pruned_manifest_count = crate::wal_checkpoint::prune_superseded_checkpoint_manifests(
+            &self.root,
+            &current_manifest_path,
+        ).map_err(|error| DbError::Wal(format!(
+            "checkpoint is durable but superseded-manifest pruning failed: {error}",
+        )))?;
         Ok(report)
     }
 
@@ -3528,6 +3547,77 @@ mod tests {
         let db = Database::open(&restored).unwrap();
         assert_eq!(db.scan("telemetry").unwrap(), rows);
         drop(db);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(backup).unwrap();
+        fs::remove_dir_all(restored).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_chronicle_capsule_map_backup_restores_all_rows_and_indexes() {
+        let root = temp_path();
+        let backup = temp_path();
+        let restored = temp_path();
+        let mut expected_rows = Vec::new();
+        let mut db = Database::open(&root).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+
+        for sequence in 1_u8..=32 {
+            let mut batch = Vec::new();
+            for row_index in 0_u16..64 {
+                let value = vec![
+                    Value::TimestampMicros(i64::from(sequence) * 10_000 + i64::from(row_index)),
+                    Value::Utf8(format!("device-{}-{row_index}", sequence % 8)),
+                    Value::Float64(f64::from(sequence) + f64::from(row_index) / 100.0),
+                ];
+                expected_rows.push(value.clone());
+                batch.push(value);
+            }
+            db.ingest_batch(
+                "telemetry",
+                BatchId::from_bytes([sequence; 16]).unwrap(),
+                &batch,
+            ).unwrap();
+        }
+
+        for group in 0_u64..8 {
+            let first = group * 4 + 1;
+            let last = first + 3;
+            db.build_capsule(
+                "telemetry",
+                group + 1,
+                1,
+                first,
+                last,
+                Some("timestamp"),
+            ).unwrap();
+        }
+        db.build_navigation_map("telemetry", 1).unwrap();
+
+        let consistency = db.check_consistency(37).unwrap();
+        assert_eq!(consistency.rows_checked, 2_048);
+        assert_eq!(consistency.chronicle_records_checked, 32);
+        assert_eq!(consistency.capsules_checked, 8);
+        assert_eq!(consistency.navigation_maps_checked, 1);
+
+        let checkpoint = db.create_checkpoint().unwrap();
+        assert!(checkpoint.manifest_path.is_file());
+        let backup_report = db.backup_to(&backup).unwrap();
+        assert!(backup_report.file_count > 40);
+        assert!(backup_report.total_bytes > 0);
+        drop(db);
+
+        let restore_report = Database::restore_backup(&backup, &restored).unwrap();
+        assert_eq!(restore_report.file_count, backup_report.file_count);
+        let restored_db = Database::open(&restored).unwrap();
+        assert_eq!(restored_db.scan("telemetry").unwrap(), expected_rows);
+        let restored_consistency = restored_db.check_consistency(53).unwrap();
+        assert_eq!(restored_consistency.rows_checked, 2_048);
+        assert_eq!(restored_consistency.chronicle_records_checked, 32);
+        assert_eq!(restored_consistency.capsules_checked, 8);
+        assert_eq!(restored_consistency.navigation_maps_checked, 1);
+        drop(restored_db);
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(backup).unwrap();
@@ -6377,6 +6467,8 @@ mod tests {
             "AfterBackupFileSynced" => AfterBackupFileSynced,
             "AfterBackupManifestSynced" => AfterBackupManifestSynced,
             "AfterBackupDirectoryRenamedBeforeSync" => AfterBackupDirectoryRenamedBeforeSync,
+            "AfterCheckpointArchiveRemoved" => AfterCheckpointArchiveRemoved,
+            "AfterCheckpointRetentionDirectorySynced" => AfterCheckpointRetentionDirectorySynced,
             _ => panic!("unsupported subprocess crash point: {point_name}"),
         };
         let path = PathBuf::from(std::env::var_os("ANANTA_WAL_CRASH_DATABASE").unwrap());
@@ -6766,6 +6858,55 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn exercise_checkpoint_prune_process_crash(point: &str) {
+        use std::process::Command;
+
+        let root = temp_path();
+        let mut setup = Database::open(&root).unwrap();
+        setup.create_table("telemetry", sample_schema()).unwrap();
+        setup.insert_batch(
+            "telemetry",
+            &[vec![
+                Value::TimestampMicros(15),
+                Value::Utf8("retention-crash".into()),
+                Value::Float64(1.5),
+            ]],
+        ).unwrap();
+        let first = setup.create_checkpoint().unwrap();
+        drop(setup);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::wal_recovery_process_crash_worker")
+            .arg("--nocapture")
+            .env("ANANTA_WAL_CRASH_OPERATION", "checkpoint")
+            .env("ANANTA_WAL_CRASH_POINT", point)
+            .env("ANANTA_WAL_CRASH_DATABASE", &root)
+            .env("ANANTA_WAL_CRASH_EXIT", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86), "checkpoint pruning worker did not stop at {point}");
+        fs::remove_file(root.join(".ananta.lock")).unwrap();
+
+        assert!(!first.manifest_path.exists());
+        let recovered = Database::open(&root).unwrap();
+        recovered.check_consistency(1).unwrap();
+        assert_eq!(
+            fs::read_dir(root.join("wal").join("checkpoints")).unwrap().count(),
+            1,
+        );
+        drop(recovered);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_archive_pruning_survives_process_crashes() {
+        exercise_checkpoint_prune_process_crash("AfterCheckpointArchiveRemoved");
+        exercise_checkpoint_prune_process_crash("AfterCheckpointRetentionDirectorySynced");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn checkpoint_wal_replacement_survives_subprocess_crashes() {
         exercise_checkpoint_process_crash("AfterCheckpointManifestTempSynced", false);
@@ -6775,6 +6916,7 @@ mod tests {
         exercise_checkpoint_process_crash("AfterCheckpointDirectorySync", true);
     }
 
+    #[cfg(unix)]
     #[test]
     fn database_checkpoint_rotates_wal_and_replays_subsequent_commits() {
         let path = temp_path();
@@ -6814,6 +6956,14 @@ mod tests {
         ).unwrap();
         drop(db);
 
+        let mut reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap(), vec![first_rows[0].clone(), second_rows[0].clone()]);
+        let second_checkpoint = reopened.create_checkpoint().unwrap();
+        assert_eq!(second_checkpoint.pruned_manifest_count, 1);
+        assert!(!checkpoint.manifest_path.exists());
+        assert!(second_checkpoint.manifest_path.is_file());
+        drop(reopened);
+
         let reopened = Database::open(&path).unwrap();
         assert_eq!(reopened.scan("telemetry").unwrap(), vec![first_rows[0].clone(), second_rows[0].clone()]);
         let consistency = reopened.check_consistency(1).unwrap();
@@ -6822,6 +6972,7 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_replays_catalog_changes_and_revalidates_mutable_state() {
         let path = temp_path();
@@ -6841,6 +6992,7 @@ mod tests {
         fs::remove_dir_all(path).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_manifest_mismatch_fails_database_open_closed() {
         let path = temp_path();

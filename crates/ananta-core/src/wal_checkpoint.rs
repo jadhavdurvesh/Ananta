@@ -27,6 +27,8 @@ pub struct CheckpointReport {
     pub total_bytes: u64,
     pub manifest_path: PathBuf,
     pub manifest_sha256: [u8; 32],
+    /// Number of superseded manifests removed after the new WAL anchor was validated.
+    pub pruned_manifest_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,13 +140,71 @@ pub(crate) fn create_checkpoint(
         total_bytes,
         manifest_path: path,
         manifest_sha256: reference.manifest_sha256,
+        pruned_manifest_count: 0,
     };
     Ok((reference, report))
 }
 
-/// Validate the manifest selected by the checkpoint marker and every immutable
-/// file that existed when the snapshot was installed. Later mutable catalog and
-/// active-pointer replacement paths are intentionally excluded from the manifest.
+/// Remove superseded canonical checkpoint manifests only after the
+/// replacement WAL has been synced and validated. The manifest referenced by
+/// the active WAL is always retained.
+pub(crate) fn prune_superseded_checkpoint_manifests(
+    root: &Path,
+    current_manifest: &Path,
+) -> io::Result<u64> {
+    let directory = root.join("wal").join("checkpoints");
+    let current_name = current_manifest.file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("current checkpoint filename is not UTF-8"))?;
+    let mut removed = 0_u64;
+    let mut entries = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        let Some(text) = name.to_str() else { continue; };
+        if text == current_name {
+            continue;
+        }
+        if text.starts_with("checkpoint-") && text.ends_with(".anck")
+            && !is_canonical_checkpoint_name(text)
+        {
+            return Err(invalid("checkpoint archive filename is not canonical"));
+        }
+        if !is_canonical_checkpoint_name(text) {
+            continue;
+        }
+        let metadata = entry.file_type()?;
+        if !metadata.is_file() {
+            return Err(invalid("checkpoint archive path is not a regular file"));
+        }
+        fs::remove_file(entry.path())?;
+        removed = removed.checked_add(1).ok_or_else(|| invalid("checkpoint prune count overflow"))?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointArchiveRemoved,
+        );
+    }
+    if removed > 0 {
+        sync_directory(&directory)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointRetentionDirectorySynced,
+        );
+    }
+    Ok(removed)
+}
+
+fn is_canonical_checkpoint_name(name: &str) -> bool {
+    let Some(value) = name.strip_prefix("checkpoint-").and_then(|value| value.strip_suffix(".anck")) else {
+        return false;
+    };
+    value.len() == 20
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok_and(|sequence| format!("{sequence:020}") == value)
+}
+
+/// Validate the manifest selected by the checkpoint marker and every
+/// immutable file recorded when the checkpoint was installed. Canonical catalog
+/// and active-pointer changes are exempted only when a committed post-checkpoint
+/// WAL intent owns that path.
 pub(crate) fn validate_checkpoint(
     root: &Path,
     payload: &[u8],
@@ -191,6 +251,7 @@ pub(crate) fn validate_checkpoint(
         total_bytes,
         manifest_path: path,
         manifest_sha256: reference.manifest_sha256,
+        pruned_manifest_count: 0,
     })
 }
 
@@ -411,6 +472,31 @@ mod tests {
         assert_eq!(CheckpointReference::decode(&reference.encode()).unwrap(), reference);
         assert!(CheckpointReference::decode(b"invalid").is_err());
         assert_eq!(reference.manifest_filename(), "checkpoint-00000000000000000044.anck");
+    }
+
+    #[test]
+    fn checkpoint_retention_keeps_only_the_active_wal_manifest() {
+        let root = temp_path();
+        fs::create_dir_all(root.join("data/table")).unwrap();
+        fs::create_dir_all(root.join("catalog")).unwrap();
+        fs::create_dir_all(root.join("wal")).unwrap();
+        fs::write(root.join("catalog/catalog.anc"), b"catalog").unwrap();
+        fs::write(root.join("data/table/one.anf"), b"one").unwrap();
+
+        let (first, _) = create_checkpoint(&root, 10, 1).unwrap();
+        fs::write(root.join("data/table/two.chr"), b"two").unwrap();
+        let (second, _) = create_checkpoint(&root, 20, 1).unwrap();
+        assert!(first.manifest_filename() != second.manifest_filename());
+
+        let removed = prune_superseded_checkpoint_manifests(&root, &second.manifest_path).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!first.manifest_path.exists());
+        assert!(second.manifest_path.is_file());
+        assert_eq!(
+            fs::read_dir(root.join("wal").join("checkpoints")).unwrap().count(),
+            1,
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

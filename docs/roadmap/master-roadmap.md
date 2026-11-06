@@ -715,7 +715,8 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Atomically rotate ANWL on Unix to a checkpoint anchor at previous high-water sequence + 1 after manifest publication; preserve monotonic IDs and redo for all later WAL transactions.
 - [x] Add subprocess crash/reopen coverage at checkpoint-manifest temp sync/publication and WAL temp sync/rename/directory-sync boundaries.
 - [x] Extend Capsule/Navigation Map subprocess crash coverage to all 12 staging, WAL, final-publication and cleanup checkpoints for both artifact types.
-- [ ] Define checkpoint-manifest archive retention/pruning and Windows atomic-replacement support; do not use delete-then-rename.
+- [x] Retain only the checkpoint manifest referenced by the durable active WAL; prune superseded manifests only after validating the new anchor.
+- [ ] Implement Windows atomic WAL replacement; do not use delete-then-rename.
 
 **Guarantee boundary:** ANF insert, Chronicle ingest, table creation, nullable-column addition, column rename, column reorder, active Weave promotion/rollback/fallback pointers, immutable compaction candidate-directory/OWM publication, Capsule publication and Navigation Map publication use WAL-backed redo. Capsule intent uses the AMUT v1 revision field for its independent generation; the embedded Capsule header retains and validates the logical schema revision. Navigation Map redo verifies all referenced immutable Capsule files before accepting the map. General multi-operation application transactions remain outside this boundary; do not claim general ACID semantics.
 
@@ -744,6 +745,7 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 - [x] Test backup/restore into a new directory and backup-manifest corruption rejection (tests added; execution validation outstanding).
 - [x] Document corruption repair boundaries and fail-closed recovery guidance.
 - [x] Add backup subprocess interruption tests after copied-file sync, manifest sync and final directory rename; verify incomplete backup absence or complete backup restore.
+- [x] Add a representative multi-artifact backup/restore workload with 2,048 rows, 32 Chronicle records, eight Capsules and one Navigation Map.
 - [ ] Add large-database and cross-platform backup/directory-durability tests.
 
 ## M6 exit gate
@@ -753,7 +755,7 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 - [ ] Locking rules are enforced.
 - [ ] Backup/restore integrity tests pass.
 
-**Deliverable:** Reliable single-node engine milestone. No cluster claims. M6 implementation slices are present, but the exit gate remains open until the Rust test suite and remaining crash/platform validation are run; ANWL checkpoint installation and Unix rotation are implemented; checkpoint archive pruning and Windows atomic replacement remain deferred.
+**Deliverable:** Reliable single-node engine milestone. No cluster claims. M6 implementation slices are present, but the exit gate remains open until the Rust test suite and remaining crash/platform validation are run; ANWL checkpoint installation, Unix rotation and superseded-manifest pruning are implemented; Windows atomic replacement remains deferred.
 
 ---
 
@@ -972,7 +974,7 @@ A task is done only when all applicable items are true:
 
 1. Run the complete Rust workspace test, formatting and lint suites on a Rust 1.75+ toolchain; resolve every regression before closing M6.
 2. Run the expanded Capsule/Navigation Map, checkpoint and backup subprocess crash suites on a Rust 1.75+ environment.
-3. Add checkpoint archive pruning only after a documented retention policy and restore/rollback tests; implement Windows atomic replacement before enabling rotation there.
+3. Implement Windows atomic replacement before enabling checkpoint rotation there; keep the active checkpoint manifest and never use delete-then-rename.
 4. Run large-database backup/restore and Unix/Windows lock and directory-durability validation.
 5. Close the M6 exit gate only when recovery, transaction-scope, locking and backup/restore tests have actually passed. Then begin M7 native server and developer interfaces.
 
