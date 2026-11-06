@@ -5,7 +5,7 @@ use crate::{
 };
 use crate::{
     ExecutionContext, ExecutionError, ExecutionPipeline, FilterOperator, LimitOperator,
-    PhysicalOperator, ProjectionOperator, ResourceLimits, ScanOperator,
+    PhysicalOperator, ProjectionOperator, ResourceLimits, ScanOperator, CapsuleScanOperator,
 };
 use ananta_core::Database;
 use ananta_types::{Column, DataType, Schema, Value};
@@ -20,6 +20,19 @@ pub fn execute_vectorized(
     batch_rows:usize,
     limits:ResourceLimits,
     cancellation:Arc<AtomicBool>,
+)->Result<ExecutionPipeline,AqlExecutionError>{
+    execute_vectorized_with_options(database,query,bindings,batch_rows,limits,cancellation,
+        crate::PlannerOptions::default())
+}
+
+pub fn execute_vectorized_with_options(
+    database:&Database,
+    query:&Query,
+    bindings:&ParameterBindings,
+    batch_rows:usize,
+    limits:ResourceLimits,
+    cancellation:Arc<AtomicBool>,
+    options:crate::PlannerOptions,
 )->Result<ExecutionPipeline,AqlExecutionError>{
     crate::validate_ast(query).map_err(parse_error)?;
     bindings.validate_for(query).map_err(parse_error)?;
@@ -44,16 +57,47 @@ pub fn execute_vectorized(
     if let Some(predicate)=&select.selection{
         collect_required(predicate,&schema,&table,&mut required)?;
     }
-    // A literal-only predicate/projection still needs one physical column to preserve row counts.
     if required.is_empty(){required.insert(0);}
     let required_indices=required.into_iter().collect::<Vec<_>>();
     let required_names=required_indices.iter().map(|index|schema.columns()[*index].name.as_str()).collect::<Vec<_>>();
-    let mut column_map=vec![None;schema.len()];
-    for (slot,index) in required_indices.iter().enumerate(){column_map[*index]=Some(slot);}
+    let all_names=schema.columns().iter().map(|column|column.name.as_str()).collect::<Vec<_>>();
 
-    let scan=ScanOperator::new(database,&table,&required_names,batch_rows)
-        .map_err(vector_error)?;
-    let mut root:Box<dyn PhysicalOperator>=Box::new(scan);
+    let range=select.selection.as_ref().and_then(|predicate|
+        crate::extract_timestamp_range(predicate,&schema,&table,bindings).ok().flatten());
+    let capsule_scan=if options.enable_predicate_pushdown {
+        if let (Some(generation),Some(range))=(options.navigation_map_generation,range.clone()) {
+            let stats=database.ingestion_stats(&table).map_err(storage_error)?;
+            if stats.accepted_rows<=options.max_capsule_materialized_rows
+                && database.capsules_cover_chronicle(&table).unwrap_or(false) {
+                let names=if options.enable_projection_pushdown{&required_names}else{&all_names};
+                CapsuleScanOperator::new(
+                    database,&table,names,range,generation,batch_rows,
+                    options.max_capsule_materialized_rows,options.max_capsule_materialized_bytes,
+                ).ok().map(|operator|Box::new(operator) as Box<dyn PhysicalOperator>)
+            }else{None}
+        }else{None}
+    }else{None};
+
+    let scan_columns=if options.enable_projection_pushdown{&required_names}else{&all_names};
+    let mut root:Box<dyn PhysicalOperator>=if let Some(capsule)=capsule_scan{
+        Box::new(capsule)
+    }else{
+        Box::new(ScanOperator::new(database,&table,scan_columns,batch_rows).map_err(vector_error)?)
+    };
+    let mut column_map=vec![None;schema.len()];
+    if options.enable_projection_pushdown{
+        for (slot,index) in required_indices.iter().enumerate(){column_map[*index]=Some(slot);}
+    }else{
+        for index in 0..schema.len(){column_map[index]=Some(index);}
+    }
+
+    if !options.enable_predicate_pushdown {
+        if !options.enable_projection_pushdown {
+            root=Box::new(ProjectionOperator::new(root,required_indices.clone()).map_err(vector_error)?);
+        }
+        // The filter is intentionally above the required-column projection in the
+        // optimiser-disabled reference path.
+    }
     if let Some(predicate)=&select.selection{
         let expression=compile_vector_expr(predicate,&schema,&table,&column_map,bindings)?;
         if infer_type(predicate,&schema,&table,bindings)?.is_some_and(|kind|kind!=DataType::Boolean){
@@ -100,6 +144,19 @@ pub fn execute_vectorized_source(
 )->Result<ExecutionPipeline,AqlExecutionError>{
     let query=crate::parse(source).map_err(parse_error)?;
     execute_vectorized(database,&query,bindings,batch_rows,limits,cancellation)
+}
+
+pub fn execute_vectorized_source_with_options(
+    database:&Database,
+    source:&str,
+    bindings:&ParameterBindings,
+    batch_rows:usize,
+    limits:ResourceLimits,
+    cancellation:Arc<AtomicBool>,
+    options:crate::PlannerOptions,
+)->Result<ExecutionPipeline,AqlExecutionError>{
+    let query=crate::parse(source).map_err(parse_error)?;
+    execute_vectorized_with_options(database,&query,bindings,batch_rows,limits,cancellation,options)
 }
 
 fn resolve_table(database:&Database,identifier:&Identifier)->Result<String,AqlExecutionError>{
