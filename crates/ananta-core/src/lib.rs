@@ -720,6 +720,9 @@ impl Database {
                     if !file_metadata.file_type().is_file() {
                         return Err(DbError::NavigationMapCorrupt("Navigation Map is not a regular file"));
                     }
+                    if file_metadata.len() > 256 * 1024 * 1024 {
+                        return Err(DbError::NavigationMapCorrupt("Navigation Map exceeds the consistency-check size limit"));
+                    }
                     let map_bytes = fs::read(&path)?;
                     let map = NavigationMap::decode(&map_bytes, definition.id.0, generation)?;
                     for map_entry in &map.entries {
