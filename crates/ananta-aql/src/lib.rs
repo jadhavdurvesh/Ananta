@@ -8,7 +8,7 @@ pub use parser::{parse, BinaryOperator, ColumnReference, Expr, ExprKind, Identif
     ParameterRef, Projection, Query, SelectItem, SelectStatement, Statement, UnaryOperator};
 
 pub use executor::{
-    execute, execute_source, AqlErrorCode, AqlExecutionError, AqlRecordBatch, AqlResultIter,
+    execute, execute_source, AqlErrorCode, AqlExecutionError, AqlResultBatch, AqlResultIter,
 };
 
 pub const AQL_VERSION: &str = "0.1";
