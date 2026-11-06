@@ -234,7 +234,82 @@ impl Database {
         read_pointer(&self.root.join("data").join(table).join("weaves"), definition.id.0)
     }
 
-    pub(super) fn recover_active_weaves(&self) -> Result<(), DbError> {
+    pub(crate) fn install_recovered_pointer(
+        root: &Path,
+        pointer: &ActiveWeavePointer,
+    ) -> Result<(), DbError> {
+        require_directory(root)?;
+        match read_pointer(root, pointer.table_id) {
+            Ok(Some(current)) if current.revision > pointer.revision => Ok(()),
+            Ok(Some(current)) if current.revision == pointer.revision => {
+                if current == *pointer {
+                    Ok(())
+                } else {
+                    Err(DbError::CompactionExecution(
+                        "active pointer revision conflicts with committed WAL snapshot".into(),
+                    ))
+                }
+            }
+            Ok(Some(current)) => {
+                if current.revision.checked_add(1) != Some(pointer.revision) {
+                    return Err(DbError::CompactionExecution(
+                        "active pointer WAL revisions are not contiguous".into(),
+                    ));
+                }
+                publish_pointer(root, pointer)
+            }
+            Ok(None) => {
+                if pointer.revision != 1 {
+                    return Err(DbError::CompactionExecution(
+                        "active pointer WAL history does not begin at revision one".into(),
+                    ));
+                }
+                publish_pointer(root, pointer)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn cleanup_orphan_active_pointer_staging(
+        root: &Path,
+        catalog: &std::collections::BTreeMap<String, TableDefinition>,
+    ) -> Result<(), DbError> {
+        for table in catalog.keys() {
+            let weave_root = root.join("data").join(table).join("weaves");
+            let entries = match fs::read_dir(&weave_root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(DbError::Io(error)),
+            };
+            let mut changed = false;
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let canonical = |prefix: &str, suffix: &str| -> bool {
+                    let Some(number) = name.strip_prefix(prefix).and_then(|value| value.strip_suffix(suffix)) else {
+                        return false;
+                    };
+                    number.len() == 20
+                        && number.bytes().all(|byte| byte.is_ascii_digit())
+                        && number.parse::<u64>().is_ok_and(|id| id != 0 && format!("{id:020}") == number)
+                };
+                if canonical(".pointer-", ".tmp") || canonical(".active-", ".tmp") {
+                    fs::remove_file(entry.path())?;
+                    changed = true;
+                }
+            }
+            if changed {
+                sync_directory(&weave_root)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recover_active_weaves(&mut self) -> Result<(), DbError> {
         for (table, definition) in &self.catalog.tables {
             let root = self.root.join("data").join(table).join("weaves");
             let Some(pointer) = read_pointer(&root, definition.id.0)? else { continue; };
@@ -249,7 +324,7 @@ impl Database {
                 active: previous,
                 previous: None,
             };
-            publish_pointer(&root, &fallback)?;
+            self.publish_active_pointer_wal(&root, &fallback, b"recover_active_weave_fallback")?;
         }
         Ok(())
     }
