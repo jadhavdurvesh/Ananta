@@ -45,7 +45,7 @@ Estimated filtered rows are rounded from analyzed scanned rows times selectivity
 
 AqlExecutionMetrics records measured output batches, output rows and output cells for values returned to the caller. output_value_payload_bytes counts the actual value-body bytes returned (fixed-width scalar bodies and UTF8/BINARY payload bytes); it excludes null markers, vector/column descriptors, allocator overhead and storage-file encoding overhead. output_bytes is a separate estimate of the owned result-batch footprint, not allocator RSS or physical disk I/O.
 
-These counters describe returned output, not rows scanned or bytes read from disk. Scan input bytes are decoded value-body bytes, not bytes physically read from ANF/Chronicle files. Runtime physical file I/O counters and operator-by-operator timings remain future profiling work.
+These counters describe returned output, not rows scanned or bytes read from disk. Scan input bytes are decoded value-body bytes, not bytes physically read from ANF/Chronicle files. Runtime physical file I/O counters and operator-by-operator timings remain future profiling work. A fixture-level plan/profile comparison checks estimated output rows against actual output rows and separately asserts decoded scan input and returned value-body bytes.
 
 ## 5. Encoded-byte and payload estimate
 

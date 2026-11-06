@@ -1,6 +1,6 @@
 use crate::{estimate_batch_bytes, ExecutionError};
 use ananta_core::Database;
-use ananta_types::{Column, DataType, Value};
+use ananta_types::{Column, Value};
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -242,7 +242,7 @@ pub fn analyze_table(
 mod tests {
     use super::*;
     use ananta_core::Database;
-    use ananta_types::Schema;
+    use ananta_types::{DataType, Schema};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

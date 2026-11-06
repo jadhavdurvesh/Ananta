@@ -630,7 +630,7 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 - [x] Add optimizer-disabled reference execution and compare simple optimized query results.
 - [x] Test aliases/repeated projections, NULL predicates, computed-expression fallback and safe LIMIT decisions.
 - [x] Record measured decoded scan input batches, rows and value bytes alongside returned output metrics.
-- [ ] Compare planned estimates against runtime input/bytes for representative workloads.
+- [x] Compare analyzed row estimates with measured output rows and decoded scan input bytes on representative fixtures.
 - [x] Record runtime output batches, rows, cells and measured value-body bytes; keep owned-batch footprint estimate separate.
 
 Specification: docs/specifications/physical-planning-v0.1.md.

@@ -1718,6 +1718,17 @@ mod tests {
         assert!(analyzed_plan.estimated_projected_payload_bytes.unwrap() > 0);
         assert!(analyzed_plan.explain().contains("native vector predicate"));
 
+        let mut profiled = execute(&db, &query, &ParameterBindings::default(), 2, None).unwrap();
+        let _profiled_rows = profiled.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            analyzed_plan.estimated_output_rows,
+            Some(profiled.metrics().output_rows)
+        );
+        assert_eq!(profiled.metrics().scan_input_rows, 4);
+        assert_eq!(profiled.metrics().output_rows, 2);
+        assert_eq!(profiled.metrics().scan_input_value_payload_bytes, 28);
+        assert_eq!(profiled.metrics().output_value_payload_bytes, 18);
+
         let no_filter = crate::parse("SELECT device FROM telemetry LIMIT 2").unwrap();
         let limit_plan = explain(
             &db,
