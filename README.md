@@ -8,7 +8,7 @@ ANANTA is not a SQL wrapper, PostgreSQL extension or ClickHouse backend. Its nat
 
 - **ANANTA Engine:** native database runtime, lifecycle, catalog and resource management.
 - **ANANTA Storage:** ANF native files and the proposed ChronoWeave research architecture.
-- **AQL:** working name for a native query language with its own grammar and execution semantics. SQL is not the required interface.
+- **AQL:** native query language with its own grammar and execution semantics. AQL v0.1 lexer, parser and AST are under implementation; SQL is not the required interface.
 - **ANANTA Analytics:** native vectorised operators, aggregations and time-series processing.
 - **ANANTA Studio:** planned first-party dashboard for database exploration, AQL workbench, storage inspection, visual explain, analytics, ingestion monitoring and administration.
 - **Developer platform:** Rust API, CLI, future server protocol, SDKs and workload integrations.
@@ -24,13 +24,22 @@ The initial Rust implementation currently includes:
 - Exclusive local writer locking, no-overwrite segment publication, directory syncing on Unix, and startup cleanup of orphan temporary segment files.
 - Immutable Chronicle ingestion records with durable BatchId receipts, commit-order sequences and duplicate retry resolution.
 - Derived immutable Capsule v0.1 files with temporal bounds, per-column statistics, integrity checks and an independent validator.
+- A standalone AQL v0.1 Rust crate with a source-spanned lexer/parser, SELECT AST, literals, casts, boolean/comparison expressions and typed parameter-binding validation.
 - A basic telemetry example and unit/integration tests.
 
-This is an experimental first vertical slice, not a complete or production-ready DBMS. The legacy `scan` APIs still materialise their complete result; the additive batch APIs bound decoded output per batch but do not yet provide predicates or physical column-range I/O. Only one local database handle/process may own a database at a time. A crash can leave a stale `.ananta.lock` file; after verifying no writer remains, an operator must remove it before reopening. Non-Unix targets do not have portable directory-entry flushing in this implementation. AQL, query planning, analytics operators, compression, indexes, compaction, WAL, transactions, MVCC and a complete crash-recovery protocol remain unimplemented.
+This is an experimental first vertical slice, not a complete or production-ready DBMS. The legacy `scan` APIs still materialise their complete result; the additive batch APIs bound decoded output per batch but do not yet provide predicates or physical column-range I/O. Only one local database handle/process may own a database at a time. A crash can leave a stale `.ananta.lock` file; after verifying no writer remains, an operator must remove it before reopening. Non-Unix targets do not have portable directory-entry flushing in this implementation. AQL parsing is an early v0.1 foundation; catalog semantic validation and native query execution remain unimplemented. Query planning, analytics operators, compression, indexes, WAL, transactions, MVCC and a complete crash-recovery protocol also remain unimplemented.
+
+
+
+## AQL v0.1 status
+
+AQL is being implemented as a native Rust language crate, not as SQL passed through to another database. The current M4 foundation includes a lexer, source-spanned SELECT AST/parser, typed literal tokens, quoted identifiers and safe named/positional binding validation. Query execution and catalog semantic validation are the next M4.3 work.
+
+- [AQL v0.1 grammar and semantics](docs/specifications/aql-v0.1.md)
 
 ## Master execution roadmap
 
-The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M3.1 — compaction foundation.** M1 and M2 are complete. M2 delivered the Chronicle ingestion contract and prototype, immutable Capsule v0.1 files, a correctness-first Navigation Map, and reproducible M2 benchmarks. M3 begins with fingerprinted compaction manifests, row provenance, bounded job execution and safely discardable attempts.
+The [ANANTA Master Roadmap](docs/roadmap/master-roadmap.md) is the single source of truth for task order, small implementation steps, milestone exit gates and deferred ideas. **Current focus: M4.2 — AQL parser and representation.** M1, M2 and M3 are complete. M3 delivered bounded ChronoWeave candidate execution, three layout strategies, provenance verification, active-generation promotion/rollback, crash recovery and reproducible benchmark evidence.
 
 ## Native design documents
 

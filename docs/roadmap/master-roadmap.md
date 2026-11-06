@@ -516,26 +516,28 @@ Decision: docs/decisions/0010-compaction-input-snapshots-and-candidate-outputs.m
 Do not start the full AQL parser before M1 storage and batch read interfaces are stable.
 
 ## M4.1 Language design
-- [ ] Define AQL's goals and non-goals.
-- [ ] Define identifiers and quoting.
-- [ ] Define literals.
-- [ ] Define data types and casts.
-- [ ] Define null semantics.
-- [ ] Define comparison semantics.
-- [ ] Define boolean logic.
-- [ ] Define error locations and diagnostics.
-- [ ] Define parameter binding.
-- [ ] Define language versioning.
-- [ ] Write grammar document.
-- [ ] Add grammar examples and invalid examples.
+- [x] Define AQL's goals and non-goals.
+- [x] Define identifiers and quoting.
+- [x] Define literals.
+- [x] Define data types and casts.
+- [x] Define null semantics.
+- [x] Define comparison semantics.
+- [x] Define boolean logic.
+- [x] Define error locations and diagnostics.
+- [x] Define parameter binding.
+- [x] Define language versioning.
+- [x] Write grammar document.
+- [x] Add grammar examples and invalid examples.
+
+Specification: docs/specifications/aql-v0.1.md
 
 ## M4.2 Parser and representation
-- [ ] Implement tokenizer/lexer.
-- [ ] Test string and numeric literals.
-- [ ] Test escaped identifiers.
-- [ ] Test malformed input diagnostics.
-- [ ] Implement parser.
-- [ ] Define AST nodes.
+- [x] Implement tokenizer/lexer.
+- [x] Test string and numeric literals.
+- [x] Test escaped identifiers.
+- [x] Test malformed input diagnostics.
+- [x] Implement parser.
+- [x] Define AST nodes.
 - [ ] Implement AST validation.
 - [ ] Define logical-plan representation.
 - [ ] Add parser golden tests.
