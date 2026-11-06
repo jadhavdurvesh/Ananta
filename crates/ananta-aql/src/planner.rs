@@ -232,7 +232,10 @@ pub fn extract_timestamp_range(
             if !matches{return Err("timestamp range qualifier does not match source table".into());}
         }
         let name=column.parts.last().ok_or_else(||"invalid timestamp column".to_owned())?.value.clone();
-        let index=schema.columns().iter().position(|field|field.name==name||field.name.eq_ignore_ascii_case(&name));
+        let identifier=column.parts.last().expect("validated timestamp column reference");
+        let index=schema.columns().iter().position(|field|{
+            if identifier.quoted{field.name==identifier.value}else{field.name.eq_ignore_ascii_case(&identifier.value)}
+        });
         let Some(index)=index else{continue;};
         if schema.columns()[index].data_type!=DataType::TimestampMicros{continue;}
         let current=selected.get_or_insert((name.clone(),None,true,None,false));
