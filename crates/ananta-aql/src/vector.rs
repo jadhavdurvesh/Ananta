@@ -647,7 +647,7 @@ mod tests{
         let scan=ScanOperator::new(&db,"t",&["id","v","enabled"],2).unwrap();
         let filter=FilterOperator::new(Box::new(scan),VectorExpr::And(
             Box::new(VectorExpr::IsNotNull(Box::new(VectorExpr::Column(1)))),
-            Box::new(VectorExpr::Eq(Box::new(VectorExpr::Column(2)),Box::new(VectorExpr::Literal(Value::Boolean(true))))
+            Box::new(VectorExpr::Eq(Box::new(VectorExpr::Column(2)),Box::new(VectorExpr::Literal(Value::Boolean(true)))))
         ));
         let project=ProjectionOperator::new(Box::new(filter),vec![0,1]).unwrap();
         let limit=LimitOperator::new(Box::new(project),1);
