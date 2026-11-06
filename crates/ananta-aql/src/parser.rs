@@ -40,7 +40,11 @@ pub enum BinaryOperator {
     Or, And, Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
     Add, Subtract, Multiply, Divide, Modulo,
 }
-pub fn parse(source: &str) -> Result<Query, AqlError> { Parser::new(lex(source)?).query() }
+pub fn parse(source: &str) -> Result<Query, AqlError> {
+    let query = Parser::new(lex(source)?).query()?;
+    crate::validate_ast(&query)?;
+    Ok(query)
+}
 
 struct Parser { tokens: Vec<Token>, cursor: usize }
 impl Parser {
