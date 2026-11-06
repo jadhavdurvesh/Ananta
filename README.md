@@ -24,10 +24,13 @@ The initial Rust implementation currently includes:
 - Exclusive local writer locking, no-overwrite segment publication, directory syncing on Unix, and startup cleanup of orphan temporary segment files.
 - Immutable Chronicle ingestion records with durable BatchId receipts, commit-order sequences and duplicate retry resolution.
 - Derived immutable Capsule v0.1 files with temporal bounds, per-column statistics, integrity checks and an independent validator.
+- Immutable Navigation Map generations with safe Capsule pruning and integrity/freshness validation.
+- ANWL write-ahead logging with redo recovery for ANF/Chronicle publication, catalog DDL, Active Weave pointers, compaction candidate publication, Capsules and Navigation Maps.
+- A single-writer process lock with read-only owner inspection, bounded-memory consistency checking, storage inventory and ANBK v1 checksummed backup/restore.
 - A standalone AQL v0.1 Rust crate with a source-spanned lexer/parser, SELECT AST, literals, casts, boolean/comparison expressions and typed parameter-binding validation.
 - A basic telemetry example and unit/integration tests.
 
-This is an experimental first vertical slice, not a complete or production-ready DBMS. The legacy `scan` APIs still materialise their complete result; the additive batch APIs bound decoded output per batch but do not yet provide predicates or physical column-range I/O. Only one local database handle/process may own a database at a time. A crash can leave a stale `.ananta.lock` file; after verifying no writer remains, an operator must remove it before reopening. Non-Unix targets do not have portable directory-entry flushing in this implementation. AQL parsing is an early v0.1 foundation; catalog semantic validation and native query execution remain unimplemented. Query planning, analytics operators, compression, indexes, WAL, transactions, MVCC and a complete crash-recovery protocol also remain unimplemented.
+This is an experimental first vertical slice, not a complete or production-ready DBMS. The legacy `scan` APIs still materialise their complete result; the additive batch APIs bound decoded output per batch but do not yet provide predicates or physical column-range I/O. Only one local database handle/process may own a database at a time. A crash can leave a stale `.ananta.lock` file; after verifying no writer remains, an operator must remove it before reopening. Non-Unix targets do not have portable directory-entry flushing in this implementation. AQL v0.1 parsing, catalog-aware planning and supported native execution paths are implemented, while joins, ordering and additional physical operators remain future work. General multi-operation ACID transactions, MVCC, WAL checkpoint/rotation, distributed operation, production hardening and complete power-loss/platform validation remain incomplete.
 
 
 
