@@ -5080,6 +5080,65 @@ mod tests {
 
 
     #[test]
+    fn capsule_and_navigation_map_wal_publications_replay_after_commit_interruption() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        for sequence in 1_u8..=2 {
+            let rows = vec![vec![
+                Value::TimestampMicros(i64::from(sequence) * 100),
+                Value::Utf8(format!("capsule-{sequence}")),
+                Value::Float64(f64::from(sequence)),
+            ]];
+            db.ingest_batch(
+                "telemetry",
+                BatchId::from_bytes([sequence + 100; 16]).unwrap(),
+                &rows,
+            ).unwrap();
+        }
+
+        crate::wal_recovery::arm_wal_recovery_crash_point(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterWalCommit,
+        );
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.build_capsule("telemetry", 700, 1, 1, 2, Some("timestamp"))
+        }));
+        assert!(interrupted.is_err());
+        drop(db);
+
+        let mut db = Database::open(&path).unwrap();
+        let capsule = db.validate_capsule("telemetry", 700, 1).unwrap();
+        assert_eq!(capsule.row_count, 2);
+        assert_eq!(db.scan_capsule("telemetry", 700, 1).unwrap().len(), 2);
+
+        crate::wal_recovery::arm_wal_recovery_crash_point(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterWalCommit,
+        );
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.build_navigation_map("telemetry", 701)
+        }));
+        assert!(interrupted.is_err());
+        drop(db);
+
+        let db = Database::open(&path).unwrap();
+        let request = CapsuleScanRequest {
+            ranges: vec![ColumnRangePredicate::new(
+                "timestamp",
+                Some(Value::TimestampMicros(0)),
+                true,
+                Some(Value::TimestampMicros(1_000)),
+                true,
+            )],
+            projection: None,
+        };
+        let mapped = db.scan_capsules("telemetry", &request, Some(701)).unwrap();
+        assert_eq!(mapped.rows.len(), 2);
+        assert_eq!(mapped.diagnostics.capsules_read, 1);
+        drop(db);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn capsule_builds_from_contiguous_chronicle_range_and_validates_column_stats() {
         let path = temp_path();
         let mut db = Database::open(&path).unwrap();
