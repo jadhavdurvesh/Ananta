@@ -964,10 +964,10 @@ A task is done only when all applicable items are true:
 
 # 15. Immediate next actions
 
-1. Complete M5.4 CI validation for native AQL execution, EXPLAIN and table analysis.
-2. Compare physical estimates against runtime rows/bytes on representative tables.
-3. Add explicit cache refresh policies and improve cost-based decisions across more physical operator types.
-4. Prove Capsule coverage semantics before integrating Navigation Map pruning with full table scans.
-5. Expand optimizer-on/off equivalence tests; keep unsupported expressions on the reference evaluator until lowered.
+1. Run the complete Rust workspace test, formatting and lint suites on a Rust 1.75+ toolchain; resolve every regression before closing M6.
+2. Expand Capsule/Navigation Map subprocess fault injection to every staging, flush, file-sync, directory-sync, final-publication and cleanup checkpoint.
+3. Design and implement a verified checkpoint snapshot before enabling any WAL rotation or prefix retention; until then retain and replay the full ANWL log.
+4. Run large-database backup/restore tests, crash-during-backup tests, and Unix/Windows lock and directory-durability validation.
+5. Close the M6 exit gate only when recovery, transaction-scope, locking and backup/restore tests have actually passed. Then begin M7 native server and developer interfaces.
 
-**Current focus: M6.2 — WAL-backed ANF/Chronicle recovery and crash-boundary validation.**
+**Current focus: M6 validation and closeout. M7 is next only after the M6 exit gate is satisfied.**
