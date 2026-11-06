@@ -629,6 +629,41 @@ impl Database {
             ));
         }
 
+        let table_name = candidate.tables.iter()
+            .find(|(_, definition)| definition.id == table_id)
+            .map(|(name, _)| name.as_str())
+            .ok_or(DbError::CorruptCatalog("catalog mutation table name is missing"))?;
+        let data_root = self.root.join("data");
+        fs::create_dir_all(&data_root)?;
+        let table_directory = data_root.join(table_name);
+        let table_previously_existed = self.catalog.tables.values()
+            .any(|existing| existing.id == table_id);
+        match fs::symlink_metadata(&table_directory) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                if !table_previously_existed && fs::read_dir(&table_directory)?.next().is_some() {
+                    return Err(DbError::CorruptCatalog(
+                        "new catalog table directory is not empty",
+                    ));
+                }
+            }
+            Ok(_) => {
+                return Err(DbError::CorruptCatalog(
+                    "catalog table path is not a real directory",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if table_previously_existed {
+                    return Err(DbError::CorruptCatalog(
+                        "existing catalog table directory is missing",
+                    ));
+                }
+                fs::create_dir(&table_directory)?;
+                sync_recovery_directory(&data_root)?;
+            }
+            Err(error) => return Err(DbError::Io(error)),
+        }
+        sync_recovery_directory(&table_directory)?;
+
         let schema_path = SchemaSnapshot::path(&self.root, table_id, schema_revision)?;
         let schema_directory = schema_path.parent().ok_or(DbError::LengthOverflow)?.to_path_buf();
         let schemas_root = self.root.join("catalog").join("schemas");
