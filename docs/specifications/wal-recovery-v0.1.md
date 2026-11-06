@@ -105,9 +105,11 @@ The TableChronicleIndex must not be advanced before the final .chr artifact is d
 
 ## 8. DDL and metadata publication
 
-create_table currently publishes a schema snapshot and then atomically replaces catalog.anc. A later WAL DDL intent must include the complete canonical catalog/schema state or a deterministic operation with allocated ObjectIds and expected catalog revision. The same staged-bytes/commit/publish rule applies to a new catalog snapshot, but schema snapshot and catalog publication must be recovered as one logical operation.
+The initial DDL WAL integration now covers `create_table`, `add_nullable_column`, `rename_column` and `reorder_columns`. A DDL transaction contains two ordered AMUT v1 intents: an immutable schema snapshot and a versioned immutable catalog snapshot. Both artifacts are staged and synced before the single durable COMMIT. After COMMIT, the engine publishes the schema snapshot first, publishes the versioned catalog snapshot second, and atomically replaces the canonical `catalog.anc` file from that verified snapshot. The canonical catalog parent directory is synced after replacement.
 
-Column rename/reorder, table drop, compaction manifests, active-Weave pointer swaps, Capsule and Navigation Map creation are not covered by the first ANF/Chronicle-only replay implementation. They must not be described as WAL-protected until they have explicit redo intents and crash-point tests.
+At startup, committed metadata intents are replayed in WAL transaction and intent order before subsequent ANF/Chronicle intents are resolved. This ordering permits a committed table creation or schema change to be replayed before later data writes for that table. Recovery verifies catalog bytes, schema identity, TableId, schema revision, canonical revision progression, immutable destination conflicts and directory types; it fails closed rather than overwriting mismatched artifacts. Stale catalog replacement temps are removed under the exclusive writer lock before catalog loading, and unowned canonical metadata staging temps are cleaned only after WAL recovery.
+
+Table drop, compaction manifests, active-Weave pointer swaps, Capsule and Navigation Map creation are not covered by this DDL integration. They must not be described as WAL-protected until they have explicit redo intents and crash-point tests.
 
 ## 9. Checkpoint and log retention
 
@@ -205,3 +207,12 @@ The parent test waits for child exit before removing that stale lock, then opens
 - ANF and Chronicle interruption immediately after final-name link but before the directory-sync checkpoint: recovery verifies the final artifact and completes cleanup.
 
 Every subprocess case is reopened a second time. Chronicle committed cases also verify receipt reconstruction and identical BatchId duplicate resolution. These are process-termination tests on the test filesystem; they still do not simulate power loss, volatile controller caches, or storage-device write reordering. Extend the subprocess matrix to the remaining sync/cleanup boundaries and add filesystem-level fault injection before claiming the full M6.2 crash matrix complete.
+
+
+## 13. Catalog DDL WAL implementation boundary
+
+The DDL path encodes the full candidate catalog snapshot and the affected immutable schema snapshot before it begins the WAL transaction. It preflights the canonical catalog replacement temp path and both immutable destinations before COMMIT, stages both artifacts with file and directory syncs, then commits the two intents together. The schema intent precedes the catalog intent. The versioned catalog file is immutable and checksum-verified; `catalog.anc` is the canonical atomically replaced current catalog.
+
+The current DDL crash suite covers `create_table` after COMMIT, after schema publication, after versioned catalog publication, and after canonical catalog replacement. Each case reopens twice and checks catalog/schema revisions and snapshot consistency. Child-process termination covers the same DDL publication boundaries. The pre-existing catalog-temp collision regression verifies that a known publication blocker is rejected before WAL COMMIT and leaves no orphan schema snapshot.
+
+The DDL tests were added to the repository but have not been executed in the current development environment. These process-exit and in-process interruption tests do not constitute physical power-loss or storage-controller cache-loss validation. Compaction/active-Weave/Capsule/Navigation Map WAL intents and checkpoint/rotation/retention remain open.
