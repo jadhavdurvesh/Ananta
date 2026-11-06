@@ -959,4 +959,4 @@ A task is done only when all applicable items are true:
 4. Prove Capsule coverage semantics before integrating Navigation Map pruning with full table scans.
 5. Expand optimizer-on/off equivalence tests; keep unsupported expressions on the reference evaluator until lowered.
 
-**Current focus: M5.4 — CI validation and estimate accuracy.**
+**Current focus: M6.2 — WAL-backed ANF/Chronicle recovery and crash-boundary validation.**
