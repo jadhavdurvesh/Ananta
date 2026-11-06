@@ -624,6 +624,7 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 - [x] Add physical EXPLAIN output.
 - [x] Add table/column analysis statistics (explicit bounded scan; exact null/min/max, approximate distinct).
 - [x] Add initial heuristic cardinality and projected-byte estimates with explicit provenance.
+- [x] Refine equality, NULL and numeric range selectivity using analyzed NDV, null fraction and min/max statistics.
 - [ ] Persist statistics and use histograms for cost-based selectivity.
 - [ ] Integrate time/Capsule pruning only with verified complete-coverage semantics.
 - [x] Add optimizer-disabled reference execution and compare simple optimized query results.

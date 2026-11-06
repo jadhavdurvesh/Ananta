@@ -382,18 +382,29 @@ pub fn explain_with_statistics(
     };
     let ingestion = database.ingestion_stats(&table).map_err(from_storage_error)?;
     let table_statistics = match table_statistics {
-        Some(statistics) if statistics.table_name == table => Some(statistics),
+        Some(statistics)
+            if statistics.table_name == table
+                && statistics.columns.len() == schema.len()
+                && statistics.columns.iter().zip(schema.columns())
+                    .all(|(stats, column)| stats.column == *column) =>
+        {
+            Some(statistics)
+        }
         Some(_) => {
             return Err(query_error(
                 AqlErrorCode::InvalidQuery,
-                "EXPLAIN statistics belong to a different table",
+                "EXPLAIN statistics do not match the current table identity/schema",
                 select.source.span,
             ));
         }
         None => None,
     };
     let selectivity = predicate.as_ref()
-        .map(estimate_compiled_selectivity)
+        .map(|expression| estimate_compiled_selectivity(
+            expression,
+            table_statistics,
+            bindings,
+        ))
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
     let estimated_rows_after_filter = table_statistics.map(|statistics| {
@@ -419,7 +430,7 @@ pub fn explain_with_statistics(
     let storage_limit_pushed =
         native_execution && predicate.is_none() && select.limit.is_some();
     let mut notes = vec![
-        "row cardinality uses a fixed selectivity heuristic, not collected column histograms".to_owned(),
+        "row cardinality uses analyzed NULL/NDV/min-max statistics when available; estimates remain heuristic without histograms".to_owned(),
         "projected payload bytes assume uniform per-column batch payload; actual bytes can differ".to_owned(),
         "Chronicle row/byte values are accepted-ingestion counters, not an execution profile".to_owned(),
     ];
@@ -446,42 +457,198 @@ pub fn explain_with_statistics(
     })
 }
 
-fn estimate_compiled_selectivity(expression: &CompiledExpr) -> f64 {
+fn estimate_compiled_selectivity(
+    expression: &CompiledExpr,
+    statistics: Option<&TableStatistics>,
+    bindings: &ParameterBindings,
+) -> f64 {
     match &expression.kind {
         CompiledExprKind::Literal(Literal::Boolean(true)) => 1.0,
         CompiledExprKind::Literal(Literal::Boolean(false)) => 0.0,
-        CompiledExprKind::IsNull { negated, .. } => if *negated { 0.9 } else { 0.1 },
+        CompiledExprKind::IsNull { expression, negated } => {
+            if let (Some(statistics), CompiledExprKind::Column(index)) =
+                (statistics, &expression.kind)
+            {
+                if let Some(column) = statistics.columns.get(*index) {
+                    if statistics.scanned_rows > 0 {
+                        let null_fraction =
+                            column.null_count as f64 / statistics.scanned_rows as f64;
+                        return if *negated {
+                            1.0 - null_fraction
+                        } else {
+                            null_fraction
+                        };
+                    }
+                }
+            }
+            if *negated { 0.9 } else { 0.1 }
+        }
         CompiledExprKind::Unary {
             operator: UnaryOperator::Not,
             expression,
-        } => 1.0 - estimate_compiled_selectivity(expression),
+        } => 1.0 - estimate_compiled_selectivity(expression, statistics, bindings),
         CompiledExprKind::Binary {
             left,
             operator: BinaryOperator::And,
             right,
-        } => estimate_compiled_selectivity(left) * estimate_compiled_selectivity(right),
+        } => {
+            estimate_compiled_selectivity(left, statistics, bindings)
+                * estimate_compiled_selectivity(right, statistics, bindings)
+        }
         CompiledExprKind::Binary {
             left,
             operator: BinaryOperator::Or,
             right,
         } => {
-            let left = estimate_compiled_selectivity(left);
-            let right = estimate_compiled_selectivity(right);
+            let left = estimate_compiled_selectivity(left, statistics, bindings);
+            let right = estimate_compiled_selectivity(right, statistics, bindings);
             left + right - left * right
         }
-        CompiledExprKind::Binary { operator: BinaryOperator::Equal, .. } => 0.1,
-        CompiledExprKind::Binary { operator: BinaryOperator::NotEqual, .. } => 0.9,
         CompiledExprKind::Binary {
-            operator: BinaryOperator::Less
+            left,
+            operator,
+            right,
+        } => {
+            if let Some(estimate) =
+                estimate_column_comparison(left, *operator, right, statistics, bindings)
+            {
+                return estimate;
+            }
+            match operator {
+                BinaryOperator::Equal => 0.1,
+                BinaryOperator::NotEqual => 0.9,
+                BinaryOperator::Less
                 | BinaryOperator::LessEqual
                 | BinaryOperator::Greater
-                | BinaryOperator::GreaterEqual,
-            ..
-        } => 0.33,
+                | BinaryOperator::GreaterEqual => 0.33,
+                _ => 0.5,
+            }
+        }
         CompiledExprKind::Column(_) => 0.5,
         CompiledExprKind::Parameter(_) => 0.5,
         _ => 0.5,
     }
+}
+
+fn estimate_column_comparison(
+    left: &CompiledExpr,
+    operator: BinaryOperator,
+    right: &CompiledExpr,
+    statistics: Option<&TableStatistics>,
+    bindings: &ParameterBindings,
+) -> Option<f64> {
+    let statistics = statistics?;
+    let (column_index, value, operator) = match (
+        &left.kind,
+        compiled_scalar_value(right, bindings),
+    ) {
+        (CompiledExprKind::Column(index), Some(value)) => (*index, value, operator),
+        _ => match (
+            &right.kind,
+            compiled_scalar_value(left, bindings),
+        ) {
+            (CompiledExprKind::Column(index), Some(value)) => {
+                (*index, value, reverse_comparison(operator)?)
+            }
+            _ => return None,
+        },
+    };
+    let column = statistics.columns.get(column_index)?;
+    if statistics.scanned_rows == 0 || matches!(value, Value::Null) {
+        return Some(0.0);
+    }
+
+    let total = statistics.scanned_rows as f64;
+    let non_null_fraction = column.non_null_count as f64 / total;
+    if non_null_fraction <= 0.0 {
+        return Some(0.0);
+    }
+
+    if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual) {
+        let distinct = column.approximate_distinct_count.max(1) as f64;
+        let equal = (non_null_fraction / distinct).min(non_null_fraction);
+        return Some(if operator == BinaryOperator::Equal {
+            equal
+        } else {
+            (non_null_fraction - equal).max(0.0)
+        });
+    }
+
+    let minimum = column.min_value.as_ref()?;
+    let maximum = column.max_value.as_ref()?;
+    let min_numeric = statistics_numeric_value(minimum)?;
+    let max_numeric = statistics_numeric_value(maximum)?;
+    let target = statistics_numeric_value(&value)?;
+    if max_numeric <= min_numeric {
+        let ordering = compare_statistics_values(&value, minimum)?;
+        let matches = match operator {
+            BinaryOperator::Less => ordering == Ordering::Greater,
+            BinaryOperator::LessEqual => ordering != Ordering::Less,
+            BinaryOperator::Greater => ordering == Ordering::Less,
+            BinaryOperator::GreaterEqual => ordering != Ordering::Greater,
+            _ => return None,
+        };
+        return Some(if matches { non_null_fraction } else { 0.0 });
+    }
+
+    let below = ((target - min_numeric) / (max_numeric - min_numeric)).clamp(0.0, 1.0);
+    // Min/max provide a uniform-range estimate. Unlike equality predicates,
+    // a range histogram is not available, so do not add an invented point mass
+    // at inclusive bounds; that would systematically overcount boundary rows.
+    let fraction = match operator {
+        BinaryOperator::Less | BinaryOperator::LessEqual => below,
+        BinaryOperator::Greater | BinaryOperator::GreaterEqual => 1.0 - below,
+        _ => return None,
+    };
+    Some(non_null_fraction * fraction)
+}
+
+fn compiled_scalar_value(
+    expression: &CompiledExpr,
+    bindings: &ParameterBindings,
+) -> Option<Value> {
+    match &expression.kind {
+        CompiledExprKind::Literal(literal) => Some(literal_value(literal)),
+        CompiledExprKind::Parameter(parameter) => {
+            binding_value(parameter, bindings, expression.span).ok().cloned()
+        }
+        _ => None,
+    }
+}
+
+fn reverse_comparison(operator: BinaryOperator) -> Option<BinaryOperator> {
+    Some(match operator {
+        BinaryOperator::Less => BinaryOperator::Greater,
+        BinaryOperator::LessEqual => BinaryOperator::GreaterEqual,
+        BinaryOperator::Greater => BinaryOperator::Less,
+        BinaryOperator::GreaterEqual => BinaryOperator::LessEqual,
+        BinaryOperator::Equal => BinaryOperator::Equal,
+        BinaryOperator::NotEqual => BinaryOperator::NotEqual,
+        _ => return None,
+    })
+}
+
+fn statistics_numeric_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int32(value) => Some(f64::from(*value)),
+        Value::Int64(value) => Some(*value as f64),
+        Value::TimestampMicros(value) => Some(*value as f64),
+        Value::Float64(value) if value.is_finite() => Some(*value),
+        _ => None,
+    }
+}
+
+fn compare_statistics_values(left: &Value, right: &Value) -> Option<Ordering> {
+    Some(match (left, right) {
+        (Value::Boolean(left), Value::Boolean(right)) => left.cmp(right),
+        (Value::Int32(left), Value::Int32(right)) => left.cmp(right),
+        (Value::Int64(left), Value::Int64(right)) => left.cmp(right),
+        (Value::TimestampMicros(left), Value::TimestampMicros(right)) => left.cmp(right),
+        (Value::Float64(left), Value::Float64(right)) => left.total_cmp(right),
+        (Value::Utf8(left), Value::Utf8(right)) => left.cmp(right),
+        (Value::Binary(left), Value::Binary(right)) => left.cmp(right),
+        _ => return None,
+    })
 }
 
 pub fn execute_source(
@@ -1528,8 +1695,8 @@ mod tests {
             true,
             Some(&table_stats),
         ).unwrap();
-        assert_eq!(analyzed_plan.estimated_rows_after_filter, Some(1));
-        assert_eq!(analyzed_plan.estimated_output_rows, Some(1));
+        assert_eq!(analyzed_plan.estimated_rows_after_filter, Some(2));
+        assert_eq!(analyzed_plan.estimated_output_rows, Some(2));
         assert!(analyzed_plan.estimated_projected_payload_bytes.unwrap() > 0);
         assert!(analyzed_plan.explain().contains("native vector predicate"));
 
@@ -1545,6 +1712,65 @@ mod tests {
 
         let reference = explain(&db, &query, &ParameterBindings::default(), false).unwrap();
         assert!(!reference.native_execution);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn analyzed_statistics_drive_equality_null_and_range_selectivity() {
+        let (db, root, _) = fixture();
+        let table_stats = ananta_execution::analyze_table(&db, "telemetry", 2).unwrap();
+
+        let equality = crate::parse(
+            "SELECT device FROM telemetry WHERE reading = 25.0"
+        ).unwrap();
+        let equality_plan = explain_with_statistics(
+            &db, &equality, &ParameterBindings::default(), true, Some(&table_stats),
+        ).unwrap();
+        assert_eq!(equality_plan.estimated_rows_after_filter, Some(1));
+
+        let is_null = crate::parse(
+            "SELECT device FROM telemetry WHERE reading IS NULL"
+        ).unwrap();
+        let null_plan = explain_with_statistics(
+            &db, &is_null, &ParameterBindings::default(), true, Some(&table_stats),
+        ).unwrap();
+        assert_eq!(null_plan.estimated_rows_after_filter, Some(1));
+
+        let reverse_range = crate::parse(
+            "SELECT device FROM telemetry WHERE 25.0 <= reading"
+        ).unwrap();
+        let range_plan = explain_with_statistics(
+            &db, &reverse_range, &ParameterBindings::default(), true, Some(&table_stats),
+        ).unwrap();
+        assert_eq!(range_plan.estimated_rows_after_filter, Some(2));
+
+        let outside_range = crate::parse(
+            "SELECT device FROM telemetry WHERE reading > 40.0"
+        ).unwrap();
+        let outside_plan = explain_with_statistics(
+            &db, &outside_range, &ParameterBindings::default(), true, Some(&table_stats),
+        ).unwrap();
+        assert_eq!(outside_plan.estimated_rows_after_filter, Some(0));
+
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explain_rejects_statistics_from_a_different_schema_snapshot() {
+        let (db, root, _) = fixture();
+        let mut stale = ananta_execution::analyze_table(&db, "telemetry", 2).unwrap();
+        stale.columns[1].column.name = "renamed_device".to_owned();
+        let query = crate::parse("SELECT device FROM telemetry").unwrap();
+        let result = explain_with_statistics(
+            &db,
+            &query,
+            &ParameterBindings::default(),
+            true,
+            Some(&stale),
+        );
+        assert_eq!(result.unwrap_err().code, AqlErrorCode::InvalidQuery);
         drop(db);
         fs::remove_dir_all(root).unwrap();
     }

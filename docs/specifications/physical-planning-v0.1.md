@@ -39,7 +39,7 @@ The first estimator uses a documented heuristic, not histograms:
 - NOT: one minus child selectivity.
 - Unknown expression: 50%.
 
-Estimated filtered rows are rounded from analyzed scanned rows times selectivity. LIMIT caps the estimated output count. These heuristics may be inaccurate for skewed data and must not be presented as measured cardinality.
+Estimated filtered rows are rounded from analyzed scanned rows times selectivity. LIMIT caps the estimated output count. With explicit table statistics, equality/inequality selectivity uses approximate distinct counts and the non-NULL fraction; IS NULL / IS NOT NULL uses the exact observed NULL fraction. Numeric and timestamp range predicates use a uniform interpolation between exact min/max bounds and add an approximate equality mass for inclusive boundaries. These estimates remain approximate for skewed or clustered data and must not be presented as measured cardinality. When no analyzed statistics are supplied, the fixed fallback heuristics are used.
 
 ## 4. Runtime query profile
 
