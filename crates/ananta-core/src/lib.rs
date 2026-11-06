@@ -476,7 +476,7 @@ impl Database {
         sync_recovery_directory(&wal_dir)?;
         let wal_report = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
-        validate_checkpoint_records(&root, &wal_report)?;
+        validate_checkpoint_records(&root, &wal_report, catalog.revision)?;
         let committed_catalog_revisions = build_recovery_plan(&wal_report)
             .map_err(|error| DbError::Wal(error.to_string()))?
             .committed
@@ -671,7 +671,7 @@ impl Database {
         let wal_path = self.root.join("wal").join("database.anwl");
         let wal_report = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
-        validate_checkpoint_records(&self.root, &wal_report)?;
+        validate_checkpoint_records(&self.root, &wal_report, self.catalog.revision)?;
         let recovery_plan = build_recovery_plan(&wal_report)
             .map_err(|error| DbError::Wal(error.to_string()))?;
         if !wal_report.is_clean() || !recovery_plan.incomplete.is_empty() {
@@ -793,7 +793,7 @@ impl Database {
             })?;
         let rotated = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
-        validate_checkpoint_records(&self.root, &rotated)?;
+        validate_checkpoint_records(&self.root, &rotated, self.catalog.revision)?;
         if rotated.records.len() != 1 || rotated.last_sequence != 1 || !rotated.is_clean() {
             self.recovery_required = true;
             return Err(DbError::RecoveryRequired(
@@ -2771,10 +2771,41 @@ fn cleanup_stale_checkpoint_temp(wal_directory: &Path) -> Result<(), DbError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(DbError::Io(error)),
     }
+    let checkpoints = wal_directory.join("checkpoints");
+    match fs::read_dir(&checkpoints) {
+        Ok(entries) => {
+            let mut removed = false;
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let text = name.to_string_lossy();
+                if !text.starts_with(".checkpoint-") || !text.ends_with(".tmp") {
+                    continue;
+                }
+                let metadata = entry.file_type()?;
+                if !metadata.is_file() {
+                    return Err(DbError::Wal(
+                        "checkpoint staging path is not a regular file".into(),
+                    ));
+                }
+                fs::remove_file(entry.path())?;
+                removed = true;
+            }
+            if removed {
+                sync_recovery_directory(&checkpoints)?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DbError::Io(error)),
+    }
     Ok(())
 }
 
-fn validate_checkpoint_records(root: &Path, report: &WalReadReport) -> Result<(), DbError> {
+fn validate_checkpoint_records(
+    root: &Path,
+    report: &WalReadReport,
+    current_catalog_revision: u64,
+) -> Result<(), DbError> {
     let checkpoints = report.records.iter()
         .filter(|record| record.kind == WalRecordKind::Checkpoint)
         .collect::<Vec<_>>();
@@ -2789,8 +2820,13 @@ fn validate_checkpoint_records(root: &Path, report: &WalReadReport) -> Result<()
             "checkpoint must be the unique first frame in a rotated WAL".into(),
         ));
     }
-    crate::wal_checkpoint::validate_checkpoint(root, &checkpoints[0].payload)
+    let checkpoint = crate::wal_checkpoint::validate_checkpoint(root, &checkpoints[0].payload)
         .map_err(|error| DbError::Wal(format!("checkpoint validation failed: {error}")))?;
+    if checkpoint.catalog_revision > current_catalog_revision {
+        return Err(DbError::Wal(
+            "checkpoint catalog revision is newer than the loaded database catalog".into(),
+        ));
+    }
     Ok(())
 }
 
