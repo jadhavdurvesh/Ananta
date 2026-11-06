@@ -1,7 +1,7 @@
-//! Snapshot-first schema operations that preserve stable column identities.
+//! WAL-backed schema operations that preserve stable column identities.
 
 use super::{
-    increment_catalog_revision, save_catalog, Database, DbError, ObjectId, TableDefinition,
+    increment_catalog_revision, Database, DbError, ObjectId, TableDefinition,
 };
 use crate::schema_snapshot::SchemaSnapshot;
 use ananta_types::{Column, Schema};
@@ -39,6 +39,7 @@ impl Database {
         old_name: &str,
         new_name: impl Into<String>,
     ) -> Result<ObjectId, DbError> {
+        self.ensure_operational()?;
         let new_name = new_name.into();
         let current = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
@@ -81,18 +82,13 @@ impl Database {
 
         let revised = candidate.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
-        SchemaSnapshot::new(
+        let snapshot = SchemaSnapshot::new(
             revised.id,
             revised.schema_revision,
             &revised.schema,
             &revised.column_ids,
-        )?.write_to(&self.root)?;
-
-        save_catalog(
-            &self.root.join("catalog").join("catalog.anc"),
-            &candidate,
         )?;
-        self.catalog = candidate;
+        self.commit_catalog_mutation(candidate, snapshot, b"rename_column")?;
         Ok(column_id)
     }
 
@@ -105,6 +101,7 @@ impl Database {
         table: &str,
         ordered_names: &[&str],
     ) -> Result<(), DbError> {
+        self.ensure_operational()?;
         let current = self.catalog.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         verify_snapshot(&self.root, current)?;
@@ -156,18 +153,13 @@ impl Database {
 
         let revised = candidate.tables.get(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
-        SchemaSnapshot::new(
+        let snapshot = SchemaSnapshot::new(
             revised.id,
             revised.schema_revision,
             &revised.schema,
             &revised.column_ids,
-        )?.write_to(&self.root)?;
-
-        save_catalog(
-            &self.root.join("catalog").join("catalog.anc"),
-            &candidate,
         )?;
-        self.catalog = candidate;
+        self.commit_catalog_mutation(candidate, snapshot, b"reorder_columns")?;
         Ok(())
     }
 }

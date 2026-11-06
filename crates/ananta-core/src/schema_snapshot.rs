@@ -20,7 +20,7 @@ const TRAILER_LEN: usize = 12;
 const DIRECTORY_ENTRY_MIN: usize = 15;
 const MAX_COLUMNS: usize = 1_000_000;
 const MAX_NAME_BYTES: usize = 1024 * 1024;
-const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One immutable schema revision, keyed by table ObjectId and revision number.
 #[derive(Debug, Clone, PartialEq, Eq)]

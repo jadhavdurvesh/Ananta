@@ -410,8 +410,10 @@ impl Database {
         fs::create_dir_all(root.join("data"))?;
         // A handle owns the exclusive local writer lock for its entire lifetime.
         let writer_lock = DatabaseLock::acquire(&root)?;
+        cleanup_stale_catalog_replacement_temp(&root)?;
+        cleanup_legacy_schema_snapshot_temps(&root)?;
         let catalog_path = root.join("catalog").join("catalog.anc");
-        let catalog = match fs::metadata(&catalog_path) {
+        let mut catalog = match fs::metadata(&catalog_path) {
             Ok(_) => load_catalog(&catalog_path)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Catalog::empty(),
             Err(error) => return Err(DbError::Io(error)),
@@ -431,26 +433,68 @@ impl Database {
         sync_recovery_directory(&wal_dir)?;
         let wal_report = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
+        let committed_catalog_revisions = build_recovery_plan(&wal_report)
+            .map_err(|error| DbError::Wal(error.to_string()))?
+            .committed
+            .into_iter()
+            .flat_map(|transaction| transaction.intents)
+            .filter(|intent| intent.artifact_kind == WalArtifactKind::CatalogSnapshot)
+            .map(|intent| intent.file_id)
+            .collect::<BTreeSet<_>>();
+
         recover_staged_artifacts(&wal_report, &mut wal, |intent| {
-            let Some((table_name, definition)) = catalog.tables.iter()
-                .find(|(_, definition)| definition.id.0 == intent.table_id)
-            else {
-                return Err(WalRecoveryError::MissingTableId(intent.table_id));
-            };
-            crate::schema_snapshot::SchemaSnapshot::read_from(
-                &root,
-                definition.id,
-                intent.schema_revision,
-            ).map_err(|error| WalRecoveryError::SchemaSnapshot(error.to_string()))?;
-            Ok(root.join("data").join(table_name))
+            match intent.artifact_kind {
+                WalArtifactKind::SchemaSnapshot => {
+                    let snapshot_path = SchemaSnapshot::path(
+                        &root,
+                        ObjectId(intent.table_id),
+                        intent.file_id,
+                    ).map_err(|error| WalRecoveryError::SchemaSnapshot(error.to_string()))?;
+                    snapshot_path.parent()
+                        .map(Path::to_path_buf)
+                        .ok_or_else(|| WalRecoveryError::SchemaSnapshot(
+                            "schema snapshot path has no parent directory".into(),
+                        ))
+                }
+                WalArtifactKind::CatalogSnapshot => {
+                    let directory = root.join("catalog");
+                    if committed_catalog_revisions.contains(&intent.file_id) {
+                        // Publish/apply the catalog snapshot here, in WAL order,
+                        // so a later transaction in this same log can resolve a
+                        // table introduced or revised by this DDL transaction.
+                        let final_path = publish_staged_wal_artifact(&directory, intent)?;
+                        apply_catalog_snapshot_artifact(
+                            &root,
+                            &mut catalog,
+                            intent,
+                            &final_path,
+                        ).map_err(|error| WalRecoveryError::SchemaSnapshot(error.to_string()))?;
+                    }
+                    Ok(directory)
+                }
+                WalArtifactKind::AnfSegment | WalArtifactKind::ChronicleRecord => {
+                    let Some((table_name, definition)) = catalog.tables.iter()
+                        .find(|(_, definition)| definition.id.0 == intent.table_id)
+                    else {
+                        return Err(WalRecoveryError::MissingTableId(intent.table_id));
+                    };
+                    SchemaSnapshot::read_from(
+                        &root,
+                        definition.id,
+                        intent.schema_revision,
+                    ).map_err(|error| WalRecoveryError::SchemaSnapshot(error.to_string()))?;
+                    Ok(root.join("data").join(table_name))
+                }
+            }
         }).map_err(|error| match error {
             WalRecoveryError::ChronicleCorrupt(message) => DbError::ChronicleCorrupt(message),
             other => DbError::Wal(other.to_string()),
         })?;
 
-        // Anything left here has no verified committed intent (for example a
-        // process stopped while writing the staging file before BEGIN).
+        // Anything left here has no verified WAL ownership (for example a
+        // process stopped while staging the second metadata artifact).
         cleanup_orphan_segment_temps(&root.join("data"))?;
+        cleanup_orphan_catalog_staging_temps(&root)?;
         let mut chronicle_indices = BTreeMap::new();
         for (name, definition) in &catalog.tables {
             let directory = root.join("data").join(name);
@@ -494,8 +538,20 @@ impl Database {
         intent: &WalMutationIntent,
         operation: &[u8],
     ) -> Result<(), DbError> {
-        let payload = intent.encode()
-            .map_err(|error| DbError::Wal(error.to_string()))?;
+        self.commit_wal_intents(std::slice::from_ref(intent), operation)
+    }
+
+    fn commit_wal_intents(
+        &mut self,
+        intents: &[WalMutationIntent],
+        operation: &[u8],
+    ) -> Result<(), DbError> {
+        if intents.is_empty() {
+            return Err(DbError::Wal("cannot commit an empty mutation-intent list".into()));
+        }
+        let payloads = intents.iter()
+            .map(|intent| intent.encode().map_err(|error| DbError::Wal(error.to_string())))
+            .collect::<Result<Vec<_>, _>>()?;
         let transaction_id = self.wal.next_sequence();
         if let Err(error) = self.wal.begin_transaction(transaction_id, operation) {
             self.recovery_required = true;
@@ -506,15 +562,17 @@ impl Database {
         crate::wal_recovery::maybe_crash_after(
             crate::wal_recovery::WalRecoveryCrashPoint::AfterWalBegin,
         );
-        if let Err(error) = self.wal.append_mutation(transaction_id, &payload) {
-            self.recovery_required = true;
-            return Err(DbError::RecoveryRequired(format!(
-                "could not append WAL mutation intent: {error}"
-            )));
+        for payload in &payloads {
+            if let Err(error) = self.wal.append_mutation(transaction_id, payload) {
+                self.recovery_required = true;
+                return Err(DbError::RecoveryRequired(format!(
+                    "could not append WAL mutation intent: {error}"
+                )));
+            }
+            crate::wal_recovery::maybe_crash_after(
+                crate::wal_recovery::WalRecoveryCrashPoint::AfterWalMutation,
+            );
         }
-        crate::wal_recovery::maybe_crash_after(
-            crate::wal_recovery::WalRecoveryCrashPoint::AfterWalMutation,
-        );
         if let Err(error) = self.wal.commit_transaction(transaction_id) {
             self.recovery_required = true;
             return Err(DbError::RecoveryRequired(format!(
@@ -541,6 +599,154 @@ impl Database {
         }
     }
 
+    fn commit_catalog_mutation(
+        &mut self,
+        candidate: Catalog,
+        snapshot: SchemaSnapshot,
+        operation: &[u8],
+    ) -> Result<(), DbError> {
+        self.ensure_operational()?;
+
+        let table_id = snapshot.table_id();
+        let schema_revision = snapshot.revision();
+        let expected_catalog_revision = self.catalog.revision
+            .checked_add(1)
+            .ok_or(DbError::LengthOverflow)?;
+        if candidate.revision != expected_catalog_revision {
+            return Err(DbError::CorruptCatalog(
+                "catalog mutation revision is not the next revision",
+            ));
+        }
+        let definition = candidate.tables.values()
+            .find(|definition| definition.id == table_id)
+            .ok_or(DbError::CorruptCatalog("catalog mutation snapshot TableId is missing"))?;
+        if definition.schema_revision != schema_revision
+            || snapshot.schema()? != definition.schema
+            || snapshot.column_ids().collect::<Vec<_>>() != definition.column_ids
+        {
+            return Err(DbError::SchemaCompatibility(
+                "catalog mutation snapshot does not match candidate catalog",
+            ));
+        }
+
+        let table_name = candidate.tables.iter()
+            .find(|(_, definition)| definition.id == table_id)
+            .map(|(name, _)| name.as_str())
+            .ok_or(DbError::CorruptCatalog("catalog mutation table name is missing"))?;
+        let data_root = self.root.join("data");
+        fs::create_dir_all(&data_root)?;
+        let table_directory = data_root.join(table_name);
+        let table_previously_existed = self.catalog.tables.values()
+            .any(|existing| existing.id == table_id);
+        match fs::symlink_metadata(&table_directory) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                if !table_previously_existed && fs::read_dir(&table_directory)?.next().is_some() {
+                    return Err(DbError::CorruptCatalog(
+                        "new catalog table directory is not empty",
+                    ));
+                }
+            }
+            Ok(_) => {
+                return Err(DbError::CorruptCatalog(
+                    "catalog table path is not a real directory",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if table_previously_existed {
+                    return Err(DbError::CorruptCatalog(
+                        "existing catalog table directory is missing",
+                    ));
+                }
+                fs::create_dir(&table_directory)?;
+                sync_recovery_directory(&data_root)?;
+            }
+            Err(error) => return Err(DbError::Io(error)),
+        }
+        sync_recovery_directory(&table_directory)?;
+
+        let schema_path = SchemaSnapshot::path(&self.root, table_id, schema_revision)?;
+        let schema_directory = schema_path.parent().ok_or(DbError::LengthOverflow)?.to_path_buf();
+        let schemas_root = self.root.join("catalog").join("schemas");
+        let catalog_directory = self.root.join("catalog");
+        fs::create_dir_all(&schema_directory)?;
+        // Persist each new directory entry before WAL COMMIT can depend on it.
+        sync_recovery_directory(&catalog_directory)?;
+        sync_recovery_directory(&schemas_root)?;
+        sync_recovery_directory(&schema_directory)?;
+
+        let snapshot_bytes = snapshot.encode()?;
+        let catalog_bytes = encode_catalog_v2(&candidate)?;
+        let catalog_replacement_temp = catalog_directory.join("catalog.anc.tmp");
+        match fs::symlink_metadata(&catalog_replacement_temp) {
+            Ok(_) => {
+                return Err(DbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "catalog replacement temporary path already exists",
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DbError::Io(error)),
+        }
+        verify_immutable_file_if_present(
+            &schema_path,
+            &snapshot_bytes,
+            "immutable schema snapshot conflict",
+        )?;
+        let catalog_snapshot_path = catalog_directory.join(
+            WalArtifactKind::CatalogSnapshot.final_file_name(candidate.revision),
+        );
+        verify_immutable_file_if_present(
+            &catalog_snapshot_path,
+            &catalog_bytes,
+            "immutable catalog snapshot conflict",
+        )?;
+        let schema_intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::SchemaSnapshot,
+            table_id: table_id.0,
+            schema_revision,
+            file_id: schema_revision,
+            file_len: u64::try_from(snapshot_bytes.len()).map_err(|_| DbError::LengthOverflow)?,
+            sha256: chronicle::sha256(&snapshot_bytes),
+        };
+        let catalog_intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::CatalogSnapshot,
+            table_id: table_id.0,
+            schema_revision,
+            file_id: candidate.revision,
+            file_len: u64::try_from(catalog_bytes.len()).map_err(|_| DbError::LengthOverflow)?,
+            sha256: chronicle::sha256(&catalog_bytes),
+        };
+
+        stage_wal_artifact(&schema_directory, &schema_intent, &snapshot_bytes)
+            .map_err(Self::map_precommit_stage_error)?;
+        if let Err(error) = stage_wal_artifact(&catalog_directory, &catalog_intent, &catalog_bytes) {
+            let _ = discard_staged_wal_artifact(&schema_directory, &schema_intent);
+            return Err(Self::map_precommit_stage_error(error));
+        }
+
+        self.commit_wal_intents(&[schema_intent.clone(), catalog_intent.clone()], operation)?;
+        self.publish_wal_intent(&schema_directory, &schema_intent)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterSchemaSnapshotPublished,
+        );
+        let catalog_path = self.publish_wal_intent(&catalog_directory, &catalog_intent)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterCatalogSnapshotPublished,
+        );
+        if let Err(error) = apply_catalog_snapshot_artifact(
+            &self.root,
+            &mut self.catalog,
+            &catalog_intent,
+            &catalog_path,
+        ) {
+            self.recovery_required = true;
+            return Err(DbError::RecoveryRequired(format!(
+                "committed catalog mutation requires recovery: {error}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn create_table(&mut self, name: impl Into<String>, schema: Schema) -> Result<(), DbError> {
         self.ensure_operational()?;
         let name = name.into();
@@ -557,13 +763,6 @@ impl Database {
         }
         increment_catalog_revision(&mut candidate)?;
 
-        let data_root = self.root.join("data");
-        let table_dir = data_root.join(&name);
-        fs::create_dir_all(&table_dir)?;
-        // Make the new table directory entry durable before later WAL intents
-        // rely on staged/final files inside it.
-        sync_recovery_directory(&data_root)?;
-        sync_recovery_directory(&table_dir)?;
         candidate.tables.insert(name.clone(), TableDefinition {
             id: table_id,
             schema_revision: 1,
@@ -571,16 +770,14 @@ impl Database {
             schema,
         });
 
-        // Persist revision-one identity before publishing the catalog that references it.
         let definition = candidate.tables.get(&name).expect("new table inserted");
-        SchemaSnapshot::new(
+        let snapshot = SchemaSnapshot::new(
             definition.id,
             definition.schema_revision,
             &definition.schema,
             &definition.column_ids,
-        )?.write_to(&self.root)?;
-        save_catalog(&self.root.join("catalog").join("catalog.anc"), &candidate)?;
-        self.catalog = candidate;
+        )?;
+        self.commit_catalog_mutation(candidate, snapshot, b"create_table")?;
         self.chronicle_indices.entry(table_id).or_default();
         Ok(())
     }
@@ -2231,6 +2428,246 @@ fn encode_catalog_v2(catalog: &Catalog) -> Result<Vec<u8>, DbError> {
     Ok(bytes)
 }
 
+fn verify_immutable_file_if_present(
+    path: &Path,
+    expected: &[u8],
+    conflict: &'static str,
+) -> Result<(), DbError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() == expected.len() as u64 => {
+            if fs::read(path)? == expected {
+                Ok(())
+            } else {
+                Err(DbError::CorruptCatalog(conflict))
+            }
+        }
+        Ok(_) => Err(DbError::CorruptCatalog(conflict)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DbError::Io(error)),
+    }
+}
+
+fn apply_catalog_snapshot_artifact(
+    root: &Path,
+    current: &mut Catalog,
+    intent: &WalMutationIntent,
+    artifact_path: &Path,
+) -> Result<(), DbError> {
+    if intent.artifact_kind != WalArtifactKind::CatalogSnapshot {
+        return Err(DbError::CorruptCatalog("non-catalog artifact passed to catalog recovery"));
+    }
+    let metadata = fs::metadata(artifact_path)?;
+    if metadata.len() > MAX_CATALOG_BYTES {
+        return Err(DbError::CorruptCatalog("catalog snapshot exceeds size limit"));
+    }
+    let capacity = usize::try_from(metadata.len()).map_err(|_| DbError::LengthOverflow)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    File::open(artifact_path)?.read_to_end(&mut bytes)?;
+    let candidate = decode_catalog_v2(&bytes)?;
+    validate_catalog(&candidate)?;
+    if candidate.revision != intent.file_id {
+        return Err(DbError::CorruptCatalog(
+            "catalog snapshot revision differs from committed WAL intent",
+        ));
+    }
+    let (table_name, definition) = candidate.tables.iter()
+        .find(|(_, definition)| definition.id.0 == intent.table_id)
+        .ok_or(DbError::CorruptCatalog(
+            "catalog snapshot does not contain the committed TableId",
+        ))?;
+    if definition.schema_revision != intent.schema_revision {
+        return Err(DbError::CorruptCatalog(
+            "catalog snapshot schema revision differs from committed WAL intent",
+        ));
+    }
+
+    // The schema intent is ordered before the catalog intent in the same WAL
+    // transaction. It must already have been published and identity-checked.
+    let snapshot = SchemaSnapshot::read_from(
+        root,
+        definition.id,
+        definition.schema_revision,
+    )?;
+    if snapshot.schema()? != definition.schema
+        || snapshot.column_ids().collect::<Vec<_>>() != definition.column_ids
+    {
+        return Err(DbError::SchemaCompatibility(
+            "published schema snapshot does not match committed catalog snapshot",
+        ));
+    }
+
+    let data_root = root.join("data");
+    fs::create_dir_all(&data_root)?;
+    let table_directory = data_root.join(table_name);
+    match fs::symlink_metadata(&table_directory) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(DbError::CorruptCatalog(
+                "catalog table path is not a real directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&table_directory)?;
+            sync_recovery_directory(&data_root)?;
+        }
+        Err(error) => return Err(DbError::Io(error)),
+    }
+    sync_recovery_directory(&table_directory)?;
+
+    if candidate.revision > current.revision {
+        let expected_revision = current.revision
+            .checked_add(1)
+            .ok_or(DbError::LengthOverflow)?;
+        if candidate.revision != expected_revision {
+            return Err(DbError::CorruptCatalog(
+                "committed catalog revisions are not contiguous",
+            ));
+        }
+        save_catalog(&root.join("catalog").join("catalog.anc"), &candidate)?;
+        *current = candidate;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterCanonicalCatalogPublished,
+        );
+    } else if candidate.revision == current.revision {
+        if encode_catalog_v2(current)? != bytes {
+            return Err(DbError::CorruptCatalog(
+                "canonical catalog conflicts with committed catalog snapshot",
+            ));
+        }
+    } else {
+        // Earlier committed snapshots remain in the WAL. A later catalog is
+        // acceptable only if it still contains this table and has advanced its
+        // schema past this historical revision.
+        let current_definition = current.tables.values()
+            .find(|definition| definition.id.0 == intent.table_id)
+            .ok_or(DbError::CorruptCatalog(
+                "current catalog lost a table from committed history",
+            ))?;
+        if current_definition.schema_revision < intent.schema_revision {
+            return Err(DbError::CorruptCatalog(
+                "current catalog is behind a committed schema snapshot",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_canonical_numbered_temp(filename: &str, prefix: &str, suffix: &str) -> bool {
+    let Some(id) = filename.strip_prefix(prefix).and_then(|value| value.strip_suffix(suffix)) else {
+        return false;
+    };
+    id.len() == 20
+        && id.bytes().all(|byte| byte.is_ascii_digit())
+        && id.parse::<u64>().is_ok_and(|value| value != 0 && format!("{value:020}") == id)
+}
+
+fn cleanup_stale_catalog_replacement_temp(root: &Path) -> Result<(), DbError> {
+    let directory = root.join("catalog");
+    let temp = directory.join("catalog.anc.tmp");
+    match fs::symlink_metadata(&temp) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::remove_file(&temp)?;
+            sync_recovery_directory(&directory)?;
+        }
+        Ok(_) => {
+            return Err(DbError::CorruptCatalog(
+                "catalog replacement temporary path is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DbError::Io(error)),
+    }
+    Ok(())
+}
+
+fn cleanup_legacy_schema_snapshot_temps(root: &Path) -> Result<(), DbError> {
+    let schemas_root = root.join("catalog").join("schemas");
+    match fs::read_dir(&schemas_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let directory = entry.path();
+                let mut changed = false;
+                for schema_entry in fs::read_dir(&directory)? {
+                    let schema_entry = schema_entry?;
+                    if !schema_entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let filename = schema_entry.file_name();
+                    let filename = filename.to_string_lossy();
+                    if is_canonical_numbered_temp(&filename, "schema-", ".ans.tmp") {
+                        fs::remove_file(schema_entry.path())?;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    sync_recovery_directory(&directory)?;
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DbError::Io(error)),
+    }
+    Ok(())
+}
+
+fn cleanup_orphan_catalog_staging_temps(root: &Path) -> Result<(), DbError> {
+    let catalog_directory = root.join("catalog");
+    let mut catalog_changed = false;
+    for entry in fs::read_dir(&catalog_directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let filename = entry.file_name();
+        let filename = filename.to_string_lossy();
+        if is_canonical_numbered_temp(&filename, ".catalog-", ".tmp") {
+            fs::remove_file(entry.path())?;
+            catalog_changed = true;
+        }
+    }
+    if catalog_changed {
+        sync_recovery_directory(&catalog_directory)?;
+    }
+
+    let schemas_root = catalog_directory.join("schemas");
+    match fs::read_dir(&schemas_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let schema_directory = entry.path();
+                let mut changed = false;
+                for schema_entry in fs::read_dir(&schema_directory)? {
+                    let schema_entry = schema_entry?;
+                    if !schema_entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let filename = schema_entry.file_name();
+                    let filename = filename.to_string_lossy();
+                    if is_canonical_numbered_temp(&filename, ".schema-", ".tmp")
+                        || is_canonical_numbered_temp(&filename, "schema-", ".ans.tmp")
+                    {
+                        fs::remove_file(schema_entry.path())?;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    sync_recovery_directory(&schema_directory)?;
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DbError::Io(error)),
+    }
+    Ok(())
+}
+
 fn save_catalog(path: &Path, catalog: &Catalog) -> Result<(), DbError> {
     let bytes = encode_catalog_v2(catalog)?;
     let temp = path.with_extension("anc.tmp");
@@ -2241,7 +2678,16 @@ fn save_catalog(path: &Path, catalog: &Catalog) -> Result<(), DbError> {
         file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterCanonicalCatalogTempSynced,
+        );
         fs::rename(&temp, path)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterCanonicalCatalogRenamedBeforeDirectorySync,
+        );
+        if let Some(parent) = path.parent() {
+            sync_recovery_directory(parent)?;
+        }
         Ok(())
     })();
     if write_result.is_err() {
@@ -2996,7 +3442,7 @@ mod tests {
     }
 
     #[test]
-    fn nullable_column_catalog_publication_failure_keeps_old_schema_and_reports_orphan() {
+    fn nullable_column_catalog_temp_collision_fails_before_commit_without_orphan() {
         let path = temp_path();
         let mut db = Database::open(&path).unwrap();
         db.create_table("telemetry", sample_schema()).unwrap();
@@ -3012,8 +3458,9 @@ mod tests {
         assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
         assert_eq!(db.catalog_revision(), 1);
         assert_eq!(db.schema("telemetry").unwrap().len(), 3);
+        assert!(!next_snapshot.exists());
         let report = db.check_schema_snapshot_consistency().unwrap();
-        assert!(report.orphaned_files.contains(&next_snapshot));
+        assert!(report.is_clean());
 
         drop(db);
         fs::remove_file(catalog_temp).unwrap();
@@ -3021,13 +3468,12 @@ mod tests {
         assert_eq!(reopened.table_schema_revision("telemetry").unwrap(), 1);
         assert_eq!(reopened.catalog_revision(), 1);
         assert_eq!(reopened.schema("telemetry").unwrap().len(), 3);
-        assert!(reopened.check_schema_snapshot_consistency().unwrap()
-            .orphaned_files.contains(&next_snapshot));
+        assert!(reopened.check_schema_snapshot_consistency().unwrap().is_clean());
         fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
-    fn nullable_column_retry_reuses_identical_orphan_snapshot() {
+    fn nullable_column_retry_after_catalog_temp_collision() {
         let path = temp_path();
         let mut db = Database::open(&path).unwrap();
         db.create_table("telemetry", sample_schema()).unwrap();
@@ -3044,6 +3490,111 @@ mod tests {
         assert_eq!(db.catalog_revision(), 2);
         assert!(db.check_schema_snapshot_consistency().unwrap().is_clean());
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn catalog_wal_recovery_discards_uncommitted_ddl_staging_and_intents() {
+        use crate::wal_recovery::WalRecoveryCrashPoint::*;
+
+        for point in [
+            AfterStagingFileCreated,
+            AfterStagingBytesWritten,
+            AfterStagingFlush,
+            AfterStagingFileSync,
+            AfterStagingDirectorySync,
+            AfterWalBegin,
+            AfterWalMutation,
+        ] {
+            let path = temp_path();
+            let mut database = Database::open(&path).unwrap();
+            crate::wal_recovery::arm_wal_recovery_crash_point(point);
+            let interruption = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                database.create_table("telemetry", sample_schema())
+            }));
+            assert!(interruption.is_err(), "DDL pre-COMMIT checkpoint {point:?} was not reached");
+            drop(database);
+
+            let recovered = Database::open(&path).unwrap();
+            assert_eq!(recovered.catalog_revision(), 0, "at {point:?}");
+            assert!(matches!(
+                recovered.table_id("telemetry"),
+                Err(DbError::TableNotFound(_))
+            ));
+            drop(recovered);
+
+            let catalog_directory = path.join("catalog");
+            let mut stack = vec![catalog_directory.clone()];
+            while let Some(directory) = stack.pop() {
+                for entry in fs::read_dir(&directory).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        stack.push(entry.path());
+                    } else {
+                        assert!(
+                            !entry.file_name().to_string_lossy().ends_with(".tmp"),
+                            "orphan DDL staging file remained after {point:?}: {}",
+                            entry.path().display(),
+                        );
+                    }
+                }
+            }
+
+            let reopened = Database::open(&path).unwrap();
+            assert_eq!(reopened.catalog_revision(), 0);
+            assert!(matches!(
+                reopened.table_id("telemetry"),
+                Err(DbError::TableNotFound(_))
+            ));
+            drop(reopened);
+            fs::remove_dir_all(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn catalog_wal_recovery_replays_create_table_at_every_ddl_publication_boundary() {
+        use crate::wal_recovery::WalRecoveryCrashPoint::*;
+
+        for point in [
+            AfterWalCommit,
+            AfterSchemaSnapshotPublished,
+            AfterCatalogSnapshotPublished,
+            AfterCanonicalCatalogTempSynced,
+            AfterCanonicalCatalogRenamedBeforeDirectorySync,
+            AfterCanonicalCatalogPublished,
+        ] {
+            let path = temp_path();
+            let mut database = Database::open(&path).unwrap();
+            crate::wal_recovery::arm_wal_recovery_crash_point(point);
+            let interruption = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                database.create_table("telemetry", sample_schema())
+            }));
+            assert!(interruption.is_err(), "DDL checkpoint {point:?} was not reached");
+            drop(database);
+
+            let expected_schema = sample_schema();
+            let recovered = Database::open(&path).unwrap();
+            assert_eq!(recovered.schema("telemetry").unwrap(), &expected_schema, "at {point:?}");
+            assert_eq!(recovered.catalog_revision(), 1);
+            assert!(recovered.table_id("telemetry").is_ok());
+            assert!(recovered.scan("telemetry").unwrap().is_empty());
+            assert!(SchemaSnapshot::path(
+                &path,
+                recovered.table_id("telemetry").unwrap(),
+                1,
+            ).unwrap().is_file());
+            assert!(path.join("catalog").join("catalog-00000000000000000001.anc").is_file());
+            assert!(recovered.check_schema_snapshot_consistency().unwrap().is_clean());
+            drop(recovered);
+
+            // Every historical catalog mutation must remain idempotent on a
+            // second startup after the canonical catalog was recovered.
+            let reopened = Database::open(&path).unwrap();
+            assert_eq!(reopened.schema("telemetry").unwrap(), &expected_schema);
+            assert_eq!(reopened.catalog_revision(), 1);
+            assert!(reopened.check_schema_snapshot_consistency().unwrap().is_clean());
+            drop(reopened);
+            fs::remove_dir_all(path).unwrap();
+        }
     }
 
     #[test]
@@ -5093,18 +5644,25 @@ mod tests {
         let Some(operation) = std::env::var_os("ANANTA_WAL_CRASH_OPERATION") else {
             return;
         };
-        let operation = operation.to_string_lossy();
+        let operation = operation.to_string_lossy().into_owned();
         let point_name = std::env::var("ANANTA_WAL_CRASH_POINT").unwrap();
         use crate::wal_recovery::WalRecoveryCrashPoint::*;
         let point = match point_name.as_str() {
             "AfterWalMutation" => AfterWalMutation,
             "AfterWalCommit" => AfterWalCommit,
             "AfterFinalNameLinked" => AfterFinalNameLinked,
+            "AfterSchemaSnapshotPublished" => AfterSchemaSnapshotPublished,
+            "AfterCatalogSnapshotPublished" => AfterCatalogSnapshotPublished,
+            "AfterCanonicalCatalogPublished" => AfterCanonicalCatalogPublished,
+            "AfterCanonicalCatalogTempSynced" => AfterCanonicalCatalogTempSynced,
+            "AfterCanonicalCatalogRenamedBeforeDirectorySync" => AfterCanonicalCatalogRenamedBeforeDirectorySync,
             _ => panic!("unsupported subprocess crash point: {point_name}"),
         };
         let path = PathBuf::from(std::env::var_os("ANANTA_WAL_CRASH_DATABASE").unwrap());
-        crate::wal_recovery::arm_wal_recovery_crash_point(point);
+        // Open and replay pre-existing transactions before arming the hook:
+        // the checkpoint must target the operation under test, not startup.
         let mut database = Database::open(path).unwrap();
+        crate::wal_recovery::arm_wal_recovery_crash_point(point);
         let rows = vec![vec![
             Value::TimestampMicros(9_000),
             Value::Utf8(format!("subprocess-{operation}-{point_name}")),
@@ -5120,6 +5678,9 @@ mod tests {
                     BatchId::from_bytes([0xD4; 16]).unwrap(),
                     &rows,
                 ).unwrap();
+            }
+            "ddl" => {
+                database.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
             }
             _ => panic!("unsupported subprocess operation: {operation}"),
         }
@@ -5194,6 +5755,67 @@ mod tests {
         assert_recovered_artifact_inventory(&table_dir, extension, committed);
         drop(recovered_again);
         fs::remove_dir_all(path).unwrap();
+    }
+
+    fn exercise_catalog_ddl_subprocess_crash(point: &str) {
+        use std::process::Command;
+
+        let path = temp_path();
+        let mut setup = Database::open(&path).unwrap();
+        setup.create_table("telemetry", sample_schema()).unwrap();
+        drop(setup);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::wal_recovery_process_crash_worker")
+            .arg("--nocapture")
+            .env("ANANTA_WAL_CRASH_OPERATION", "ddl")
+            .env("ANANTA_WAL_CRASH_POINT", point)
+            .env("ANANTA_WAL_CRASH_DATABASE", &path)
+            .env("ANANTA_WAL_CRASH_EXIT", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86), "DDL worker did not terminate at {point}");
+
+        // The child exited without running DatabaseLock::drop.
+        fs::remove_file(path.join(".ananta.lock")).unwrap();
+
+        let recovered = Database::open(&path).unwrap();
+        assert_eq!(recovered.catalog_revision(), 2, "at {point}");
+        assert_eq!(recovered.table_schema_revision("telemetry").unwrap(), 2, "at {point}");
+        assert_eq!(recovered.schema("telemetry").unwrap().len(), 4, "at {point}");
+        assert_eq!(recovered.column_id("telemetry", "humidity").unwrap().0, 5);
+        assert!(recovered.scan("telemetry").unwrap().is_empty());
+        assert!(recovered.check_schema_snapshot_consistency().unwrap().is_clean());
+        assert!(SchemaSnapshot::path(
+            &path,
+            recovered.table_id("telemetry").unwrap(),
+            2,
+        ).unwrap().is_file());
+        assert!(path.join("catalog").join("catalog-00000000000000000002.anc").is_file());
+        drop(recovered);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.catalog_revision(), 2);
+        assert_eq!(reopened.table_schema_revision("telemetry").unwrap(), 2);
+        assert_eq!(reopened.schema("telemetry").unwrap().len(), 4);
+        assert!(reopened.check_schema_snapshot_consistency().unwrap().is_clean());
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn catalog_ddl_recovery_survives_subprocess_termination_at_publication_boundaries() {
+        for point in [
+            "AfterWalCommit",
+            "AfterSchemaSnapshotPublished",
+            "AfterCatalogSnapshotPublished",
+            "AfterCanonicalCatalogTempSynced",
+            "AfterCanonicalCatalogRenamedBeforeDirectorySync",
+            "AfterCanonicalCatalogPublished",
+        ] {
+            exercise_catalog_ddl_subprocess_crash(point);
+        }
     }
 
     #[test]

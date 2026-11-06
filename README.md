@@ -176,19 +176,13 @@ cargo run -p ananta-aql --example cost_calibration
 The example creates a deterministic 2,048-row telemetry dataset, persists ANALYZE statistics, and emits CSV comparing estimated scan/output rows and projected payload with measured decoded input/output profiles across six workloads. It reports the current configurable cost weights and elapsed time as observations; it does not automatically rewrite defaults or claim that relative cost units are milliseconds.
 
 
-The standalone ANWL WAL reader additionally tests truncated frame-body recovery, sequence-gap rejection and transaction commit-digest validation. Database write-path integration and startup replay remain M6.2 work.
+The standalone ANWL WAL reader additionally tests truncated frame-body recovery, sequence-gap rejection and transaction commit-digest validation; the current Database recovery integration and its scoped guarantees are summarised below.
 
 
-M6.2 now routes `insert_batch` and `ingest_batch` through staged, checksummed AMUT intents and durable WAL COMMIT before no-replace artifact publication. `Database::open` replays committed artifacts before rebuilding Chronicle receipts and fails closed on missing or conflicting files. Test-only interruption checkpoints cover staging writes/syncs, WAL records, final-name publication and cleanup; ANF and Chronicle restart tests reopen twice and verify idempotence. Subprocess-kill/physical power-loss tests, catalog DDL, compaction/Weave WAL intents and checkpoint/rotation remain outstanding. See `docs/specifications/wal-recovery-v0.1.md`.
+M6.2 now WAL-protects immutable ANF inserts, Chronicle ingests, table creation, nullable-column addition, column rename and column reorder. DDL writes schema and versioned catalog snapshots as a single multi-intent WAL transaction; startup replays them in log order before resolving later data mutations. Deterministic in-process crash tests cover all ANF/Chronicle write boundaries and six DDL publication/replacement boundaries; subprocess-exit tests cover critical ANF, Chronicle and all six DDL boundaries. These tests have not yet been executed in this environment. Compaction/Weave/Capsule/Navigation Map WAL intents, full remaining subprocess/filesystem fault coverage, checkpoint installation, WAL rotation and retention remain outstanding. General multi-operation ACID semantics are not claimed. See `docs/specifications/wal-recovery-v0.1.md`.
 
 
-M6.2 now includes typed AMUT v1 mutation intents and a tested recovery-plan classifier for committed, incomplete and aborted WAL transactions. These are primitives only; Database::open replay and ANF/Chronicle mutation-path integration remain in progress.
-
-
-M6.2 now has reusable staged-artifact publication and WAL replay-plan helpers, including streaming SHA-256 verification and idempotent final-name publication. They are not yet wired into Database::open or insert/ingest; no crash-recovery guarantee is claimed yet.
-
-
-M6.2 now connects the WAL to initial immutable ANF inserts and Chronicle ingests. Database startup replays committed artifact intents before rebuilding Chronicle receipt indexes; uncommitted staging is discarded and explicitly aborted. See docs/specifications/wal-recovery-v0.1.md for the current scope and remaining crash points. This is not yet general ACID transaction support.
+M6.2 now connects the WAL to immutable ANF inserts, Chronicle ingests and supported catalog DDL. Database startup replays committed artifact intents in WAL order before rebuilding Chronicle receipt indexes and resolving later mutations; uncommitted staging is discarded and explicitly aborted. See docs/specifications/wal-recovery-v0.1.md for the current scope and remaining crash points. This is not general ACID transaction support.
 
 
 The M6.2 write path also synchronises the WAL parent directory after header creation and the data/table directories before staged artifact publication, on platforms that support directory fsync.

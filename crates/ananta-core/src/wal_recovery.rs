@@ -1,9 +1,10 @@
-//! Typed mutation intents and recovery-plan construction for the ANWL log.
+//! Typed mutation intents, immutable artifact publication and recovery-plan
+//! construction for the ANWL log.
 //!
-//! This module does not publish files or mutate the database. It validates the
-//! WAL payload contract and classifies committed versus incomplete transactions
-//! so Database::open can apply the recovery protocol without reinterpreting
-//! opaque payload bytes at every call site.
+//! This module validates the WAL payload contract and provides generic staging,
+//! no-replace publication, cleanup and replay helpers. Database::open supplies
+//! database-specific directory routing and applies catalog/schema state in WAL
+//! order without reinterpreting opaque payload bytes at every call site.
 
 use crate::wal::{WalReadReport, WalRecordKind, WalWriter};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +22,8 @@ const INTENT_LEN: usize = 4 + 2 + 1 + 8 + 8 + 8 + 8 + 32;
 pub enum WalArtifactKind {
     AnfSegment = 1,
     ChronicleRecord = 2,
+    SchemaSnapshot = 3,
+    CatalogSnapshot = 4,
 }
 
 impl WalArtifactKind {
@@ -28,6 +31,8 @@ impl WalArtifactKind {
         match value {
             1 => Ok(Self::AnfSegment),
             2 => Ok(Self::ChronicleRecord),
+            3 => Ok(Self::SchemaSnapshot),
+            4 => Ok(Self::CatalogSnapshot),
             _ => Err(WalRecoveryError::CorruptIntent("unknown artifact kind")),
         }
     }
@@ -36,6 +41,8 @@ impl WalArtifactKind {
         match self {
             Self::AnfSegment => format!("segment-{file_id:020}.anf"),
             Self::ChronicleRecord => format!("segment-{file_id:020}.chr"),
+            Self::SchemaSnapshot => format!("schema-{file_id:020}.ans"),
+            Self::CatalogSnapshot => format!("catalog-{file_id:020}.anc"),
         }
     }
 
@@ -43,6 +50,8 @@ impl WalArtifactKind {
         match self {
             Self::AnfSegment => format!(".segment-{file_id:020}.tmp"),
             Self::ChronicleRecord => format!(".chronicle-{file_id:020}.tmp"),
+            Self::SchemaSnapshot => format!(".schema-{file_id:020}.tmp"),
+            Self::CatalogSnapshot => format!(".catalog-{file_id:020}.tmp"),
         }
     }
 }
@@ -265,6 +274,11 @@ pub(crate) enum WalRecoveryCrashPoint {
     AfterPublishDirectorySync,
     AfterStagingNameRemoved,
     AfterCleanupDirectorySync,
+    AfterSchemaSnapshotPublished,
+    AfterCatalogSnapshotPublished,
+    AfterCanonicalCatalogPublished,
+    AfterCanonicalCatalogTempSynced,
+    AfterCanonicalCatalogRenamedBeforeDirectorySync,
 }
 
 #[cfg(test)]
@@ -551,6 +565,50 @@ fn verify_artifact_identity(
             if metadata.schema_revision != intent.schema_revision {
                 return Err(WalRecoveryError::ChronicleCorrupt(
                     "record schema revision differs from committed WAL intent",
+                ));
+            }
+        }
+        WalArtifactKind::SchemaSnapshot => {
+            let metadata = fs::metadata(path).map_err(io_error)?;
+            if metadata.len() > crate::schema_snapshot::MAX_SNAPSHOT_BYTES {
+                return Err(WalRecoveryError::FileConflict(
+                    "schema snapshot exceeds size limit",
+                ));
+            }
+            let capacity = usize::try_from(metadata.len())
+                .map_err(|_| WalRecoveryError::FileConflict("schema snapshot length is too large"))?;
+            let mut bytes = Vec::with_capacity(capacity);
+            File::open(path).map_err(io_error)?.read_to_end(&mut bytes).map_err(io_error)?;
+            let snapshot = crate::schema_snapshot::SchemaSnapshot::decode(&bytes)
+                .map_err(|_| WalRecoveryError::FileConflict("schema snapshot is invalid"))?;
+            if snapshot.table_id().0 != intent.table_id
+                || snapshot.revision() != intent.schema_revision
+                || intent.file_id != intent.schema_revision
+            {
+                return Err(WalRecoveryError::FileConflict(
+                    "schema snapshot identity differs from committed WAL intent",
+                ));
+            }
+        }
+        WalArtifactKind::CatalogSnapshot => {
+            let metadata = fs::metadata(path).map_err(io_error)?;
+            if metadata.len() > crate::MAX_CATALOG_BYTES {
+                return Err(WalRecoveryError::FileConflict(
+                    "catalog snapshot exceeds size limit",
+                ));
+            }
+            let capacity = usize::try_from(metadata.len())
+                .map_err(|_| WalRecoveryError::FileConflict("catalog snapshot length is too large"))?;
+            let mut bytes = Vec::with_capacity(capacity);
+            File::open(path).map_err(io_error)?.read_to_end(&mut bytes).map_err(io_error)?;
+            let catalog = crate::decode_catalog_v2(&bytes)
+                .map_err(|_| WalRecoveryError::FileConflict("catalog snapshot is invalid"))?;
+            let table_matches = catalog.tables.values().any(|table| {
+                table.id.0 == intent.table_id && table.schema_revision == intent.schema_revision
+            });
+            if catalog.revision != intent.file_id || !table_matches {
+                return Err(WalRecoveryError::FileConflict(
+                    "catalog snapshot identity differs from committed WAL intent",
                 ));
             }
         }
