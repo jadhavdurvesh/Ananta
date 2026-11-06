@@ -220,7 +220,8 @@ mod tests{
         assert_eq!(time_bucket_start(10,10,0).unwrap(),10);
         assert_eq!(time_bucket_start(9,10,3).unwrap(),3);
         assert!(time_bucket_start(1,0,0).is_err());
-        assert!(time_bucket_start(i64::MAX,2,0).is_err());
+        assert_eq!(time_bucket_start(i64::MAX,2,0).unwrap(),i64::MAX-1);
+        assert!(time_bucket_start(i64::MAX,2,i64::MIN).is_err());
     }
     #[test]
     fn range_is_lower_inclusive_upper_exclusive_and_null_safe(){
