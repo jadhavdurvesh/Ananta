@@ -6341,6 +6341,8 @@ mod tests {
             "AfterCanonicalCatalogPublished" => AfterCanonicalCatalogPublished,
             "AfterCanonicalCatalogTempSynced" => AfterCanonicalCatalogTempSynced,
             "AfterCanonicalCatalogRenamedBeforeDirectorySync" => AfterCanonicalCatalogRenamedBeforeDirectorySync,
+            "AfterCheckpointManifestTempSynced" => AfterCheckpointManifestTempSynced,
+            "AfterCheckpointManifestPublished" => AfterCheckpointManifestPublished,
             "AfterCheckpointTempSynced" => AfterCheckpointTempSynced,
             "AfterCheckpointRenamedBeforeDirectorySync" => AfterCheckpointRenamedBeforeDirectorySync,
             "AfterCheckpointDirectorySync" => AfterCheckpointDirectorySync,
@@ -6723,6 +6725,7 @@ mod tests {
             .arg("tests::wal_recovery_process_crash_worker")
             .arg("--nocapture")
             .env("ANANTA_WAL_CRASH_OPERATION", "lock-probe")
+            .env("ANANTA_WAL_CRASH_POINT", "AfterWalCommit")
             .env("ANANTA_WAL_CRASH_DATABASE", &root)
             .status()
             .unwrap();
@@ -6735,6 +6738,8 @@ mod tests {
 
     #[test]
     fn checkpoint_wal_replacement_survives_subprocess_crashes() {
+        exercise_checkpoint_process_crash("AfterCheckpointManifestTempSynced", false);
+        exercise_checkpoint_process_crash("AfterCheckpointManifestPublished", false);
         exercise_checkpoint_process_crash("AfterCheckpointTempSynced", false);
         exercise_checkpoint_process_crash("AfterCheckpointRenamedBeforeDirectorySync", true);
         exercise_checkpoint_process_crash("AfterCheckpointDirectorySync", true);
