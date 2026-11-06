@@ -623,6 +623,7 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 - [x] Implement safe LIMIT pushdown when no filter can discard rows.
 - [x] Add physical EXPLAIN output.
 - [x] Add table/column analysis statistics (explicit bounded scan; exact null/min/max, approximate distinct).
+- [x] Bind analysis statistics to table/schema identity and immutable scan-inventory fingerprint; reject stale statistics after writes/Weave changes.
 - [x] Add initial heuristic cardinality and projected-byte estimates with explicit provenance.
 - [x] Refine equality, NULL and numeric range selectivity using analyzed NDV, null fraction and min/max statistics.
 - [ ] Persist statistics and use histograms for cost-based selectivity.

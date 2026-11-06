@@ -24,6 +24,11 @@ pub struct ColumnStatistics {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableStatistics {
     pub table_name: String,
+    pub table_id: u64,
+    pub schema_revision: u64,
+    /// Fingerprint of the immutable scan-file inventory and active Weave identity
+    /// at analysis time. EXPLAIN rejects the statistics if this token has changed.
+    pub snapshot_token: [u8; 32],
     pub scanned_rows: u64,
     pub estimated_batch_payload_bytes: u64,
     pub chronicle_accepted_rows: u64,
@@ -206,6 +211,9 @@ pub fn analyze_table(
         ));
     }
     let schema = database.schema(table)?;
+    let table_id = database.table_id(table)?.0;
+    let schema_revision = database.table_schema_revision(table)?;
+    let snapshot_token = database.table_scan_snapshot_token(table)?;
     let mut columns = schema.columns().iter().cloned()
         .map(ColumnAccumulator::new)
         .collect::<Vec<_>>();
@@ -227,9 +235,18 @@ pub fn analyze_table(
             }
         }
     }
+    let final_snapshot_token = database.table_scan_snapshot_token(table)?;
+    if final_snapshot_token != snapshot_token {
+        return Err(ExecutionError::InvalidPlan(
+            "table scan inventory changed during analysis; rerun table analysis".into(),
+        ));
+    }
     let ingestion = database.ingestion_stats(table)?;
     Ok(TableStatistics {
         table_name: table.to_owned(),
+        table_id,
+        schema_revision,
+        snapshot_token,
         scanned_rows,
         estimated_batch_payload_bytes,
         chronicle_accepted_rows: ingestion.accepted_rows,

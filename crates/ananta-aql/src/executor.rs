@@ -390,10 +390,22 @@ pub fn explain_with_statistics(
     let table_statistics = match table_statistics {
         Some(statistics)
             if statistics.table_name == table
+                && statistics.table_id == database.table_id(&table).map_err(from_storage_error)?.0
+                && statistics.schema_revision == database.table_schema_revision(&table).map_err(from_storage_error)?
                 && statistics.columns.len() == schema.len()
                 && statistics.columns.iter().zip(schema.columns())
                     .all(|(stats, column)| stats.column == *column) =>
         {
+            let current_snapshot = database
+                .table_scan_snapshot_token(&table)
+                .map_err(from_storage_error)?;
+            if statistics.snapshot_token != current_snapshot {
+                return Err(query_error(
+                    AqlErrorCode::InvalidQuery,
+                    "EXPLAIN statistics are stale because table data or active Weave changed; rerun analyze_table",
+                    select.source.span,
+                ));
+            }
             Some(statistics)
         }
         Some(_) => {
@@ -1798,6 +1810,29 @@ mod tests {
             &ParameterBindings::default(),
             true,
             Some(&stale),
+        );
+        assert_eq!(result.unwrap_err().code, AqlErrorCode::InvalidQuery);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explain_rejects_stale_statistics_after_a_new_segment_is_published() {
+        let (mut db, root, _) = fixture();
+        let table_stats = ananta_execution::analyze_table(&db, "telemetry", 2).unwrap();
+        db.insert_batch("telemetry", &[vec![
+            Value::TimestampMicros(500),
+            Value::Utf8("e".into()),
+            Value::Float64(35.0),
+            Value::Boolean(true),
+        ]]).unwrap();
+        let query = crate::parse("SELECT device FROM telemetry").unwrap();
+        let result = explain_with_statistics(
+            &db,
+            &query,
+            &ParameterBindings::default(),
+            true,
+            Some(&table_stats),
         );
         assert_eq!(result.unwrap_err().code, AqlErrorCode::InvalidQuery);
         drop(db);

@@ -5,6 +5,7 @@ use crate::{DbError, Database, TableDefinition};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 const MAGIC: &[u8; 4] = b"AWP1";
 const END: &[u8; 4] = b"AEND";
@@ -199,6 +200,51 @@ impl Database {
             publish_pointer(&root, &fallback)?;
         }
         Ok(())
+    }
+
+    /// Stable metadata fingerprint for the logical scan inventory of a table.
+    ///
+    /// ANF/Chronicle and active Weave artifacts are immutable once published;
+    /// the token includes their sorted names, sizes and modification timestamps,
+    /// together with table/schema and active-Weave identity. It is designed to
+    /// invalidate explicit ANALYZE statistics after normal database writes or
+    /// compaction publication without reading the table payload a second time.
+    pub fn table_scan_snapshot_token(&self, table: &str) -> Result<[u8; 32], DbError> {
+        let definition = self.catalog.tables.get(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
+        let mut identity = Vec::new();
+        identity.extend_from_slice(&definition.id.0.to_le_bytes());
+        identity.extend_from_slice(&definition.schema_revision.to_le_bytes());
+
+        let table_dir = self.root.join("data").join(table);
+        let weave_root = table_dir.join("weaves");
+        if let Some(pointer) = read_pointer(&weave_root, definition.id.0)? {
+            identity.push(1);
+            identity.extend_from_slice(&pointer.revision.to_le_bytes());
+            identity.extend_from_slice(&pointer.active.weave_id.to_le_bytes());
+            identity.extend_from_slice(&pointer.active.generation.to_le_bytes());
+            identity.extend_from_slice(&pointer.active.manifest_sha256);
+        } else {
+            identity.push(0);
+        }
+
+        let mut paths = self.list_table_scan_paths(table, definition)?;
+        paths.sort();
+        for path in paths {
+            let metadata = fs::metadata(&path)?;
+            let name = path.file_name()
+                .ok_or(DbError::CompactionPreflight("scan path has no file name"))?
+                .to_string_lossy();
+            let name_bytes = name.as_bytes();
+            let name_len = u64::try_from(name_bytes.len()).map_err(|_| DbError::LengthOverflow)?;
+            identity.extend_from_slice(&name_len.to_le_bytes());
+            identity.extend_from_slice(name_bytes);
+            identity.extend_from_slice(&metadata.len().to_le_bytes());
+            let modified = metadata.modified()?.duration_since(UNIX_EPOCH).unwrap_or_default();
+            identity.extend_from_slice(&modified.as_secs().to_le_bytes());
+            identity.extend_from_slice(&modified.subsec_nanos().to_le_bytes());
+        }
+        Ok(sha256(&identity))
     }
 
     pub(super) fn list_table_scan_paths(
