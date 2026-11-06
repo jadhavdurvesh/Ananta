@@ -709,8 +709,9 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Integrate Capsule publication with explicit WAL intent, immutable Capsule ID/generation naming, format/identity verification and startup redo.
 - [x] Integrate Navigation Map publication with explicit WAL intent, map identity verification, and referenced Capsule length/SHA-256/metadata validation during redo.
 - [x] Add post-COMMIT interruption/reopen/idempotence coverage for Capsule and Navigation Map publication.
+- [x] Add subprocess crash/reopen coverage for Capsule and Navigation Map at WAL MUTATION, durable COMMIT and final-name link; verify data, artifacts, consistency and a second reopen.
 - [ ] Add checkpoint installation, WAL rotation and retention only after replay coverage is proven.
-- [ ] Complete subprocess termination coverage for every Capsule/Navigation Map stage, sync, publication and cleanup boundary; add broader filesystem fault injection.
+- [ ] Extend Capsule/Navigation Map subprocess coverage to every staging/sync/cleanup checkpoint and add broader filesystem fault injection.
 
 **Guarantee boundary:** ANF insert, Chronicle ingest, table creation, nullable-column addition, column rename, column reorder, active Weave promotion/rollback/fallback pointers, immutable compaction candidate-directory/OWM publication, Capsule publication and Navigation Map publication use WAL-backed redo. Capsule intent uses the AMUT v1 revision field for its independent generation; the embedded Capsule header retains and validates the logical schema revision. Navigation Map redo verifies all referenced immutable Capsule files before accepting the map. General multi-operation application transactions remain outside this boundary; do not claim general ACID semantics.
 
