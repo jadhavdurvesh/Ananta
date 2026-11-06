@@ -339,6 +339,20 @@ mod tests{
         assert_eq!(result.rows().next().unwrap(),vec![Value::Int64(0),Value::Null,Value::Null]);
     }
     #[test]
+    fn sum_of_all_null_values_is_null_and_int_overflow_is_rejected(){
+        let all_null=batch(&[[Value::Utf8("x".into()),Value::Null,Value::Null]]);
+        let result=aggregate_batches(vec![Ok(all_null.clone())],&all_null.schema,&[],
+            &[AggregateSpec::new(AggregateKind::Sum,1,"total")],&ExecutionContext::default()).unwrap();
+        assert_eq!(result.rows().next().unwrap(),vec![Value::Null]);
+
+        let schema=vec![Column::new("v",DataType::Int64,false)];
+        let columns=vec![Vector::new(schema[0].clone(),vec![Value::Int64(i64::MAX),Value::Int64(1)]).unwrap()];
+        let overflow=VectorBatch::try_new(columns,2).unwrap();
+        assert!(matches!(aggregate_batches(vec![Ok(overflow.clone())],&schema,&[],
+            &[AggregateSpec::new(AggregateKind::Sum,0,"total")],&ExecutionContext::default()),
+            Err(ExecutionError::Arithmetic(_))));
+    }
+    #[test]
     fn group_and_memory_limits_fail_without_dropping_rows(){
         let input=batch(&[
             [Value::Utf8("a".into()),Value::Int64(1),Value::Float64(1.0)],
