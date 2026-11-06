@@ -1234,11 +1234,17 @@ impl Database {
             let mut removed_orphans = false;
             for entry in entries {
                 let entry = entry?;
-                if !entry.file_type()?.is_file() {
-                    continue;
-                }
                 let filename = entry.file_name();
                 let filename = filename.to_string_lossy().into_owned();
+                let is_candidate_name = filename.starts_with("candidate-") && filename.ends_with(".owm");
+                if !entry.file_type()?.is_file() {
+                    if is_candidate_name {
+                        return Err(DbError::CompactionPreflight(
+                            "versioned candidate manifest is not a regular file",
+                        ));
+                    }
+                    continue;
+                }
                 if let Some(number) = filename.strip_prefix(".candidate-").and_then(|v| v.strip_suffix(".tmp")) {
                     let canonical = number.len() == 20
                         && number.bytes().all(|byte| byte.is_ascii_digit())
