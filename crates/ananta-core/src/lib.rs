@@ -793,7 +793,7 @@ impl Database {
             current.last_sequence,
             self.catalog.revision,
         ).map_err(|error| DbError::Wal(format!("checkpoint snapshot failed: {error}")))?;
-        if let Err(error) = self.wal.replace_with_checkpoint(&reference.encode()) {
+        if let Err(error) = self.wal.replace_with_checkpoint(current.last_sequence, &reference.encode()) {
             if matches!(&error, WalError::Io(io_error) if io_error.kind() == std::io::ErrorKind::Unsupported) {
                 return Err(DbError::Wal(error.to_string()));
             }
@@ -805,7 +805,10 @@ impl Database {
         let rotated = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
         validate_checkpoint_records(&self.root, &rotated, &self.catalog)?;
-        if rotated.records.len() != 1 || rotated.last_sequence != 1 || !rotated.is_clean() {
+        if rotated.records.len() != 1
+            || rotated.last_sequence != current.last_sequence.saturating_add(1)
+            || !rotated.is_clean()
+        {
             self.recovery_required = true;
             return Err(DbError::RecoveryRequired(
                 "rotated WAL did not reopen as a clean checkpoint anchor".into(),
@@ -2824,7 +2827,7 @@ fn validate_checkpoint_records(
         return Ok(());
     }
     if checkpoints.len() != 1 || report.records.first().map_or(true, |record| {
-        record.sequence != 1 || record.kind != WalRecordKind::Checkpoint
+        record.kind != WalRecordKind::Checkpoint
     }) || checkpoints[0].transaction_id != 0
     {
         return Err(DbError::Wal(
@@ -2862,6 +2865,11 @@ fn validate_checkpoint_records(
         &checkpoints[0].payload,
         &permitted_changed_paths,
     ).map_err(|error| DbError::Wal(format!("checkpoint validation failed: {error}")))?;
+    if checkpoints[0].sequence != checkpoint.base_sequence.checked_add(1).ok_or(DbError::LengthOverflow)? {
+        return Err(DbError::Wal(
+            "checkpoint WAL sequence does not follow its declared base sequence".into(),
+        ));
+    }
     if checkpoint.catalog_revision > catalog.revision {
         return Err(DbError::Wal(
             "checkpoint catalog revision is newer than the loaded database catalog".into(),
@@ -6796,6 +6804,7 @@ mod tests {
         let rotated = read_wal(path.join("wal").join("database.anwl")).unwrap();
         assert_eq!(rotated.records.len(), 1);
         assert_eq!(rotated.records[0].kind, WalRecordKind::Checkpoint);
+        assert_eq!(rotated.records[0].sequence, checkpoint.base_sequence + 1);
         assert!(rotated.is_clean());
 
         db.ingest_batch(
