@@ -284,6 +284,11 @@ pub(crate) fn maybe_crash_after(point: WalRecoveryCrashPoint) {
     WAL_RECOVERY_CRASH_POINT.with(|armed| {
         if armed.get() == Some(point) {
             armed.set(None);
+            if std::env::var_os("ANANTA_WAL_CRASH_EXIT").is_some() {
+                // Exit without Rust destructors so the parent process can
+                // observe a genuinely abandoned database lock and WAL state.
+                std::process::exit(86);
+            }
             panic!("simulated process interruption at {point:?}");
         }
     });
