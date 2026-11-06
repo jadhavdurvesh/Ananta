@@ -1,6 +1,7 @@
-use ananta_core::{Database, DbError, RecordBatch, ScanBatchIter};
+use ananta_core::{CapsuleScanDiagnostics, CapsuleScanRequest, ColumnRangePredicate, Database, DbError, RecordBatch, ScanBatchIter};
 use ananta_types::{Column, DataType, Value};
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
@@ -209,6 +210,11 @@ pub struct ExecutionProfile {
     pub decoded_value_bytes_estimate: u64,
     pub output_value_bytes_estimate: u64,
     pub elapsed_micros: u64,
+    pub capsules_considered: u64,
+    pub capsules_skipped: u64,
+    pub capsules_read: u64,
+    pub capsule_bytes_verified: u64,
+    pub capsule_payload_bytes_decoded: u64,
 }
 #[derive(Clone)]
 pub struct ExecutionContext {
@@ -256,6 +262,15 @@ impl ExecutionContext {
     fn record_filtered(&self, rows: usize) {
         if let Ok(mut profile) = self.profile.lock() {
             profile.filtered_rows = profile.filtered_rows.saturating_add(rows as u64);
+        }
+    }
+    fn record_capsule_scan(&self, diagnostics:&CapsuleScanDiagnostics) {
+        if let Ok(mut profile)=self.profile.lock() {
+            profile.capsules_considered=profile.capsules_considered.saturating_add(diagnostics.capsules_considered);
+            profile.capsules_skipped=profile.capsules_skipped.saturating_add(diagnostics.capsules_skipped);
+            profile.capsules_read=profile.capsules_read.saturating_add(diagnostics.capsules_read);
+            profile.capsule_bytes_verified=profile.capsule_bytes_verified.saturating_add(diagnostics.bytes_verified);
+            profile.capsule_payload_bytes_decoded=profile.capsule_payload_bytes_decoded.saturating_add(diagnostics.payload_bytes_decoded);
         }
     }
 }
@@ -306,6 +321,85 @@ impl PhysicalOperator for ScanOperator {
                 Err(error.into())
             }
             None => { self.terminal = true; Ok(None) }
+        }
+    }
+}
+
+
+/// Bounded-output adapter for a complete, validated Capsule inventory. The
+/// underlying Capsule scan materialises its selected result, so both the
+/// accepted source-row count and the estimated selected bytes are checked
+/// before the result is split into independently owned output batches.
+pub struct CapsuleScanOperator {
+    batches:VecDeque<VectorBatch>,
+    schema:Vec<Column>,
+    diagnostics:CapsuleScanDiagnostics,
+    terminal:bool,
+}
+impl CapsuleScanOperator {
+    pub fn new(
+        database:&Database,
+        table:&str,
+        columns:&[&str],
+        range:ColumnRangePredicate,
+        navigation_map_generation:u64,
+        batch_rows:usize,
+        max_materialized_rows:u64,
+        max_materialized_bytes:usize,
+    )->Result<Self,ExecutionError>{
+        if columns.is_empty()||batch_rows==0||batch_rows>DEFAULT_MAX_BATCH_ROWS{
+            return Err(ExecutionError::InvalidLimits);
+        }
+        let ingestion=database.ingestion_stats(table)?;
+        if ingestion.accepted_rows>max_materialized_rows{
+            return Err(ExecutionError::ResourceLimit("Capsule result exceeds materialisation row cap"));
+        }
+        if !database.capsules_cover_chronicle(table)?{
+            return Err(ExecutionError::ResourceLimit("Capsule inventory does not cover the complete Chronicle table"));
+        }
+        let schema=database.schema(table)?.columns().to_vec();
+        let output_schema=columns.iter().map(|name|schema.iter().find(|column|column.name==**name)
+            .cloned().ok_or_else(||ExecutionError::Storage(format!("Capsule projection column not found: {name}"))))
+            .collect::<Result<Vec<_>,_>>()?;
+        let request=CapsuleScanRequest{ranges:vec![range],projection:Some(columns.iter().map(|name|(*name).to_owned()).collect())};
+        let scanned=database.scan_capsules(table,&request,Some(navigation_map_generation))?;
+        if scanned.rows.len() as u64>max_materialized_rows{
+            return Err(ExecutionError::ResourceLimit("Capsule result exceeds materialisation row cap"));
+        }
+        let estimated=scanned.rows.iter().flatten().fold(0usize,|total,value|{
+            total.saturating_add(match value{Value::Utf8(v)=>v.len(),Value::Binary(v)=>v.len(),_=>16})
+        });
+        if estimated>max_materialized_bytes{
+            return Err(ExecutionError::ResourceLimit("Capsule result exceeds materialisation byte cap"));
+        }
+        let mut batches=VecDeque::new();
+        for chunk in scanned.rows.chunks(batch_rows){
+            let mut vectors=Vec::with_capacity(output_schema.len());
+            for (column_index,field) in output_schema.iter().enumerate(){
+                let values=chunk.iter().map(|row|row.get(column_index).cloned()
+                    .ok_or_else(||ExecutionError::InvalidBatch("Capsule row width differs from projection".into())))
+                    .collect::<Result<Vec<_>,_>>()?;
+                vectors.push(Vector::new(field.clone(),values)?);
+            }
+            batches.push_back(VectorBatch::try_new(vectors,chunk.len())?);
+        }
+        Ok(Self{batches,schema:output_schema,diagnostics:scanned.diagnostics,terminal:false})
+    }
+    pub fn diagnostics(&self)->&CapsuleScanDiagnostics{&self.diagnostics}
+}
+impl PhysicalOperator for CapsuleScanOperator {
+    fn schema(&self)->&[Column]{&self.schema}
+    fn next_batch(&mut self,context:&ExecutionContext)->Result<Option<VectorBatch>,ExecutionError>{
+        if self.terminal{return Ok(None);}
+        context.check_cancelled()?;
+        if let Some(batch)=self.batches.pop_front(){
+            context.limits.check_batch(&batch)?;
+            context.record_input(&batch);
+            Ok(Some(batch))
+        }else{
+            self.terminal=true;
+            context.record_capsule_scan(&self.diagnostics);
+            Ok(None)
         }
     }
 }
