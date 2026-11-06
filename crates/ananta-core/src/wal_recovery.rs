@@ -250,6 +250,49 @@ pub fn build_recovery_plan(report: &WalReadReport) -> Result<WalRecoveryPlan, Wa
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+
+/// Deterministic interruption points used only by the recovery test suite.
+/// These checkpoints deliberately sit after durable/visible filesystem steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalRecoveryCrashPoint {
+    AfterStagingFileCreated,
+    AfterStagingBytesWritten,
+    AfterStagingFlush,
+    AfterStagingFileSync,
+    AfterStagingDirectorySync,
+    AfterWalBegin,
+    AfterWalMutation,
+    AfterWalCommit,
+    AfterFinalNameLinked,
+    AfterPublishDirectorySync,
+    AfterStagingNameRemoved,
+    AfterCleanupDirectorySync,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static WAL_RECOVERY_CRASH_POINT: std::cell::Cell<Option<WalRecoveryCrashPoint>> =
+        std::cell::Cell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn arm_wal_recovery_crash_point(point: WalRecoveryCrashPoint) {
+    WAL_RECOVERY_CRASH_POINT.with(|armed| armed.set(Some(point)));
+}
+
+#[inline]
+pub(crate) fn maybe_crash_after(point: WalRecoveryCrashPoint) {
+    #[cfg(test)]
+    WAL_RECOVERY_CRASH_POINT.with(|armed| {
+        if armed.get() == Some(point) {
+            armed.set(None);
+            panic!("simulated process interruption at {point:?}");
+        }
+    });
+    #[cfg(not(test))]
+    let _ = point;
+}
+
 pub struct WalRecoverySummary {
     pub committed_artifacts_published_or_verified: u64,
     pub incomplete_artifacts_discarded: u64,
@@ -333,11 +376,16 @@ pub fn stage_wal_artifact(
         .create_new(true)
         .open(&staging_path)
         .map_err(io_error)?;
+    maybe_crash_after(WalRecoveryCrashPoint::AfterStagingFileCreated);
     let write_result = (|| {
         file.write_all(bytes)?;
+        maybe_crash_after(WalRecoveryCrashPoint::AfterStagingBytesWritten);
         file.flush()?;
+        maybe_crash_after(WalRecoveryCrashPoint::AfterStagingFlush);
         file.sync_all()?;
+        maybe_crash_after(WalRecoveryCrashPoint::AfterStagingFileSync);
         sync_recovery_directory(directory)?;
+        maybe_crash_after(WalRecoveryCrashPoint::AfterStagingDirectorySync);
         Ok::<(), std::io::Error>(())
     })();
     drop(file);
@@ -366,7 +414,9 @@ pub fn publish_staged_wal_artifact(
         if staging_path.exists() {
             verify_intent_file(&staging_path, intent)?;
             fs::remove_file(&staging_path).map_err(io_error)?;
+            maybe_crash_after(WalRecoveryCrashPoint::AfterStagingNameRemoved);
             sync_recovery_directory(directory).map_err(io_error)?;
+            maybe_crash_after(WalRecoveryCrashPoint::AfterCleanupDirectorySync);
         }
         return Ok(final_path);
     }
@@ -382,11 +432,15 @@ pub fn publish_staged_wal_artifact(
         }
         Err(error) => return Err(io_error(error)),
     }
+    maybe_crash_after(WalRecoveryCrashPoint::AfterFinalNameLinked);
     sync_recovery_directory(directory).map_err(io_error)?;
+    maybe_crash_after(WalRecoveryCrashPoint::AfterPublishDirectorySync);
     verify_intent_file(&final_path, intent)?;
     if staging_path.exists() {
         fs::remove_file(&staging_path).map_err(io_error)?;
+        maybe_crash_after(WalRecoveryCrashPoint::AfterStagingNameRemoved);
         sync_recovery_directory(directory).map_err(io_error)?;
+        maybe_crash_after(WalRecoveryCrashPoint::AfterCleanupDirectorySync);
     }
     Ok(final_path)
 }
