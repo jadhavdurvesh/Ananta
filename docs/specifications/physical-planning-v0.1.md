@@ -85,3 +85,8 @@ Tests compare native execution with optimizer-disabled reference execution on su
 - Adaptive runtime re-optimization.
 - Capsule coverage inference or unsafe implicit Capsule substitution.
 - Distributed query planning.
+
+
+## Database-managed analysis cache
+
+`analyze_table_and_persist` writes a versioned checksummed statistics snapshot to the database-managed per-table cache path using an atomic temporary-file publication. `load_table_statistics` checks table identity, schema revision, logical column descriptors and immutable scan-inventory fingerprint. Missing or stale files are treated as unavailable. AQL `EXPLAIN` automatically reuses a fresh cache when the caller has not supplied explicit statistics; it never initiates a full table scan to gather statistics. Applications can explicitly rerun analysis after writes to refresh the cache.

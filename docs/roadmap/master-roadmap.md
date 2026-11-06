@@ -629,6 +629,7 @@ Specification: docs/specifications/time-series-execution-v0.1.md.
 - [x] Add versioned, checksummed statistics snapshot encode/decode, atomic save/load, and a database-managed cache path.
 - [x] Build bounded deterministic sample histograms (256-value sample, up to 16 buckets) and use them for numeric/timestamp range selectivity.
 - [x] Add explicit analyze-and-persist and load-if-fresh APIs for the database-managed statistics cache.
+- [x] Reuse a fresh database-managed statistics snapshot automatically in EXPLAIN without triggering an implicit full-table analysis scan.
 - [ ] Automatically refresh analysis after writes / persist analysis metadata in the catalog and implement a broader cost-based physical planner.
 - [x] Integrate time/Capsule pruning and exact-row reporting behind verified Chronicle sequence/row coverage, legacy-ANF exclusion, map-generation and materialisation-limit gates.
 - [x] Add optimizer-disabled reference execution and compare simple optimized query results.

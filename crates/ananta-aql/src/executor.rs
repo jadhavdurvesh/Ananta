@@ -387,7 +387,17 @@ pub fn explain_with_statistics(
         schema.columns().iter().map(|column| column.name.clone()).collect::<Vec<_>>()
     };
     let ingestion = database.ingestion_stats(&table).map_err(from_storage_error)?;
-    let table_statistics = match table_statistics {
+    // Prefer explicitly supplied analysis results; otherwise load the
+    // database-managed snapshot only if it still matches the current table.
+    // This never performs a full analysis scan inside EXPLAIN.
+    let cached_statistics = if table_statistics.is_none() {
+        ananta_execution::load_table_statistics(database, &table)
+            .map_err(from_execution_error)?
+    } else {
+        None
+    };
+    let statistics_to_use = table_statistics.or(cached_statistics.as_ref());
+    let table_statistics = match statistics_to_use {
         Some(statistics)
             if statistics.table_name == table
                 && statistics.table_id == database.table_id(&table).map_err(from_storage_error)?.0
@@ -1813,6 +1823,14 @@ mod tests {
         assert_eq!(analyzed_plan.estimated_output_rows, Some(2));
         assert!(analyzed_plan.estimated_projected_payload_bytes.unwrap() > 0);
         assert!(analyzed_plan.explain().contains("native vector predicate"));
+
+        // ANALYZE persists a versioned cache; ordinary EXPLAIN reuses it
+        // without rescanning the table, but the cache is validated against
+        // the current immutable scan inventory before use.
+        ananta_execution::analyze_table_and_persist(&db, "telemetry", 2).unwrap();
+        let cached_plan = explain(&db, &query, &ParameterBindings::default(), true).unwrap();
+        assert_eq!(cached_plan.estimated_rows_after_filter, Some(2));
+        assert_eq!(cached_plan.estimated_output_rows, Some(2));
 
         let mut profiled = execute(&db, &query, &ParameterBindings::default(), 2, None).unwrap();
         let _profiled_rows = profiled.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
