@@ -718,28 +718,26 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 
 ## M6.3 Transactions and concurrency
 - [x] Define current transaction scope: each WAL-backed immutable publication or catalog DDL operation commits as one atomic redo unit; callers cannot group multiple API calls into one transaction.
-- [x] Define current isolation boundary: one exclusive database owner process/handle; no simultaneous writer handles; reads through the owning handle may be concurrent where the Rust API permits shared access.
+- [x] Define current isolation boundary: one exclusive database owner process/handle; shared-reference reads may run concurrently, while mutations require exclusive mutable access.
 - [x] Enforce a database-wide exclusive writer lock and reject a second opener.
-- [ ] Add public lock diagnostics and stale-lock recovery guidance/API.
-- [ ] Add concurrent reader tests.
-- [ ] Define schema/catalog concurrency.
-- [ ] Design MVCC only if workload requirements justify it.
-- [ ] Add conflict tests.
-- [ ] Add transaction timeout/cancellation.
-- [ ] Define schema/catalog concurrency.
-- [ ] Design MVCC only if workload requirements justify it.
-- [ ] Add conflict tests.
-- [ ] Add transaction timeout/cancellation.
-- [ ] Document durability guarantees precisely.
+- [x] Add read-only lock inspection reporting the lock path and owner PID without deleting stale locks.
+- [x] Add concurrent shared-handle reader coverage.
+- [x] Define schema/catalog concurrency: one writer owns the database; Rust exclusive mutable access serializes mutations, and readers observe the committed catalog held by their handle.
+- [x] Defer MVCC: it is not justified for the current single-process, single-writer embedded contract; revisit when multi-writer/server workloads are introduced.
+- [x] Add lock-conflict and idempotency/conflicting-BatchId regression tests.
+- [x] Define cancellation boundary: scan iterators can be cancelled by dropping them; the current nonblocking lock acquisition and absence of public multi-call transactions mean transaction wait-timeout APIs are not applicable yet.
+- [x] Document per-operation durability and the explicit absence of general multi-operation ACID transactions.
+- [ ] Add multi-process reader/writer stress tests and platform-specific lock validation.
 
 ## M6.4 Operational integrity
-- [ ] Add database consistency checker.
-- [ ] Add segment inventory.
-- [ ] Add orphan/temp-file reporting.
-- [ ] Add backup format.
-- [ ] Add restore validation.
-- [ ] Test restore into a new directory.
-- [ ] Document corruption repair boundaries.
+- [x] Add bounded-memory database consistency checker for WAL, logical scans, Chronicle, Capsules and Navigation Maps.
+- [x] Add storage inventory with artifact classes and byte counts.
+- [x] Add read-only orphan/temp/staging path reporting.
+- [x] Add versioned ANBK v1 full-directory backup format with manifest SHA-256 and per-file fingerprints.
+- [x] Add backup verification and fresh-directory restore validation through normal database open/recovery plus consistency scan.
+- [x] Test backup/restore into a new directory and backup-manifest corruption rejection (tests added; execution validation outstanding).
+- [x] Document corruption repair boundaries and fail-closed recovery guidance.
+- [ ] Add large-database, crash-during-backup and cross-platform durability tests.
 
 ## M6 exit gate
 - [ ] Fault-injection tests pass.
@@ -748,7 +746,7 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 - [ ] Locking rules are enforced.
 - [ ] Backup/restore integrity tests pass.
 
-**Deliverable:** Reliable single-node engine milestone. No cluster claims.
+**Deliverable:** Reliable single-node engine milestone. No cluster claims. M6 implementation slices are present, but the exit gate remains open until the Rust test suite and remaining crash/platform validation are run; M6.2 checkpoint installation/rotation is still deliberately deferred.
 
 ---
 

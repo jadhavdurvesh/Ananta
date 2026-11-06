@@ -7,6 +7,8 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub mod schema_snapshot;
+pub mod backup;
+pub use backup::BackupReport;
 mod nullable_ddl;
 mod column_rename_reorder;
 mod segment_publication;
@@ -93,6 +95,7 @@ pub enum DbError {
     CompactionPreflight(&'static str),
     Wal(String),
     RecoveryRequired(String),
+    Backup(String),
 }
 
 impl fmt::Display for DbError {
@@ -128,6 +131,7 @@ impl fmt::Display for DbError {
             Self::CompactionPreflight(message) => write!(f, "compaction input preflight failed: {message}"),
             Self::Wal(message) => write!(f, "ANANTA WAL error: {message}"),
             Self::RecoveryRequired(message) => write!(f, "database handle requires recovery before use: {message}"),
+            Self::Backup(message) => write!(f, "ANANTA backup/restore error: {message}"),
         }
     }
 }
@@ -393,6 +397,42 @@ pub struct CompactionPreflightReport {
     pub input_manifest_sha256: [u8; 32],
 }
 
+/// One file in the database's on-disk inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageFileInfo {
+    pub relative_path: String,
+    pub byte_length: u64,
+    pub artifact_kind: String,
+}
+
+/// On-disk inventory. The active lock file is intentionally excluded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StorageInventory {
+    pub files: Vec<StorageFileInfo>,
+    pub total_bytes: u64,
+    pub temporary_files: Vec<String>,
+}
+
+/// Results from a full bounded-read consistency pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConsistencyReport {
+    pub tables_checked: u64,
+    pub rows_checked: u64,
+    pub chronicle_records_checked: u64,
+    pub capsules_checked: u64,
+    pub navigation_maps_checked: u64,
+    pub wal_records_checked: u64,
+    pub inventory: StorageInventory,
+}
+
+/// Read-only inspection of a database's exclusive writer lock file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseLockStatus {
+    pub lock_path: PathBuf,
+    pub is_locked: bool,
+    pub owner_process_id: Option<u32>,
+}
+
 /// An embedded, single-writer ANANTA database handle. No external database is required.
 pub struct Database {
     root: PathBuf,
@@ -579,6 +619,175 @@ impl Database {
         database.recover_compaction_jobs()?;
         database.recover_active_weaves()?;
         Ok(database)
+    }
+
+    /// Inspect the lock marker without changing or removing it.
+    ///
+    /// A PID is informational only: callers must verify process ownership using
+    /// operating-system tools before treating an existing lock as stale.
+    pub fn inspect_lock(database_directory: impl AsRef<Path>) -> Result<DatabaseLockStatus, DbError> {
+        let lock_path = database_directory.as_ref().join(".ananta.lock");
+        match fs::read_to_string(&lock_path) {
+            Ok(contents) => {
+                let owner_process_id = contents.lines()
+                    .find_map(|line| line.strip_prefix("pid="))
+                    .and_then(|value| value.parse::<u32>().ok());
+                Ok(DatabaseLockStatus {
+                    lock_path,
+                    is_locked: true,
+                    owner_process_id,
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DatabaseLockStatus {
+                lock_path,
+                is_locked: false,
+                owner_process_id: None,
+            }),
+            Err(error) => Err(DbError::Io(error)),
+        }
+    }
+
+    /// Inventory persisted files and surface leftover temporary names without deleting them.
+    pub fn storage_inventory(&self) -> Result<StorageInventory, DbError> {
+        self.ensure_operational()?;
+        let mut inventory = StorageInventory::default();
+        collect_storage_inventory(&self.root, &self.root, &mut inventory)?;
+        inventory.files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        inventory.temporary_files.sort();
+        Ok(inventory)
+    }
+
+    /// Perform a bounded-memory integrity pass over WAL, table rows, Chronicle,
+    /// Capsules and Navigation Maps. It fails closed on the first invalid artifact.
+    pub fn check_consistency(&self, batch_rows: usize) -> Result<ConsistencyReport, DbError> {
+        self.ensure_operational()?;
+        if batch_rows == 0 {
+            return Err(DbError::InvalidRange("consistency batch size must be nonzero".into()));
+        }
+        let wal_path = self.root.join("wal").join("database.anwl");
+        let wal_report = read_wal(&wal_path)
+            .map_err(|error| DbError::Wal(error.to_string()))?;
+        let recovery_plan = build_recovery_plan(&wal_report)
+            .map_err(|error| DbError::Wal(error.to_string()))?;
+        if !wal_report.is_clean() || !recovery_plan.incomplete.is_empty() {
+            return Err(DbError::Wal("consistency check found an incomplete or truncated WAL tail".into()));
+        }
+        let mut report = ConsistencyReport {
+            wal_records_checked: u64::try_from(wal_report.records.len()).map_err(|_| DbError::LengthOverflow)?,
+            inventory: self.storage_inventory()?,
+            ..ConsistencyReport::default()
+        };
+        for (table, definition) in &self.catalog.tables {
+            let mut scan = self.scan_batches(table, batch_rows)?;
+            while let Some(batch) = scan.next() {
+                let batch = batch?;
+                report.rows_checked = report.rows_checked
+                    .checked_add(u64::try_from(batch.row_count).map_err(|_| DbError::LengthOverflow)?)
+                    .ok_or(DbError::LengthOverflow)?;
+            }
+            let table_directory = self.root.join("data").join(table);
+            let chronicle_index = scan_table_index(&table_directory, definition.id.0)?;
+            report.chronicle_records_checked = report.chronicle_records_checked
+                .checked_add(u64::try_from(chronicle_index.by_batch_id.len()).map_err(|_| DbError::LengthOverflow)?)
+                .ok_or(DbError::LengthOverflow)?;
+
+            let capsules_directory = table_directory.join("capsules");
+            for (capsule_id, generation, _) in list_capsule_paths(&capsules_directory)? {
+                self.validate_capsule(table, capsule_id, generation)?;
+                report.capsules_checked = report.capsules_checked.checked_add(1).ok_or(DbError::LengthOverflow)?;
+            }
+
+            match fs::read_dir(&capsules_directory) {
+                Ok(entries) => for entry in entries {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() { continue; }
+                    let path = entry.path();
+                    if path.extension().and_then(|value| value.to_str()) != Some("nvm") { continue; }
+                    let filename = path.file_name().and_then(|value| value.to_str())
+                        .ok_or(DbError::NavigationMapCorrupt("Navigation Map filename is not UTF-8"))?;
+                    let generation_text = filename.strip_prefix("navigation-")
+                        .and_then(|value| value.strip_suffix(".nvm"))
+                        .ok_or(DbError::NavigationMapCorrupt("Navigation Map filename is not canonical"))?;
+                    if generation_text.len() != 20 || !generation_text.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return Err(DbError::NavigationMapCorrupt("Navigation Map filename is not canonical"));
+                    }
+                    let generation = generation_text.parse::<u64>()
+                        .map_err(|_| DbError::NavigationMapCorrupt("Navigation Map generation is invalid"))?;
+                    if generation == 0 || format!("navigation-{generation:020}.nvm") != filename {
+                        return Err(DbError::NavigationMapCorrupt("Navigation Map filename is not canonical"));
+                    }
+                    let file_metadata = fs::symlink_metadata(&path)?;
+                    if !file_metadata.file_type().is_file() {
+                        return Err(DbError::NavigationMapCorrupt("Navigation Map is not a regular file"));
+                    }
+                    let map_bytes = fs::read(&path)?;
+                    let map = NavigationMap::decode(&map_bytes, definition.id.0, generation)?;
+                    for map_entry in &map.entries {
+                        let capsule_path = capsules_directory.join(format!(
+                            "capsule-{:020}-g{:020}.cap",
+                            map_entry.metadata.capsule_id,
+                            map_entry.metadata.generation,
+                        ));
+                        let metadata = fs::symlink_metadata(&capsule_path)?;
+                        if !metadata.file_type().is_file() || metadata.len() != map_entry.file_len {
+                            return Err(DbError::NavigationMapCorrupt("map references a missing or length-mismatched Capsule"));
+                        }
+                        let bytes = fs::read(&capsule_path)?;
+                        if file_sha256(&bytes) != map_entry.capsule_sha256 {
+                            return Err(DbError::NavigationMapCorrupt("map Capsule fingerprint mismatch"));
+                        }
+                        let (capsule, _) = decode_capsule(&bytes)?;
+                        if capsule != map_entry.metadata {
+                            return Err(DbError::NavigationMapCorrupt("map Capsule metadata mismatch"));
+                        }
+                    }
+                    report.navigation_maps_checked = report.navigation_maps_checked
+                        .checked_add(1).ok_or(DbError::LengthOverflow)?;
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(DbError::Io(error)),
+            }
+            report.tables_checked = report.tables_checked.checked_add(1).ok_or(DbError::LengthOverflow)?;
+        }
+        Ok(report)
+    }
+
+    /// Create a point-in-time, checksummed backup of the database directory.
+    ///
+    /// The current handle owns the exclusive writer lock, and each acknowledged
+    /// mutation has a durable WAL commit. The backup excludes only the live lock
+    /// file; restore always creates a fresh destination and validates it by opening
+    /// the restored database through the normal recovery path.
+    pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<BackupReport, DbError> {
+        self.ensure_operational()?;
+        let consistency = self.check_consistency(1024)?;
+        if !consistency.inventory.temporary_files.is_empty() {
+            return Err(DbError::Backup(
+                "backup refused while staging/temp artifacts remain; inspect storage_inventory first".into(),
+            ));
+        }
+        crate::backup::create_backup(&self.root, destination.as_ref())
+            .map_err(|error| DbError::Backup(error.to_string()))
+    }
+
+    /// Verify and restore an ANBK v1 backup into a new directory.
+    ///
+    /// A successful return means both the backup manifest and the restored
+    /// database's ordinary startup recovery checks have completed.
+    pub fn restore_backup(
+        backup_directory: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<BackupReport, DbError> {
+        crate::backup::verify_backup(backup_directory.as_ref())
+            .map_err(|error| DbError::Backup(error.to_string()))?;
+        let report = crate::backup::restore_backup(
+            backup_directory.as_ref(),
+            destination.as_ref(),
+        ).map_err(|error| DbError::Backup(error.to_string()))?;
+        let restored = Self::open(&report.directory)?;
+        restored.check_consistency(1024)?;
+        drop(restored);
+        Ok(report)
     }
 
     fn ensure_operational(&self) -> Result<(), DbError> {
@@ -2498,6 +2707,79 @@ fn validate_catalog(catalog: &Catalog) -> Result<(), DbError> {
     Ok(())
 }
 
+fn collect_storage_inventory(
+    root: &Path,
+    directory: &Path,
+    inventory: &mut StorageInventory,
+) -> Result<(), DbError> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if directory == root && name == ".ananta.lock" {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(DbError::Wal(format!(
+                "storage inventory refuses symbolic link {}",
+                path.display(),
+            )));
+        }
+        if file_type.is_dir() {
+            if name.to_str().is_some_and(|value| {
+                value.starts_with(".stage-") || value.starts_with(".candidate-") || value.ends_with(".tmp")
+            }) {
+                let relative = path.strip_prefix(root)
+                    .map_err(|_| DbError::Wal("temporary directory escaped database root".into()))?
+                    .to_str()
+                    .ok_or_else(|| DbError::Wal("temporary directory path is not UTF-8".into()))?
+                    .replace('\\', "/");
+                inventory.temporary_files.push(relative);
+            }
+            collect_storage_inventory(root, &path, inventory)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(DbError::Wal(format!(
+                "storage inventory found unsupported filesystem entry {}",
+                path.display(),
+            )));
+        }
+        let relative_path = path.strip_prefix(root)
+            .map_err(|_| DbError::Wal("inventory path escaped database root".into()))?
+            .to_str()
+            .ok_or_else(|| DbError::Wal("database inventory path is not UTF-8".into()))?
+            .replace('\\', "/");
+        let byte_length = entry.metadata()?.len();
+        inventory.total_bytes = inventory.total_bytes.checked_add(byte_length).ok_or(DbError::LengthOverflow)?;
+        let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+        let artifact_kind = match extension {
+            "anf" => "ANF segment",
+            "chr" => "Chronicle record",
+            "cap" => "Capsule",
+            "nvm" => "Navigation Map",
+            "anwl" => "ANWL WAL",
+            "anc" => "Catalog",
+            "ans" => "Schema snapshot",
+            "awp" => "Active Weave pointer",
+            "owm" => "Compaction output manifest",
+            _ => "Other",
+        }.to_owned();
+        if path.file_name().and_then(|value| value.to_str())
+            .is_some_and(|name| name.starts_with('.') && name.ends_with(".tmp"))
+        {
+            inventory.temporary_files.push(relative_path.clone());
+        }
+        inventory.files.push(StorageFileInfo {
+            relative_path,
+            byte_length,
+            artifact_kind,
+        });
+    }
+    Ok(())
+}
+
 fn encode_catalog_v2(catalog: &Catalog) -> Result<Vec<u8>, DbError> {
     validate_catalog(catalog)?;
     let mut bytes = Vec::new();
@@ -3037,6 +3319,89 @@ mod tests {
             Column::new("device", DataType::Utf8, false),
             Column::new("temperature", DataType::Float64, true),
         ]).unwrap()
+    }
+
+    #[test]
+    fn database_backup_restores_into_a_new_directory_and_replays_wal() {
+        let root = temp_path();
+        let backup = temp_path();
+        let restored = temp_path();
+        let rows = vec![
+            vec![Value::TimestampMicros(10), Value::Utf8("backup-a".into()), Value::Float64(1.5)],
+            vec![Value::TimestampMicros(20), Value::Utf8("backup-b".into()), Value::Float64(2.5)],
+        ];
+        {
+            let mut db = Database::open(&root).unwrap();
+            db.create_table("telemetry", sample_schema()).unwrap();
+            db.ingest_batch(
+                "telemetry",
+                BatchId::from_bytes([201; 16]).unwrap(),
+                &rows,
+            ).unwrap();
+            db.build_capsule("telemetry", 3, 1, 1, 1, Some("timestamp")).unwrap();
+            db.build_navigation_map("telemetry", 1).unwrap();
+            let consistency = db.check_consistency(1).unwrap();
+            assert_eq!(consistency.tables_checked, 1);
+            assert_eq!(consistency.rows_checked, 2);
+            assert_eq!(consistency.chronicle_records_checked, 1);
+            assert_eq!(consistency.capsules_checked, 1);
+            assert_eq!(consistency.navigation_maps_checked, 1);
+            assert!(consistency.inventory.total_bytes > 0);
+            let report = db.backup_to(&backup).unwrap();
+            assert!(report.file_count >= 7);
+            assert!(backup.join("backup.anbk").is_file());
+        }
+
+        let restored_report = Database::restore_backup(&backup, &restored).unwrap();
+        assert_eq!(restored_report.file_count >= 4, true);
+        let db = Database::open(&restored).unwrap();
+        assert_eq!(db.scan("telemetry").unwrap(), rows);
+        drop(db);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(backup).unwrap();
+        fs::remove_dir_all(restored).unwrap();
+    }
+
+    #[test]
+    fn writer_lock_inspection_reports_owner_without_mutating_lock() {
+        let path = temp_path();
+        let db = Database::open(&path).unwrap();
+        let status = Database::inspect_lock(&path).unwrap();
+        assert!(status.is_locked);
+        assert_eq!(status.owner_process_id, Some(std::process::id()));
+        assert!(matches!(Database::open(&path), Err(DbError::DatabaseLocked(_))));
+        drop(db);
+        let unlocked = Database::inspect_lock(&path).unwrap();
+        assert!(!unlocked.is_locked);
+        assert_eq!(unlocked.owner_process_id, None);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn one_database_handle_supports_concurrent_readers() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let rows = vec![
+            vec![Value::TimestampMicros(1), Value::Utf8("reader-a".into()), Value::Float64(1.0)],
+            vec![Value::TimestampMicros(2), Value::Utf8("reader-b".into()), Value::Float64(2.0)],
+        ];
+        db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([202; 16]).unwrap(),
+            &rows,
+        ).unwrap();
+        std::thread::scope(|scope| {
+            let readers = (0..4)
+                .map(|_| scope.spawn(|| db.scan("telemetry").unwrap()))
+                .collect::<Vec<_>>();
+            for reader in readers {
+                assert_eq!(reader.join().unwrap(), rows);
+            }
+        });
+        drop(db);
+        fs::remove_dir_all(path).unwrap();
     }
 
     fn legacy_v1_catalog(tables: &[(&str, &Schema)]) -> Vec<u8> {
