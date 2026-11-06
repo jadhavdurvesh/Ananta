@@ -56,9 +56,9 @@ impl Ord for GroupKey {
 #[derive(Debug, Clone)]
 enum State {
     Count(u64),
-    SumI32(i64),
-    SumI64(i64),
-    SumF64 { sum:f64, compensation:f64 },
+    SumI32 { sum:i64, count:u64 },
+    SumI64 { sum:i64, count:u64 },
+    SumF64 { sum:f64, compensation:f64, count:u64 },
     Average { sum:f64, compensation:f64, count:u64 },
     Extremum(Option<Value>),
 }
@@ -70,9 +70,9 @@ impl State {
             AggregateKind::Sum=>{
                 let index=spec.column.ok_or(ExecutionError::InvalidExpression("SUM requires a column"))?;
                 match input_schema.get(index).ok_or(ExecutionError::InvalidExpression("aggregate column index out of range"))?.data_type{
-                    DataType::Int32=>Ok(Self::SumI32(0)),
-                    DataType::Int64=>Ok(Self::SumI64(0)),
-                    DataType::Float64=>Ok(Self::SumF64{sum:0.0,compensation:0.0}),
+                    DataType::Int32=>Ok(Self::SumI32{sum:0,count:0}),
+                    DataType::Int64=>Ok(Self::SumI64{sum:0,count:0}),
+                    DataType::Float64=>Ok(Self::SumF64{sum:0.0,compensation:0.0,count:0}),
                     _=>Err(ExecutionError::InvalidExpression("SUM requires a numeric column")),
                 }
             }
@@ -99,21 +99,24 @@ impl State {
                     *count=count.checked_add(1).ok_or(ExecutionError::Arithmetic("COUNT overflow"))?;
                 }
             }
-            (State::SumI32(sum),AggregateKind::Sum)=>{
+            (State::SumI32{sum,count},AggregateKind::Sum)=>{
                 if let Some(Value::Int32(v))=value.filter(|v|!matches!(v,Value::Null)){
                     *sum=sum.checked_add(i64::from(*v)).ok_or(ExecutionError::Arithmetic("INT32 SUM overflow"))?;
                     if i32::try_from(*sum).is_err(){return Err(ExecutionError::Arithmetic("INT32 SUM overflow"));}
+                    *count=count.checked_add(1).ok_or(ExecutionError::Arithmetic("SUM count overflow"))?;
                 }
             }
-            (State::SumI64(sum),AggregateKind::Sum)=>{
+            (State::SumI64{sum,count},AggregateKind::Sum)=>{
                 if let Some(Value::Int64(v))=value.filter(|v|!matches!(v,Value::Null)){
                     *sum=sum.checked_add(*v).ok_or(ExecutionError::Arithmetic("INT64 SUM overflow"))?;
+                    *count=count.checked_add(1).ok_or(ExecutionError::Arithmetic("SUM count overflow"))?;
                 }
             }
-            (State::SumF64{sum,compensation},AggregateKind::Sum)=>{
+            (State::SumF64{sum,compensation,count},AggregateKind::Sum)=>{
                 if let Some(Value::Float64(v))=value.filter(|v|!matches!(v,Value::Null)){
                     if !v.is_finite(){return Err(ExecutionError::Arithmetic("SUM received a non-finite FLOAT64"));}
                     kahan_add(sum,compensation,*v)?;
+                    *count=count.checked_add(1).ok_or(ExecutionError::Arithmetic("SUM count overflow"))?;
                 }
             }
             (State::Average{sum,compensation,count},AggregateKind::Avg)=>{
@@ -144,9 +147,9 @@ impl State {
     fn finish(&self,kind:AggregateKind)->Result<Value,ExecutionError>{
         match (self,kind){
             (State::Count(value),_)=>Ok(Value::Int64(i64::try_from(*value).map_err(|_|ExecutionError::Arithmetic("COUNT exceeds INT64"))?)),
-            (State::SumI32(value),AggregateKind::Sum)=>Ok(Value::Int32(i32::try_from(*value).map_err(|_|ExecutionError::Arithmetic("INT32 SUM overflow"))?)),
-            (State::SumI64(value),AggregateKind::Sum)=>Ok(Value::Int64(*value)),
-            (State::SumF64{sum,..},AggregateKind::Sum)=>Ok(Value::Float64(*sum)),
+            (State::SumI32{sum,count},AggregateKind::Sum)=>if *count==0{Ok(Value::Null)}else{Ok(Value::Int32(i32::try_from(*sum).map_err(|_|ExecutionError::Arithmetic("INT32 SUM overflow"))?))},
+            (State::SumI64{sum,count},AggregateKind::Sum)=>if *count==0{Ok(Value::Null)}else{Ok(Value::Int64(*sum))},
+            (State::SumF64{sum,count,..},AggregateKind::Sum)=>if *count==0{Ok(Value::Null)}else{Ok(Value::Float64(*sum))},
             (State::Average{sum,count,..},AggregateKind::Avg)=>{
                 if *count==0{Ok(Value::Null)}else{
                     let result=*sum/(*count as f64);
