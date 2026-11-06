@@ -568,7 +568,16 @@ fn verify_artifact_identity(
             }
         }
         WalArtifactKind::SchemaSnapshot => {
-            let bytes = fs::read(path).map_err(io_error)?;
+            let metadata = fs::metadata(path).map_err(io_error)?;
+            if metadata.len() > crate::schema_snapshot::MAX_SNAPSHOT_BYTES {
+                return Err(WalRecoveryError::FileConflict(
+                    "schema snapshot exceeds size limit",
+                ));
+            }
+            let capacity = usize::try_from(metadata.len())
+                .map_err(|_| WalRecoveryError::FileConflict("schema snapshot length is too large"))?;
+            let mut bytes = Vec::with_capacity(capacity);
+            File::open(path).map_err(io_error)?.read_to_end(&mut bytes).map_err(io_error)?;
             let snapshot = crate::schema_snapshot::SchemaSnapshot::decode(&bytes)
                 .map_err(|_| WalRecoveryError::FileConflict("schema snapshot is invalid"))?;
             if snapshot.table_id().0 != intent.table_id
@@ -581,7 +590,15 @@ fn verify_artifact_identity(
             }
         }
         WalArtifactKind::CatalogSnapshot => {
-            let mut bytes = Vec::new();
+            let metadata = fs::metadata(path).map_err(io_error)?;
+            if metadata.len() > crate::MAX_CATALOG_BYTES {
+                return Err(WalRecoveryError::FileConflict(
+                    "catalog snapshot exceeds size limit",
+                ));
+            }
+            let capacity = usize::try_from(metadata.len())
+                .map_err(|_| WalRecoveryError::FileConflict("catalog snapshot length is too large"))?;
+            let mut bytes = Vec::with_capacity(capacity);
             File::open(path).map_err(io_error)?.read_to_end(&mut bytes).map_err(io_error)?;
             let catalog = crate::decode_catalog_v2(&bytes)
                 .map_err(|_| WalRecoveryError::FileConflict("catalog snapshot is invalid"))?;
