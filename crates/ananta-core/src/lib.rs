@@ -410,8 +410,9 @@ impl Database {
         fs::create_dir_all(root.join("data"))?;
         // A handle owns the exclusive local writer lock for its entire lifetime.
         let writer_lock = DatabaseLock::acquire(&root)?;
+        cleanup_stale_catalog_replacement_temp(&root)?;
         let catalog_path = root.join("catalog").join("catalog.anc");
-        let catalog = match fs::metadata(&catalog_path) {
+        let mut catalog = match fs::metadata(&catalog_path) {
             Ok(_) => load_catalog(&catalog_path)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Catalog::empty(),
             Err(error) => return Err(DbError::Io(error)),
@@ -431,26 +432,68 @@ impl Database {
         sync_recovery_directory(&wal_dir)?;
         let wal_report = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
+        let committed_catalog_revisions = build_recovery_plan(&wal_report)
+            .map_err(|error| DbError::Wal(error.to_string()))?
+            .committed
+            .into_iter()
+            .flat_map(|transaction| transaction.intents)
+            .filter(|intent| intent.artifact_kind == WalArtifactKind::CatalogSnapshot)
+            .map(|intent| intent.file_id)
+            .collect::<BTreeSet<_>>();
+
         recover_staged_artifacts(&wal_report, &mut wal, |intent| {
-            let Some((table_name, definition)) = catalog.tables.iter()
-                .find(|(_, definition)| definition.id.0 == intent.table_id)
-            else {
-                return Err(WalRecoveryError::MissingTableId(intent.table_id));
-            };
-            crate::schema_snapshot::SchemaSnapshot::read_from(
-                &root,
-                definition.id,
-                intent.schema_revision,
-            ).map_err(|error| WalRecoveryError::SchemaSnapshot(error.to_string()))?;
-            Ok(root.join("data").join(table_name))
+            match intent.artifact_kind {
+                WalArtifactKind::SchemaSnapshot => {
+                    let snapshot_path = SchemaSnapshot::path(
+                        &root,
+                        ObjectId(intent.table_id),
+                        intent.file_id,
+                    ).map_err(|error| WalRecoveryError::SchemaSnapshot(error.to_string()))?;
+                    snapshot_path.parent()
+                        .map(Path::to_path_buf)
+                        .ok_or_else(|| WalRecoveryError::SchemaSnapshot(
+                            "schema snapshot path has no parent directory".into(),
+                        ))
+                }
+                WalArtifactKind::CatalogSnapshot => {
+                    let directory = root.join("catalog");
+                    if committed_catalog_revisions.contains(&intent.file_id) {
+                        // Publish/apply the catalog snapshot here, in WAL order,
+                        // so a later transaction in this same log can resolve a
+                        // table introduced or revised by this DDL transaction.
+                        let final_path = publish_staged_wal_artifact(&directory, intent)?;
+                        apply_catalog_snapshot_artifact(
+                            &root,
+                            &mut catalog,
+                            intent,
+                            &final_path,
+                        ).map_err(|error| WalRecoveryError::SchemaSnapshot(error.to_string()))?;
+                    }
+                    Ok(directory)
+                }
+                WalArtifactKind::AnfSegment | WalArtifactKind::ChronicleRecord => {
+                    let Some((table_name, definition)) = catalog.tables.iter()
+                        .find(|(_, definition)| definition.id.0 == intent.table_id)
+                    else {
+                        return Err(WalRecoveryError::MissingTableId(intent.table_id));
+                    };
+                    SchemaSnapshot::read_from(
+                        &root,
+                        definition.id,
+                        intent.schema_revision,
+                    ).map_err(|error| WalRecoveryError::SchemaSnapshot(error.to_string()))?;
+                    Ok(root.join("data").join(table_name))
+                }
+            }
         }).map_err(|error| match error {
             WalRecoveryError::ChronicleCorrupt(message) => DbError::ChronicleCorrupt(message),
             other => DbError::Wal(other.to_string()),
         })?;
 
-        // Anything left here has no verified committed intent (for example a
-        // process stopped while writing the staging file before BEGIN).
+        // Anything left here has no verified WAL ownership (for example a
+        // process stopped while staging the second metadata artifact).
         cleanup_orphan_segment_temps(&root.join("data"))?;
+        cleanup_orphan_catalog_staging_temps(&root)?;
         let mut chronicle_indices = BTreeMap::new();
         for (name, definition) in &catalog.tables {
             let directory = root.join("data").join(name);
@@ -494,8 +537,20 @@ impl Database {
         intent: &WalMutationIntent,
         operation: &[u8],
     ) -> Result<(), DbError> {
-        let payload = intent.encode()
-            .map_err(|error| DbError::Wal(error.to_string()))?;
+        self.commit_wal_intents(std::slice::from_ref(intent), operation)
+    }
+
+    fn commit_wal_intents(
+        &mut self,
+        intents: &[WalMutationIntent],
+        operation: &[u8],
+    ) -> Result<(), DbError> {
+        if intents.is_empty() {
+            return Err(DbError::Wal("cannot commit an empty mutation-intent list".into()));
+        }
+        let payloads = intents.iter()
+            .map(|intent| intent.encode().map_err(|error| DbError::Wal(error.to_string())))
+            .collect::<Result<Vec<_>, _>>()?;
         let transaction_id = self.wal.next_sequence();
         if let Err(error) = self.wal.begin_transaction(transaction_id, operation) {
             self.recovery_required = true;
@@ -506,15 +561,17 @@ impl Database {
         crate::wal_recovery::maybe_crash_after(
             crate::wal_recovery::WalRecoveryCrashPoint::AfterWalBegin,
         );
-        if let Err(error) = self.wal.append_mutation(transaction_id, &payload) {
-            self.recovery_required = true;
-            return Err(DbError::RecoveryRequired(format!(
-                "could not append WAL mutation intent: {error}"
-            )));
+        for payload in &payloads {
+            if let Err(error) = self.wal.append_mutation(transaction_id, payload) {
+                self.recovery_required = true;
+                return Err(DbError::RecoveryRequired(format!(
+                    "could not append WAL mutation intent: {error}"
+                )));
+            }
+            crate::wal_recovery::maybe_crash_after(
+                crate::wal_recovery::WalRecoveryCrashPoint::AfterWalMutation,
+            );
         }
-        crate::wal_recovery::maybe_crash_after(
-            crate::wal_recovery::WalRecoveryCrashPoint::AfterWalMutation,
-        );
         if let Err(error) = self.wal.commit_transaction(transaction_id) {
             self.recovery_required = true;
             return Err(DbError::RecoveryRequired(format!(
@@ -541,6 +598,87 @@ impl Database {
         }
     }
 
+    fn commit_catalog_mutation(
+        &mut self,
+        candidate: Catalog,
+        snapshot: SchemaSnapshot,
+        operation: &[u8],
+    ) -> Result<(), DbError> {
+        self.ensure_operational()?;
+
+        let table_id = snapshot.table_id();
+        let schema_revision = snapshot.revision();
+        let definition = candidate.tables.values()
+            .find(|definition| definition.id == table_id)
+            .ok_or(DbError::CorruptCatalog("catalog mutation snapshot TableId is missing"))?;
+        if definition.schema_revision != schema_revision
+            || snapshot.schema()? != definition.schema
+            || snapshot.column_ids().collect::<Vec<_>>() != definition.column_ids
+        {
+            return Err(DbError::SchemaCompatibility(
+                "catalog mutation snapshot does not match candidate catalog",
+            ));
+        }
+
+        let schema_path = SchemaSnapshot::path(&self.root, table_id, schema_revision)?;
+        let schema_directory = schema_path.parent().ok_or(DbError::LengthOverflow)?.to_path_buf();
+        let schemas_root = self.root.join("catalog").join("schemas");
+        let catalog_directory = self.root.join("catalog");
+        fs::create_dir_all(&schema_directory)?;
+        // Persist each new directory entry before WAL COMMIT can depend on it.
+        sync_recovery_directory(&catalog_directory)?;
+        sync_recovery_directory(&schemas_root)?;
+        sync_recovery_directory(&schema_directory)?;
+
+        let snapshot_bytes = snapshot.encode()?;
+        let catalog_bytes = encode_catalog_v2(&candidate)?;
+        let schema_intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::SchemaSnapshot,
+            table_id: table_id.0,
+            schema_revision,
+            file_id: schema_revision,
+            file_len: u64::try_from(snapshot_bytes.len()).map_err(|_| DbError::LengthOverflow)?,
+            sha256: chronicle::sha256(&snapshot_bytes),
+        };
+        let catalog_intent = WalMutationIntent {
+            artifact_kind: WalArtifactKind::CatalogSnapshot,
+            table_id: table_id.0,
+            schema_revision,
+            file_id: candidate.revision,
+            file_len: u64::try_from(catalog_bytes.len()).map_err(|_| DbError::LengthOverflow)?,
+            sha256: chronicle::sha256(&catalog_bytes),
+        };
+
+        stage_wal_artifact(&schema_directory, &schema_intent, &snapshot_bytes)
+            .map_err(Self::map_precommit_stage_error)?;
+        if let Err(error) = stage_wal_artifact(&catalog_directory, &catalog_intent, &catalog_bytes) {
+            let _ = discard_staged_wal_artifact(&schema_directory, &schema_intent);
+            return Err(Self::map_precommit_stage_error(error));
+        }
+
+        self.commit_wal_intents(&[schema_intent.clone(), catalog_intent.clone()], operation)?;
+        self.publish_wal_intent(&schema_directory, &schema_intent)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterSchemaSnapshotPublished,
+        );
+        let catalog_path = self.publish_wal_intent(&catalog_directory, &catalog_intent)?;
+        crate::wal_recovery::maybe_crash_after(
+            crate::wal_recovery::WalRecoveryCrashPoint::AfterCatalogSnapshotPublished,
+        );
+        if let Err(error) = apply_catalog_snapshot_artifact(
+            &self.root,
+            &mut self.catalog,
+            &catalog_intent,
+            &catalog_path,
+        ) {
+            self.recovery_required = true;
+            return Err(DbError::RecoveryRequired(format!(
+                "committed catalog mutation requires recovery: {error}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn create_table(&mut self, name: impl Into<String>, schema: Schema) -> Result<(), DbError> {
         self.ensure_operational()?;
         let name = name.into();
@@ -557,13 +695,6 @@ impl Database {
         }
         increment_catalog_revision(&mut candidate)?;
 
-        let data_root = self.root.join("data");
-        let table_dir = data_root.join(&name);
-        fs::create_dir_all(&table_dir)?;
-        // Make the new table directory entry durable before later WAL intents
-        // rely on staged/final files inside it.
-        sync_recovery_directory(&data_root)?;
-        sync_recovery_directory(&table_dir)?;
         candidate.tables.insert(name.clone(), TableDefinition {
             id: table_id,
             schema_revision: 1,
@@ -571,16 +702,14 @@ impl Database {
             schema,
         });
 
-        // Persist revision-one identity before publishing the catalog that references it.
         let definition = candidate.tables.get(&name).expect("new table inserted");
-        SchemaSnapshot::new(
+        let snapshot = SchemaSnapshot::new(
             definition.id,
             definition.schema_revision,
             &definition.schema,
             &definition.column_ids,
-        )?.write_to(&self.root)?;
-        save_catalog(&self.root.join("catalog").join("catalog.anc"), &candidate)?;
-        self.catalog = candidate;
+        )?;
+        self.commit_catalog_mutation(candidate, snapshot, b"create_table")?;
         self.chronicle_indices.entry(table_id).or_default();
         Ok(())
     }
@@ -2242,6 +2371,9 @@ fn save_catalog(path: &Path, catalog: &Catalog) -> Result<(), DbError> {
         file.sync_all()?;
         drop(file);
         fs::rename(&temp, path)?;
+        if let Some(parent) = path.parent() {
+            sync_recovery_directory(parent)?;
+        }
         Ok(())
     })();
     if write_result.is_err() {
