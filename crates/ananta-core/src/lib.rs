@@ -527,7 +527,7 @@ impl Database {
         // process stopped while staging the second metadata artifact).
         cleanup_orphan_segment_temps(&root.join("data"))?;
         cleanup_orphan_catalog_staging_temps(&root)?;
-        crate::active_generation::cleanup_orphan_active_pointer_staging(&root, &catalog)?;
+        crate::active_generation::cleanup_orphan_active_pointer_staging(&root, &catalog.tables)?;
         let mut chronicle_indices = BTreeMap::new();
         for (name, definition) in &catalog.tables {
             let directory = root.join("data").join(name);
