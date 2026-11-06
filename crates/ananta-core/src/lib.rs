@@ -6463,6 +6463,8 @@ mod tests {
             "AfterBackupFileSynced" => AfterBackupFileSynced,
             "AfterBackupManifestSynced" => AfterBackupManifestSynced,
             "AfterBackupDirectoryRenamedBeforeSync" => AfterBackupDirectoryRenamedBeforeSync,
+            "AfterCheckpointArchiveRemoved" => AfterCheckpointArchiveRemoved,
+            "AfterCheckpointRetentionDirectorySynced" => AfterCheckpointRetentionDirectorySynced,
             _ => panic!("unsupported subprocess crash point: {point_name}"),
         };
         let path = PathBuf::from(std::env::var_os("ANANTA_WAL_CRASH_DATABASE").unwrap());
@@ -6850,6 +6852,53 @@ mod tests {
         drop(database);
         assert!(!Database::inspect_lock(&root).unwrap().is_locked);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn exercise_checkpoint_prune_process_crash(point: &str) {
+        use std::process::Command;
+
+        let root = temp_path();
+        let mut setup = Database::open(&root).unwrap();
+        setup.create_table("telemetry", sample_schema()).unwrap();
+        setup.insert_batch(
+            "telemetry",
+            &[vec![
+                Value::TimestampMicros(15),
+                Value::Utf8("retention-crash".into()),
+                Value::Float64(1.5),
+            ]],
+        ).unwrap();
+        let first = setup.create_checkpoint().unwrap();
+        drop(setup);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::wal_recovery_process_crash_worker")
+            .arg("--nocapture")
+            .env("ANANTA_WAL_CRASH_OPERATION", "checkpoint")
+            .env("ANANTA_WAL_CRASH_POINT", point)
+            .env("ANANTA_WAL_CRASH_DATABASE", &root)
+            .env("ANANTA_WAL_CRASH_EXIT", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86), "checkpoint pruning worker did not stop at {point}");
+        fs::remove_file(root.join(".ananta.lock")).unwrap();
+
+        assert!(!first.manifest_path.exists());
+        let recovered = Database::open(&root).unwrap();
+        recovered.check_consistency(1).unwrap();
+        assert_eq!(
+            fs::read_dir(root.join("wal").join("checkpoints")).unwrap().count(),
+            1,
+        );
+        drop(recovered);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_archive_pruning_survives_process_crashes() {
+        exercise_checkpoint_prune_process_crash("AfterCheckpointArchiveRemoved");
+        exercise_checkpoint_prune_process_crash("AfterCheckpointRetentionDirectorySynced");
     }
 
     #[test]
