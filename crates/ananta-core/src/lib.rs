@@ -6215,6 +6215,12 @@ mod tests {
             "ddl" => {
                 database.add_nullable_column("telemetry", "humidity", DataType::Float64).unwrap();
             }
+            "capsule" => {
+                database.build_capsule("telemetry", 900, 1, 1, 1, Some("timestamp")).unwrap();
+            }
+            "navigation-map" => {
+                database.build_navigation_map("telemetry", 901).unwrap();
+            }
             _ => panic!("unsupported subprocess operation: {operation}"),
         }
         panic!("subprocess crash checkpoint was not reached");
@@ -6335,6 +6341,97 @@ mod tests {
         assert!(reopened.check_schema_snapshot_consistency().unwrap().is_clean());
         drop(reopened);
         fs::remove_dir_all(path).unwrap();
+    }
+
+    fn exercise_derived_artifact_subprocess_crash(
+        operation: &str,
+        point: &str,
+        committed: bool,
+    ) {
+        use std::process::Command;
+
+        let path = temp_path();
+        let rows = vec![vec![
+            Value::TimestampMicros(9_000),
+            Value::Utf8(format!("subprocess-{operation}-{point}")),
+            Value::Float64(29.5),
+        ]];
+        let mut setup = Database::open(&path).unwrap();
+        setup.create_table("telemetry", sample_schema()).unwrap();
+        setup.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([0xD4; 16]).unwrap(),
+            &rows,
+        ).unwrap();
+        if operation == "navigation-map" {
+            setup.build_capsule("telemetry", 900, 1, 1, 1, Some("timestamp")).unwrap();
+        }
+        drop(setup);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::wal_recovery_process_crash_worker")
+            .arg("--nocapture")
+            .env("ANANTA_WAL_CRASH_OPERATION", operation)
+            .env("ANANTA_WAL_CRASH_POINT", point)
+            .env("ANANTA_WAL_CRASH_DATABASE", &path)
+            .env("ANANTA_WAL_CRASH_EXIT", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86), "worker did not terminate at {operation}/{point}");
+        fs::remove_file(path.join(".ananta.lock")).unwrap();
+
+        let capsules = path.join("data").join("telemetry").join("capsules");
+        let expected_artifact = if operation == "capsule" {
+            capsules.join("capsule-00000000000000000900-g00000000000000000001.cap")
+        } else {
+            capsules.join("navigation-00000000000000000901.nvm")
+        };
+        assert_eq!(expected_artifact.is_file(), committed, "publication state at {operation}/{point}");
+
+        let recovered = Database::open(&path).unwrap();
+        assert_eq!(recovered.scan("telemetry").unwrap(), rows);
+        if committed && operation == "capsule" {
+            let metadata = recovered.validate_capsule("telemetry", 900, 1).unwrap();
+            assert_eq!(metadata.row_count, 1);
+            assert_eq!(recovered.scan_capsule("telemetry", 900, 1).unwrap(), rows);
+        }
+        if committed && operation == "navigation-map" {
+            let request = CapsuleScanRequest {
+                ranges: vec![ColumnRangePredicate::new(
+                    "timestamp",
+                    Some(Value::TimestampMicros(0)),
+                    true,
+                    Some(Value::TimestampMicros(10_000)),
+                    true,
+                )],
+                projection: None,
+            };
+            let mapped = recovered.scan_capsules("telemetry", &request, Some(901)).unwrap();
+            assert_eq!(mapped.rows, rows);
+        }
+        let consistency = recovered.check_consistency(1).unwrap();
+        assert_eq!(consistency.rows_checked, 1);
+        drop(recovered);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap(), rows);
+        reopened.check_consistency(1).unwrap();
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn capsule_and_navigation_map_wal_recovery_survives_process_crashes() {
+        for operation in ["capsule", "navigation-map"] {
+            for (point, committed) in [
+                ("AfterWalMutation", false),
+                ("AfterWalCommit", true),
+                ("AfterFinalNameLinked", true),
+            ] {
+                exercise_derived_artifact_subprocess_crash(operation, point, committed);
+            }
+        }
     }
 
     #[test]
