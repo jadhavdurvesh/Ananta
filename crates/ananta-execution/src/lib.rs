@@ -308,7 +308,7 @@ impl Default for ExecutionContext {
 }
 
 fn measured_value_payload_bytes(batch: &VectorBatch) -> u64 {
-    batch.columns.iter().flatten().fold(0_u64, |total, value| {
+    batch.columns.iter().flat_map(|column| column.values.iter()).fold(0_u64, |total, value| {
         let value_bytes = match value {
             Value::Null => 0,
             Value::Boolean(_) => 1,
