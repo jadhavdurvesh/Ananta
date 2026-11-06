@@ -707,7 +707,7 @@ mod tests {
     fn timestamp_range_and_three_valued_null_filtering_work() {
         let (db, root, _) = fixture();
         let query = crate::parse(
-            "SELECT device FROM telemetry WHERE event_time >= $1 AND event_time < $2 AND active IS NOT NULL"
+            "SELECT device FROM telemetry WHERE event_time >= $1 AND event_time < $2 AND active IS NOT NULL AND active = TRUE"
         ).unwrap();
         let bindings = ParameterBindings {
             named: Default::default(),
