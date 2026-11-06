@@ -85,7 +85,7 @@ pub fn execute_vectorized_with_options(
         Box::new(ScanOperator::new(database,&table,scan_columns,batch_rows).map_err(vector_error)?)
     };
     let mut column_map=vec![None;schema.len()];
-    if options.enable_projection_pushdown{
+    if options.enable_projection_pushdown || !options.enable_predicate_pushdown {
         for (slot,index) in required_indices.iter().enumerate(){column_map[*index]=Some(slot);}
     }else{
         for index in 0..schema.len(){column_map[index]=Some(index);}
