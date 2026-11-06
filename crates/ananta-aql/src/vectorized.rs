@@ -5,7 +5,7 @@ use crate::{
 };
 use crate::{
     ExecutionContext, ExecutionError, ExecutionPipeline, FilterOperator, LimitOperator,
-    PhysicalOperator, ProjectionOperator, ResourceLimits, ScanOperator, VectorBatch,
+    PhysicalOperator, ProjectionOperator, ResourceLimits, ScanOperator,
 };
 use ananta_core::Database;
 use ananta_types::{Column, DataType, Schema, Value};
@@ -255,7 +255,7 @@ fn storage_error(error:ananta_core::DbError)->AqlExecutionError{
     query_error(code,error.to_string(),crate::Span::default())
 }
 fn vector_error(error:ExecutionError)->AqlExecutionError{
-    let code=match error{
+    let code=match &error{
         ExecutionError::Cancelled=>AqlErrorCode::Cancelled,
         ExecutionError::TypeMismatch{..}|ExecutionError::NullNotAllowed(_)=>AqlErrorCode::TypeMismatch,
         ExecutionError::Arithmetic(_)=>AqlErrorCode::Arithmetic,
