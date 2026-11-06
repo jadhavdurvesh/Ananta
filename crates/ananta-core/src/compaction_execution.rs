@@ -1131,6 +1131,47 @@ mod tests {
             assert!(report.temporary_bytes >= report.output_bytes);
         }
 
+        // Candidate directory publication is now WAL-backed. Exercise the
+        // durable commit, versioned OWM publication, and directory-rename
+        // boundaries; every reopen must complete the same immutable candidate.
+        for (offset, point) in [
+            (0_u8, crate::wal_recovery::WalRecoveryCrashPoint::AfterCompactionWalCommitted),
+            (1_u8, crate::wal_recovery::WalRecoveryCrashPoint::AfterCompactionManifestPublished),
+            (2_u8, crate::wal_recovery::WalRecoveryCrashPoint::AfterCompactionDirectoryRenamedBeforeSync),
+        ] {
+            let job_id = crate::CompactionJobId::from_bytes([63 + offset; 16]).unwrap();
+            let input = CompactionInputManifest {
+                table_id: table_id.0,
+                job_id,
+                attempt: 1,
+                target_schema_revision: 1,
+                first_sequence: 1,
+                last_sequence: 2,
+                expected_row_count: 4,
+                capsules: capsules.clone(),
+                receipts: receipts.clone(),
+            };
+            let weave_id = 150 + u64::from(offset);
+            crate::wal_recovery::arm_wal_recovery_crash_point(point);
+            let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                db.execute_compaction(
+                    "telemetry",
+                    &input,
+                    weave_id,
+                    1,
+                    WeaveLayoutProfile::AppendOnly,
+                    limits,
+                    None,
+                )
+            }));
+            assert!(interrupted.is_err(), "compaction crash point {point:?} was not reached");
+            drop(db);
+            db = Database::open(&root).unwrap();
+            let recovered = db.verify_compaction_candidate("telemetry", &input, weave_id, 1).unwrap();
+            assert_eq!(recovered.weave_id, weave_id);
+            assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
+        }
+
         assert_eq!(first_timestamps[0], Value::TimestampMicros(300));
         assert_eq!(first_timestamps[1], Value::TimestampMicros(100));
         assert_eq!(first_entities[2], Value::Utf8("a".into()));
