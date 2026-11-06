@@ -1,6 +1,6 @@
 use ananta_aql::{
     aggregate_batches, bucketed_aggregate, execute_vectorized_source,
-    execute_vectorized_source_with_options, explain, latest_per_series,
+    execute_vectorized_source_with_options, explain_plan, latest_per_series,
     AggregateKind, AggregateSpec, ParameterBindings, PlannerOptions,
     ResourceLimits,
 };
@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..PlannerOptions::default()
     };
     let parsed = ananta_aql::parse(source)?;
-    let plan = explain(&database, &parsed, &bindings, options)?;
+    let plan = explain_plan(&database, &parsed, &bindings, options)?;
     println!("=== EXPLAIN ===\n{}", plan.render());
 
     let mut optimized = execute_vectorized_source_with_options(

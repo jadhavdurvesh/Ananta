@@ -289,6 +289,7 @@ where I:IntoIterator<Item=Result<VectorBatch,ExecutionError>>{
 #[cfg(test)]
 mod tests{
     use super::*;
+    use crate::ResourceLimits;
     use crate::vector::Vector;
 
     fn batch(rows:&[[Value;3]])->VectorBatch{
