@@ -188,17 +188,19 @@ pub struct ExecutionProfile {
     pub filtered_rows: u64,
     pub decoded_value_bytes_estimate: u64,
     pub output_value_bytes_estimate: u64,
+    pub elapsed_micros: u64,
 }
 #[derive(Clone)]
 pub struct ExecutionContext {
     pub limits: ResourceLimits,
     pub cancellation: Arc<AtomicBool>,
     profile: Arc<Mutex<ExecutionProfile>>,
+    started: std::time::Instant,
 }
 impl Default for ExecutionContext {
     fn default() -> Self {
         Self { limits: ResourceLimits::default(), cancellation: Arc::new(AtomicBool::new(false)),
-            profile: Arc::new(Mutex::new(ExecutionProfile::default())) }
+            profile: Arc::new(Mutex::new(ExecutionProfile::default())), started: std::time::Instant::now() }
     }
 }
 impl ExecutionContext {
@@ -211,7 +213,9 @@ impl ExecutionContext {
         if self.cancellation.load(AtomicOrdering::Acquire) { Err(ExecutionError::Cancelled) } else { Ok(()) }
     }
     pub fn profile(&self) -> ExecutionProfile {
-        self.profile.lock().map(|p| p.clone()).unwrap_or_default()
+        let mut profile=self.profile.lock().map(|p| p.clone()).unwrap_or_default();
+        profile.elapsed_micros=u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        profile
     }
     fn record_input(&self, batch: &VectorBatch) {
         if let Ok(mut profile) = self.profile.lock() {
@@ -308,7 +312,6 @@ impl PhysicalOperator for ProjectionOperator {
         match self.input.next_batch(context) {
             Ok(Some(batch)) => {
                 let output = batch.select_columns(&self.indices)?;
-                context.record_output(&output);
                 Ok(Some(output))
             }
             Ok(None) => { self.terminal = true; Ok(None) }
@@ -428,7 +431,6 @@ impl PhysicalOperator for FilterOperator {
             if selection.is_empty(){continue;}
             let output=batch.take_rows(&selection)?;
             context.limits.check_batch(&output)?;
-            context.record_output(&output);
             return Ok(Some(output));
         }
     }
@@ -456,7 +458,6 @@ impl PhysicalOperator for LimitOperator {
         let indices=(0..self.remaining).collect::<Vec<_>>();
         let output=batch.take_rows(&indices)?;
         self.remaining=0;self.terminal=true;
-        context.record_output(&output);
         Ok(Some(output))
     }
 }
@@ -473,7 +474,7 @@ impl Iterator for ExecutionPipeline {
     fn next(&mut self)->Option<Self::Item>{
         if self.terminal{return None;}
         match self.root.next_batch(&self.context){
-            Ok(Some(batch))=>Some(Ok(batch)),
+            Ok(Some(batch))=>{self.context.record_output(&batch);Some(Ok(batch))},
             Ok(None)=>{self.terminal=true;None},
             Err(error)=>{self.terminal=true;Some(Err(error))},
         }
