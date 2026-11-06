@@ -189,3 +189,6 @@ M6.2 now has reusable staged-artifact publication and WAL replay-plan helpers, i
 
 
 M6.2 now connects the WAL to initial immutable ANF inserts and Chronicle ingests. Database startup replays committed artifact intents before rebuilding Chronicle receipt indexes; uncommitted staging is discarded and explicitly aborted. See docs/specifications/wal-recovery-v0.1.md for the current scope and remaining crash points. This is not yet general ACID transaction support.
+
+
+The M6.2 write path also synchronises the WAL parent directory after header creation and the data/table directories before staged artifact publication, on platforms that support directory fsync.

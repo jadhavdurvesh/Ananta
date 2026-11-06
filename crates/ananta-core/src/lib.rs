@@ -418,11 +418,17 @@ impl Database {
         };
         ensure_initial_schema_snapshots(&root, &catalog)?;
 
-        // WAL redo must publish committed Chronicle/ANF artifacts before the
-        // Chronicle receipt indexes are rebuilt from the directory inventory.
-        let wal_path = root.join("wal").join("database.anwl");
+        // Create and durably publish the WAL directory entry before the
+        // first transaction can ever commit. The WAL file header itself is
+        // synchronised by WalWriter::open; syncing wal_dir persists that name.
+        let wal_dir = root.join("wal");
+        fs::create_dir_all(&wal_dir)?;
+        sync_recovery_directory(&root)?;
+        sync_recovery_directory(&wal_dir)?;
+        let wal_path = wal_dir.join("database.anwl");
         let mut wal = WalWriter::open(&wal_path, WalSyncPolicy::OnCommit)
             .map_err(|error| DbError::Wal(error.to_string()))?;
+        sync_recovery_directory(&wal_dir)?;
         let wal_report = read_wal(&wal_path)
             .map_err(|error| DbError::Wal(error.to_string()))?;
         recover_staged_artifacts(&wal_report, &mut wal, |intent| {
@@ -529,8 +535,13 @@ impl Database {
         }
         increment_catalog_revision(&mut candidate)?;
 
-        let table_dir = self.root.join("data").join(&name);
+        let data_root = self.root.join("data");
+        let table_dir = data_root.join(&name);
         fs::create_dir_all(&table_dir)?;
+        // Make the new table directory entry durable before later WAL intents
+        // rely on staged/final files inside it.
+        sync_recovery_directory(&data_root)?;
+        sync_recovery_directory(&table_dir)?;
         candidate.tables.insert(name.clone(), TableDefinition {
             id: table_id,
             schema_revision: 1,
@@ -2076,6 +2087,18 @@ fn validate_name(name: &str) -> Result<(), DbError> {
     if name.is_empty() || name.len() > 128 ||
        !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
         return Err(DbError::InvalidName(name.to_owned()));
+    }
+    Ok(())
+}
+
+fn sync_recovery_directory(path: &Path) -> Result<(), DbError> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
     }
     Ok(())
 }
@@ -5027,6 +5050,13 @@ mod tests {
         assert_eq!(duplicate.chronicle_path, ingested.chronicle_path);
 
         drop(reopened);
+        let reopened_again = Database::open(&path).unwrap();
+        assert_eq!(reopened_again.scan("telemetry").unwrap(), vec![
+            anf_row,
+            chronicle_rows[0].clone(),
+        ]);
+        assert_eq!(reopened_again.ingestion_stats("telemetry").unwrap().accepted_batches, 1);
+        drop(reopened_again);
         fs::remove_dir_all(path).unwrap();
     }
 
@@ -5073,6 +5103,9 @@ mod tests {
         assert!(!staging.exists());
 
         drop(reopened);
+        let reopened_again = Database::open(&path).unwrap();
+        assert_eq!(reopened_again.scan("telemetry").unwrap(), rows);
+        drop(reopened_again);
         fs::remove_dir_all(path).unwrap();
     }
 
@@ -5134,6 +5167,10 @@ mod tests {
         assert!(table_dir.join(intent.artifact_kind.final_file_name(file_id)).is_file());
 
         drop(reopened);
+        let reopened_again = Database::open(&path).unwrap();
+        assert_eq!(reopened_again.scan("telemetry").unwrap(), rows);
+        assert_eq!(reopened_again.ingestion_stats("telemetry").unwrap().accepted_batches, 1);
+        drop(reopened_again);
         fs::remove_dir_all(path).unwrap();
     }
 

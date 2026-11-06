@@ -720,6 +720,7 @@ mod tests{
     #[test]
     fn explain_pushes_required_columns_and_reports_measured_table_stats(){
         let(db,root)=fixture();
+        ananta_execution::analyze_table_and_persist(&db,"telemetry",1).unwrap();
         let query=crate::parse("SELECT device FROM telemetry WHERE time >= :lower LIMIT 10").unwrap();
         let bindings=ParameterBindings{
             named:[("lower".into(),Value::TimestampMicros(5))].into_iter().collect(),positional:vec![],
@@ -727,6 +728,7 @@ mod tests{
         let plan=explain(&db,&query,&bindings,PlannerOptions::default()).unwrap();
         assert_eq!(plan.required_columns,vec!["time","device"]);
         assert_eq!(plan.table_statistics.row_count,Some(1));
+        assert!(plan.table_statistics.analyzed_snapshot_available);
         assert!(plan.timestamp_range.is_some());
         assert!(plan.render().contains("projection_pushdown=true"));
         drop(db);fs::remove_dir_all(root).unwrap();

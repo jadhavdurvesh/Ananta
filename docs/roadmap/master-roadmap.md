@@ -687,6 +687,7 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Implement streaming checksum-verified staging and idempotent final publication helpers.
 - [x] Implement recovery-plan classification and replay driver for committed/incomplete/aborted transactions.
 - [x] Run WAL recovery in Database::open before Chronicle receipt index reconstruction.
+- [x] Synchronise WAL parent-directory creation and newly created table-directory entries before relying on staged artifacts.
 - [x] Integrate WAL intents with Database::insert_batch (ANF) and Database::ingest_batch (Chronicle).
 - [x] Rebuild Chronicle sequence/BatchId receipt state from recovered published files.
 - [x] Mark the Database handle recovery-required if a WAL append/commit/publication outcome is uncertain.

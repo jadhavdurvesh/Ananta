@@ -54,13 +54,13 @@ For one immutable artifact:
 7. Publish the staging file under the final canonical name using a no-replace operation (hard link on the same filesystem), verify exact bytes/length, sync the table directory, remove the staging name, and sync the directory again.
 8. Return success only after the final name is published and verified.
 
-The staged bytes must be durable before the WAL COMMIT can become durable. This ordering makes redo possible after a crash between COMMIT and final-name publication.
+The staged bytes and their table-directory entry must be durable before the WAL COMMIT can become durable. This ordering makes redo possible after a crash between COMMIT and final-name publication.
 
 If step 7 fails after COMMIT, the operation is committed but publication is pending. The current Database handle must be marked recovery-required and must not accept further reads or writes that could expose a partial logical state. The caller is told to reopen/recover; a retry must not allocate a second artifact for the same committed intent.
 
 ## 5. Startup recovery algorithm
 
-Database open must acquire the existing exclusive writer lock before recovery.
+Database open must acquire the existing exclusive writer lock before recovery. It creates the WAL directory, synchronises the database root and WAL directory, opens the WAL (which synchronises a new header), then synchronises the WAL directory again so the WAL filename is durable before it can acknowledge transactions. Table creation synchronises the data root and new table directory before subsequent staged artifacts depend on that directory.
 
 1. Open the WAL writer. M6.1 validates the header and complete frames and truncates only an incomplete final frame to the last verified offset. A checksum mismatch or any complete-frame corruption fails open.
 2. Read the complete verified WAL records and group transaction records by transaction ID.
@@ -153,3 +153,6 @@ The core Database now owns a WAL writer at catalog-independent path wal/database
 Database::insert_batch and Database::ingest_batch now stage and sync complete immutable artifacts, append AMUT v1 BEGIN/MUTATION/COMMIT intent records using OnCommit sync, and publish the final filename with no-replace semantics. A failed/uncertain WAL or final-publication outcome marks the current Database handle recovery-required; data-facing APIs reject further use through that handle and ask the caller to reopen.
 
 Integration tests cover normal ANF/Chronicle close/reopen, fault injection after a durable ANF COMMIT but before final publication, the equivalent Chronicle replay with receipt-index reconstruction and duplicate BatchId behavior, and uncommitted intent discard/ABORT. More publication-boundary crash points, catalog DDL, compaction/Weave publication and checkpoint/rotation remain open. This is not yet a general ACID transaction implementation.
+
+
+The current Database integration also synchronises the WAL directory after header creation, and synchronises both the data root and newly-created table directory during table creation. This closes the parent-directory entry durability gap for the initial ANF/Chronicle write path on platforms where directory fsync is supported.
