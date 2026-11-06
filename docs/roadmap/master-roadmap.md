@@ -679,16 +679,23 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 
 **M6.1 boundary:** The ANWL v1 reader/writer is standalone. Database insert/ingest/catalog/compaction mutations are not yet routed through it, and there is no startup replay or rollback. These are M6.2 deliverables; no crash-recovery or ACID guarantee is claimed.
 
-## M6.2 Recovery
-- [ ] Define startup recovery algorithm.
-- [ ] Replay committed operations only.
-- [ ] Ignore or roll back incomplete operations according to documented semantics.
-- [ ] Define checkpoint format.
-- [ ] Implement checkpoint creation.
-- [ ] Implement checkpoint loading.
-- [ ] Inject process interruption at each write boundary.
-- [ ] Test repeated recovery.
-- [ ] Verify recovered row counts and values.
+## M6.2 Recovery — protocol defined; Database replay implementation in progress
+- [x] Define startup recovery algorithm for the first immutable ANF/Chronicle artifact scope.
+- [x] Define committed-only redo semantics and explicit handling of incomplete transactions.
+- [x] Define versioned mutation-intent envelope, canonical file names, size and SHA-256 validation.
+- [x] Define staged-file -> durable WAL COMMIT -> no-replace final publication ordering.
+- [x] Define idempotent replay for already-published files and Chronicle BatchId/sequence reconstruction.
+- [x] Define fail-closed behavior for missing committed artifacts and checksum conflicts.
+- [x] Define crash-point matrix for staging, commit, link publication and cleanup.
+- [ ] Implement ANF insert staging and WAL intent integration.
+- [ ] Implement Chronicle ingest staging and WAL intent integration.
+- [ ] Run WAL replay before Chronicle index reconstruction in Database::open.
+- [ ] Add recovery-required state after committed publication failure.
+- [ ] Inject process interruption at every listed crash point.
+- [ ] Verify replay idempotence across two consecutive reopens.
+- [ ] Implement catalog DDL replay only after data-artifact replay is proven.
+
+Specification: docs/specifications/wal-recovery-v0.1.md.
 
 ## M6.3 Transactions and concurrency
 - [ ] Define transaction scope and isolation goals.

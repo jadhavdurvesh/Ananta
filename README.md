@@ -177,3 +177,6 @@ The example creates a deterministic 2,048-row telemetry dataset, persists ANALYZ
 
 
 The standalone ANWL WAL reader additionally tests truncated frame-body recovery, sequence-gap rejection and transaction commit-digest validation. Database write-path integration and startup replay remain M6.2 work.
+
+
+M6.2 is being developed against a redo-only staged-file publication protocol. Its crash matrix, mutation-intent envelope, recovery ordering, Chronicle idempotency rules and fail-closed cases are specified in docs/specifications/wal-recovery-v0.1.md. This remains design work until Database mutation paths and startup replay are implemented and fault-injection tested.
