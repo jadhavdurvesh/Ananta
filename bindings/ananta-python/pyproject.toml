@@ -11,4 +11,3 @@ requires-python = ">=3.11"
 [tool.maturin]
 manifest-path = "Cargo.toml"
 module-name = "ananta_native"
-python-source = "python"
