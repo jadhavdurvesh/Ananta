@@ -504,6 +504,19 @@ impl Database {
                     }
                     Ok(weave_root)
                 }
+                WalArtifactKind::CompactionOutputManifest => {
+                    let Some((table_name, definition)) = catalog.tables.iter()
+                        .find(|(_, definition)| definition.id.0 == intent.table_id)
+                    else {
+                        return Err(WalRecoveryError::MissingTableId(intent.table_id));
+                    };
+                    if definition.schema_revision != intent.schema_revision {
+                        return Err(WalRecoveryError::FileConflict(
+                            "compaction manifest schema revision differs from the catalog",
+                        ));
+                    }
+                    Ok(root.join("data").join(table_name).join("weaves"))
+                }
                 WalArtifactKind::AnfSegment | WalArtifactKind::ChronicleRecord => {
                     let Some((table_name, definition)) = catalog.tables.iter()
                         .find(|(_, definition)| definition.id.0 == intent.table_id)
@@ -541,6 +554,7 @@ impl Database {
             recovery_required: false,
             _writer_lock: writer_lock,
         };
+        database.recover_compaction_candidate_publications()?;
         database.recover_compaction_jobs()?;
         database.recover_active_weaves()?;
         Ok(database)
