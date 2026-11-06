@@ -422,10 +422,10 @@ mod tests {
         fs::write(root.join("catalog/catalog.anc"), b"mutable catalog").unwrap();
         let (reference, report) = create_checkpoint(&root, 12, 2).unwrap();
         assert_eq!(report.file_count, 1);
-        let validated = validate_checkpoint(&root, &reference.encode()).unwrap();
+        let validated = validate_checkpoint(&root, &reference.encode(), &BTreeSet::new()).unwrap();
         assert_eq!(validated.base_sequence, 12);
         fs::write(root.join("data/table/segment-00000000000000000001.anf"), b"tampered").unwrap();
-        assert!(validate_checkpoint(&root, &reference.encode()).is_err());
+        assert!(validate_checkpoint(&root, &reference.encode(), &BTreeSet::new()).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }
