@@ -17,8 +17,8 @@ impl TimeRange {
         Ok(Self{lower_inclusive,upper_exclusive})
     }
     pub fn contains(&self,timestamp:i64)->bool{
-        self.lower_inclusive.is_none_or(|lower|timestamp>=lower)
-            && self.upper_exclusive.is_none_or(|upper|timestamp<upper)
+        self.lower_inclusive.map_or(true,|lower|timestamp>=lower)
+            && self.upper_exclusive.map_or(true,|upper|timestamp<upper)
     }
 }
 
@@ -164,7 +164,7 @@ where I:IntoIterator<Item=Result<VectorBatch,ExecutionError>>{
             };
             let values=batch.columns.iter().map(|column|column.values[row].clone()).collect::<Vec<_>>();
             let key=SeriesKey(series_columns.iter().map(|index|values[*index].clone()).collect());
-            let replace=latest.get(&key).is_none_or(|(old_timestamp,_,_)|timestamp>=*old_timestamp);
+            let replace=latest.get(&key).map_or(true,|(old_timestamp,_,_)|timestamp>=*old_timestamp);
             if replace{
                 if !latest.contains_key(&key){
                     if latest.len()>=context.limits.max_groups{return Err(ExecutionError::ResourceLimit("latest-per-series group limit exceeded"));}
@@ -224,7 +224,7 @@ mod tests{
         let range=TimeRange::new(Some(3),Some(11)).unwrap();
         let filtered=filter_time_range(&batch,1,range).unwrap();
         assert_eq!(filtered.row_count,2);
-        assert!(filter_time_range(&batch,1,TimeRange::new(Some(11),Some(3)).unwrap_err().into()).is_err());
+        assert!(TimeRange::new(Some(11),Some(3)).is_err());
     }
     #[test]
     fn bucketed_aggregate_uses_utc_bucket_start_as_group_key(){
