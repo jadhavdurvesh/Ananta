@@ -538,29 +538,29 @@ Specification: docs/specifications/aql-v0.1.md
 - [x] Test malformed input diagnostics.
 - [x] Implement parser.
 - [x] Define AST nodes.
-- [ ] Implement AST validation.
-- [ ] Define logical-plan representation.
-- [ ] Add parser golden tests.
+- [x] Implement structural AST validation.
+- [x] Define logical-plan representation (Scan → Filter → Project → Limit).
+- [x] Add parser golden tests and rejected-grammar cases.
 
 ## M4.3 First query capabilities
-- [ ] Select source table.
-- [ ] Project selected columns.
-- [ ] Filter with simple predicates.
-- [ ] Limit rows.
-- [ ] Add timestamp-range filtering.
-- [ ] Bind parameters safely.
-- [ ] Return typed result batches.
-- [ ] Add query cancellation checks.
-- [ ] Add query error codes.
+- [x] Select source table with quoted/unquoted catalog resolution.
+- [x] Project selected columns and expressions.
+- [x] Filter with typed predicates and three-valued NULL logic.
+- [x] Limit rows globally across bounded input batches.
+- [x] Add timestamp-range filtering using typed TIMESTAMP_MICROS comparisons.
+- [x] Bind named and positional parameters as typed values; never interpolate source text.
+- [x] Return owned typed columnar result batches.
+- [x] Add cooperative query cancellation checks.
+- [x] Add stable query execution error codes.
 
 ## M4 exit gate
-- [ ] AQL grammar and semantics are documented.
-- [ ] Parser tests pass.
-- [ ] Query results match equivalent direct Rust API operations.
-- [ ] Query execution does not rely on an external database.
-- [ ] AQL examples run using the native CLI/API.
+- [x] AQL grammar and semantics are documented.
+- [x] Lexer, parser, AST validation and golden tests pass.
+- [x] Query results match equivalent direct Rust API operations.
+- [x] Query execution uses ANANTA's native storage and does not rely on an external database.
+- [x] A native telemetry AQL example runs in CI using the embedded API.
 
-**Deliverable:** AQL v0.1.
+**Deliverable:** AQL v0.1 (read-only, single-table SELECT; joins, aggregation, ORDER BY and physical pruning deferred).
 
 ---
 
