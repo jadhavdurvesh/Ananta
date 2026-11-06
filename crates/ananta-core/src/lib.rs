@@ -2781,7 +2781,7 @@ fn validate_checkpoint_records(root: &Path, report: &WalReadReport) -> Result<()
     if checkpoints.is_empty() {
         return Ok(());
     }
-    if checkpoints.len() != 1 || report.records.first().is_none_or(|record| {
+    if checkpoints.len() != 1 || report.records.first().map_or(true, |record| {
         record.sequence != 1 || record.kind != WalRecordKind::Checkpoint
     }) || checkpoints[0].transaction_id != 0
     {
@@ -6276,6 +6276,9 @@ mod tests {
             "AfterCanonicalCatalogPublished" => AfterCanonicalCatalogPublished,
             "AfterCanonicalCatalogTempSynced" => AfterCanonicalCatalogTempSynced,
             "AfterCanonicalCatalogRenamedBeforeDirectorySync" => AfterCanonicalCatalogRenamedBeforeDirectorySync,
+            "AfterCheckpointTempSynced" => AfterCheckpointTempSynced,
+            "AfterCheckpointRenamedBeforeDirectorySync" => AfterCheckpointRenamedBeforeDirectorySync,
+            "AfterCheckpointDirectorySync" => AfterCheckpointDirectorySync,
             _ => panic!("unsupported subprocess crash point: {point_name}"),
         };
         let path = PathBuf::from(std::env::var_os("ANANTA_WAL_CRASH_DATABASE").unwrap());
@@ -6307,6 +6310,9 @@ mod tests {
             }
             "navigation-map" => {
                 database.build_navigation_map("telemetry", 901).unwrap();
+            }
+            "checkpoint" => {
+                database.create_checkpoint().unwrap();
             }
             _ => panic!("unsupported subprocess operation: {operation}"),
         }
@@ -6505,6 +6511,136 @@ mod tests {
         assert_eq!(reopened.scan("telemetry").unwrap(), rows);
         reopened.check_consistency(1).unwrap();
         drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    fn exercise_checkpoint_process_crash(point: &str, rotated: bool) {
+        use std::process::Command;
+
+        let path = temp_path();
+        let rows = vec![vec![
+            Value::TimestampMicros(1_000),
+            Value::Utf8("checkpoint-source".into()),
+            Value::Float64(15.0),
+        ]];
+        let mut setup = Database::open(&path).unwrap();
+        setup.create_table("telemetry", sample_schema()).unwrap();
+        setup.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([0xC1; 16]).unwrap(),
+            &rows,
+        ).unwrap();
+        drop(setup);
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::wal_recovery_process_crash_worker")
+            .arg("--nocapture")
+            .env("ANANTA_WAL_CRASH_OPERATION", "checkpoint")
+            .env("ANANTA_WAL_CRASH_POINT", point)
+            .env("ANANTA_WAL_CRASH_DATABASE", &path)
+            .env("ANANTA_WAL_CRASH_EXIT", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86), "checkpoint worker did not terminate at {point}");
+        fs::remove_file(path.join(".ananta.lock")).unwrap();
+
+        let mut recovered = Database::open(&path).unwrap();
+        assert_eq!(recovered.scan("telemetry").unwrap(), rows);
+        let wal_report = read_wal(path.join("wal").join("database.anwl")).unwrap();
+        assert_eq!(
+            wal_report.records.first().map(|record| record.kind == WalRecordKind::Checkpoint).unwrap_or(false),
+            rotated,
+            "checkpoint rotation state at {point}",
+        );
+        recovered.check_consistency(1).unwrap();
+        drop(recovered);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap(), rows);
+        reopened.check_consistency(1).unwrap();
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_wal_replacement_survives_subprocess_crashes() {
+        exercise_checkpoint_process_crash("AfterCheckpointTempSynced", false);
+        exercise_checkpoint_process_crash("AfterCheckpointRenamedBeforeDirectorySync", true);
+        exercise_checkpoint_process_crash("AfterCheckpointDirectorySync", true);
+    }
+
+    #[test]
+    fn database_checkpoint_rotates_wal_and_replays_subsequent_commits() {
+        let path = temp_path();
+        let first_rows = vec![vec![
+            Value::TimestampMicros(1),
+            Value::Utf8("before-checkpoint".into()),
+            Value::Float64(1.0),
+        ]];
+        let second_rows = vec![vec![
+            Value::TimestampMicros(2),
+            Value::Utf8("after-checkpoint".into()),
+            Value::Float64(2.0),
+        ]];
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([0xC2; 16]).unwrap(),
+            &first_rows,
+        ).unwrap();
+        let previous = read_wal(path.join("wal").join("database.anwl")).unwrap();
+        assert!(previous.last_sequence > 1);
+
+        let checkpoint = db.create_checkpoint().unwrap();
+        assert_eq!(checkpoint.base_sequence, previous.last_sequence);
+        assert!(checkpoint.manifest_path.is_file());
+        let rotated = read_wal(path.join("wal").join("database.anwl")).unwrap();
+        assert_eq!(rotated.records.len(), 1);
+        assert_eq!(rotated.records[0].kind, WalRecordKind::Checkpoint);
+        assert!(rotated.is_clean());
+
+        db.ingest_batch(
+            "telemetry",
+            BatchId::from_bytes([0xC3; 16]).unwrap(),
+            &second_rows,
+        ).unwrap();
+        drop(db);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.scan("telemetry").unwrap(), vec![first_rows[0].clone(), second_rows[0].clone()]);
+        let consistency = reopened.check_consistency(1).unwrap();
+        assert_eq!(consistency.rows_checked, 2);
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_manifest_mismatch_fails_database_open_closed() {
+        let path = temp_path();
+        let mut db = Database::open(&path).unwrap();
+        db.create_table("telemetry", sample_schema()).unwrap();
+        let row = vec![vec![
+            Value::TimestampMicros(50),
+            Value::Utf8("checkpoint-integrity".into()),
+            Value::Float64(5.0),
+        ]];
+        db.insert_batch("telemetry", &row).unwrap();
+        let checkpoint = db.create_checkpoint().unwrap();
+        drop(db);
+
+        let segment = fs::read_dir(path.join("data").join("telemetry")).unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| candidate.extension().and_then(|value| value.to_str()) == Some("anf"))
+            .unwrap();
+        let mut bytes = fs::read(&segment).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        fs::write(&segment, bytes).unwrap();
+        assert!(matches!(Database::open(&path), Err(DbError::Wal(_))));
+        assert!(checkpoint.manifest_path.is_file());
         fs::remove_dir_all(path).unwrap();
     }
 
