@@ -411,6 +411,7 @@ impl Database {
         // A handle owns the exclusive local writer lock for its entire lifetime.
         let writer_lock = DatabaseLock::acquire(&root)?;
         cleanup_stale_catalog_replacement_temp(&root)?;
+        cleanup_legacy_schema_snapshot_temps(&root)?;
         let catalog_path = root.join("catalog").join("catalog.anc");
         let mut catalog = match fs::metadata(&catalog_path) {
             Ok(_) => load_catalog(&catalog_path)?,
@@ -2537,6 +2538,40 @@ fn cleanup_stale_catalog_replacement_temp(root: &Path) -> Result<(), DbError> {
             return Err(DbError::CorruptCatalog(
                 "catalog replacement temporary path is not a regular file",
             ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DbError::Io(error)),
+    }
+    Ok(())
+}
+
+fn cleanup_legacy_schema_snapshot_temps(root: &Path) -> Result<(), DbError> {
+    let schemas_root = root.join("catalog").join("schemas");
+    match fs::read_dir(&schemas_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let directory = entry.path();
+                let mut changed = false;
+                for schema_entry in fs::read_dir(&directory)? {
+                    let schema_entry = schema_entry?;
+                    if !schema_entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let filename = schema_entry.file_name();
+                    let filename = filename.to_string_lossy();
+                    if is_canonical_numbered_temp(&filename, "schema-", ".ans.tmp") {
+                        fs::remove_file(schema_entry.path())?;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    sync_recovery_directory(&directory)?;
+                }
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(DbError::Io(error)),
