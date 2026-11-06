@@ -247,7 +247,7 @@ AMUT v1 has a fixed-size identity envelope. For a Capsule intent, `table_id` is 
 
 For a Navigation Map intent, `table_id` is the stable TableId, `file_id` is the map generation, and `schema_revision` remains the current logical schema revision. Recovery decodes the map against the logged TableId/generation, then checks every referenced Capsule is a regular file of the recorded length, matches its SHA-256, decodes successfully, and has metadata identical to the map entry. Missing or conflicting dependencies fail open; the map is never treated as authoritative data.
 
-Both builders reject an already-existing immutable generation before committing another intent. Crash/reopen tests cover interruption immediately after durable COMMIT for each artifact type and verify successful replay. The wider subprocess and filesystem-sync interruption matrix for these two builders remains outstanding; the tests have been added but were not executed in this environment.
+Both builders reject an already-existing immutable generation before committing another intent. In-process and subprocess crash/reopen tests cover both artifact types. Child-process termination is exercised at WAL MUTATION (incomplete transaction), durable COMMIT and final-name link before directory sync; recovery checks artifact/data state, consistency, and a second reopen. The full subprocess matrix for every staging/flush/file-sync/directory-sync/cleanup checkpoint and broader filesystem fault injection remains outstanding. These tests have been added but were not executed in this environment.
 
 ## 17. Checkpoint and retention boundary
 
