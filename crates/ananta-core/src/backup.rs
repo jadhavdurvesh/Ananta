@@ -27,7 +27,7 @@ pub struct BackupReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Entry {
+pub(crate) struct Entry {
     path: String,
     length: u64,
     sha256: [u8; 32],
