@@ -276,6 +276,8 @@ pub(crate) enum WalRecoveryCrashPoint {
     AfterSchemaSnapshotPublished,
     AfterCatalogSnapshotPublished,
     AfterCanonicalCatalogPublished,
+    AfterCanonicalCatalogTempSynced,
+    AfterCanonicalCatalogRenamedBeforeDirectorySync,
 }
 
 #[cfg(test)]
