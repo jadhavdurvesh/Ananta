@@ -3553,6 +3553,7 @@ mod tests {
         fs::remove_dir_all(restored).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn large_chronicle_capsule_map_backup_restores_all_rows_and_indexes() {
         let root = temp_path();
