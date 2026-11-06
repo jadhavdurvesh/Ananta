@@ -1,4 +1,4 @@
-//! Snapshot-first publication for the first supported schema change.
+//! WAL-backed immutable schema and catalog publication for nullable-column DDL.
 
 use super::{
     allocate_object_id, increment_catalog_revision, Database,
@@ -11,9 +11,8 @@ impl Database {
     /// Add one nullable column without rewriting existing data segments.
     ///
     /// The current immutable snapshot is verified against the catalog first.
-    /// The new snapshot is then published before the catalog pointer. If the
-    /// catalog write fails, the live handle retains its old catalog and the
-    /// future-revision snapshot remains an orphan for explicit inspection.
+    /// The new schema snapshot and complete catalog snapshot are committed as
+    /// one WAL transaction before either final metadata name is published.
     pub fn add_nullable_column(
         &mut self,
         table: &str,
