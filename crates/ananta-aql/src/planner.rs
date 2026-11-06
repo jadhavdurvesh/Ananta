@@ -15,7 +15,8 @@ pub struct PlannerOptions {
 impl Default for PlannerOptions {
     fn default()->Self{
         Self{enable_projection_pushdown:true,enable_predicate_pushdown:true,
-            navigation_map_generation:None,max_capsule_materialized_rows:100_000}
+            navigation_map_generation:None,max_capsule_materialized_rows:100_000,
+            max_capsule_materialized_bytes:128*1024*1024}
     }
 }
 
