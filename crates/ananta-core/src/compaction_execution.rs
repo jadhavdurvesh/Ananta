@@ -1076,7 +1076,16 @@ mod tests {
                 let pointer = db.active_weave_pointer("telemetry").unwrap().unwrap();
                 assert_eq!(pointer.active.weave_id, 101);
                 assert_eq!(db.scan("telemetry").unwrap()[0][0], Value::TimestampMicros(100));
-                let rolled_back = db.rollback_active_weave("telemetry").unwrap();
+                crate::wal_recovery::arm_wal_recovery_crash_point(
+                    crate::wal_recovery::WalRecoveryCrashPoint::AfterActivePointerRenamedBeforeDirectorySync,
+                );
+                let interrupted_rollback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    db.rollback_active_weave("telemetry")
+                }));
+                assert!(interrupted_rollback.is_err());
+                drop(db);
+                db = Database::open(&root).unwrap();
+                let rolled_back = db.active_weave_pointer("telemetry").unwrap().unwrap();
                 assert_eq!(rolled_back.active.weave_id, 100);
                 assert_eq!(db.scan("telemetry").unwrap(), [rows_one.clone(), rows_two.clone()].concat());
             }
