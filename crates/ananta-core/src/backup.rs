@@ -54,7 +54,7 @@ pub(crate) fn create_backup(source: &Path, destination: &Path) -> io::Result<Bac
         );
         sync_tree_directories(&staging)?;
         sync_directory(parent)?;
-        fs::rename(&staging, &destination)?;
+        ananta_platform::atomic_move(&staging, &destination)?;
         crate::wal_recovery::maybe_crash_after(
             crate::wal_recovery::WalRecoveryCrashPoint::AfterBackupDirectoryRenamedBeforeSync,
         );
@@ -96,7 +96,7 @@ pub(crate) fn restore_backup(backup: &Path, destination: &Path) -> io::Result<Ba
         }
         sync_tree_directories(&staging)?;
         sync_directory(parent)?;
-        fs::rename(&staging, &destination)?;
+        ananta_platform::atomic_move(&staging, &destination)?;
         sync_directory(parent)?;
         report(&destination, &entries, &manifest)
     })();
