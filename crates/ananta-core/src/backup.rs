@@ -89,7 +89,7 @@ pub(crate) fn restore_backup(backup: &Path, destination: &Path) -> io::Result<Ba
                 fs::create_dir_all(directory)?;
             }
             fs::copy(&source, &target)?;
-            File::open(&target)?.sync_all()?;
+            OpenOptions::new().write(true).open(&target)?.sync_all()?;
             if crate::chronicle::sha256_file(&target)? != entry.sha256 {
                 return Err(invalid("restored file fingerprint differs from backup manifest"));
             }
@@ -202,7 +202,7 @@ fn copy_tree(
                 fs::create_dir_all(parent)?;
             }
             fs::copy(&source_path, &target_path)?;
-            File::open(&target_path)?.sync_all()?;
+            OpenOptions::new().write(true).open(&target_path)?.sync_all()?;
             crate::wal_recovery::maybe_crash_after(
                 crate::wal_recovery::WalRecoveryCrashPoint::AfterBackupFileSynced,
             );
