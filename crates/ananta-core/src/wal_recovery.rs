@@ -963,7 +963,7 @@ mod tests {
             file_len: incomplete_bytes.len() as u64,
             sha256: crate::chronicle::sha256(incomplete_bytes),
         };
-        stage_wal_artifact(&table_dir, &committed_intent, committed_bytes).unwrap();
+        stage_wal_artifact(&table_dir, &committed_intent, &committed_bytes).unwrap();
         stage_wal_artifact(&table_dir, &incomplete_intent, incomplete_bytes).unwrap();
 
         let mut writer = WalWriter::open(&wal_path, WalSyncPolicy::OnCommit).unwrap();
