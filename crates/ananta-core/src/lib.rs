@@ -6420,22 +6420,17 @@ mod tests {
 
         let wal_path = path.join("wal").join("database.anwl");
         let report = read_wal(&wal_path).unwrap();
+        // Table creation, ANF insertion and Chronicle ingestion each commit
+        // one WAL transaction.
         assert_eq!(
             report.records.iter().filter(|record| record.kind == WalRecordKind::Commit).count(),
-            2,
+            3,
         );
         assert!(report.is_clean());
 
         let mut reopened = Database::open(&path).unwrap();
         let rows = reopened.scan("telemetry").unwrap();
-        let definition = reopened.catalog.tables.get("telemetry").unwrap();
-        let scan_paths = reopened.list_table_scan_paths("telemetry", definition).unwrap();
-        assert_eq!(
-            rows.len(),
-            2,
-            "logical rows: {rows:?}; physical scan paths: {scan_paths:?}; inventory: {:?}",
-            reopened.storage_inventory().unwrap(),
-        );
+        assert_eq!(rows.len(), 2);
         assert!(rows.iter().any(|row| row[1] == Value::Utf8("anf-device".into())));
         assert!(rows.iter().any(|row| row[1] == Value::Utf8("chronicle-device".into())));
         let stats = reopened.ingestion_stats("telemetry").unwrap();
