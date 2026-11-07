@@ -4,14 +4,15 @@ use crate::{
 };
 use ananta_core::{Database, DbError, ScanBatchIter};
 use ananta_execution::{
-    CancellationToken, ComparisonOperator as NativeComparison, ExecutionContext, ExecutionError, ExecutionOperator,
+    estimate_batch_bytes, CancellationToken, ComparisonOperator as NativeComparison,
+    ExecutionConfig, ExecutionContext, ExecutionError, ExecutionOperator, ExecutionOptionsV1,
     FilterOperator, FilterPredicate, LimitOperator, Operand, ProjectionField, ProjectionOperator,
     ScanOperator, TableStatistics, ColumnStatistics,
 };
 use ananta_types::{Column, DataType, Schema, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// Stable machine-readable classifications for AQL parse, planning and execution errors.
@@ -19,6 +20,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AqlErrorCode {
     InvalidQuery,
+    InvalidOptions,
     TableNotFound,
     ColumnNotFound,
     TypeMismatch,
@@ -36,6 +38,7 @@ impl AqlErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidQuery => "invalid_query",
+            Self::InvalidOptions => "invalid_options",
             Self::TableNotFound => "table_not_found",
             Self::ColumnNotFound => "column_not_found",
             Self::TypeMismatch => "type_mismatch",
@@ -210,9 +213,57 @@ pub struct AqlResultIter {
     predicate: Option<CompiledExpr>,
     bindings: ParameterBindings,
     remaining_limit: Option<u64>,
-    cancellation: Option<Arc<AtomicBool>>,
+    cancellation: Option<CancellationToken>,
+    execution_config: ExecutionConfig,
     metrics: AqlExecutionMetrics,
     finished: bool,
+}
+
+/// Version of the public AQL query-options contract.
+pub const AQL_EXECUTION_OPTIONS_V1_VERSION: u16 = 1;
+
+/// Versioned AQL options composing native execution limits, optimizer policy
+/// and a shared cancellation signal.
+#[derive(Debug, Clone)]
+pub struct AqlExecutionOptionsV1 {
+    pub version: u16,
+    pub execution: ExecutionOptionsV1,
+    pub optimizer_enabled: bool,
+    pub cancellation: Option<CancellationToken>,
+}
+
+impl Default for AqlExecutionOptionsV1 {
+    fn default() -> Self {
+        Self {
+            version: AQL_EXECUTION_OPTIONS_V1_VERSION,
+            execution: ExecutionOptionsV1::default(),
+            optimizer_enabled: true,
+            cancellation: None,
+        }
+    }
+}
+
+impl AqlExecutionOptionsV1 {
+    pub fn new(execution: ExecutionOptionsV1) -> Self {
+        Self { execution, ..Self::default() }
+    }
+
+    pub fn validate(&self) -> Result<(), AqlExecutionError> {
+        if self.version != AQL_EXECUTION_OPTIONS_V1_VERSION {
+            return Err(query_error(
+                AqlErrorCode::InvalidOptions,
+                format!("unsupported AQL execution-options version {}", self.version),
+                crate::Span::default(),
+            ));
+        }
+        self.execution.validate().map_err(|error| {
+            query_error(
+                AqlErrorCode::InvalidOptions,
+                error.to_string(),
+                crate::Span::default(),
+            )
+        })
+    }
 }
 
 pub fn execute(
@@ -225,11 +276,8 @@ pub fn execute(
     execute_with_options(database, query, bindings, batch_rows, cancellation, true)
 }
 
-/// Execute with the stable cloneable cancellation-token API.
-///
-/// The legacy Arc<AtomicBool> parameter remains supported by execute(); new
-/// integrations should pass a CancellationToken so the signal can be shared
-/// without exposing atomic implementation details at call sites.
+/// Execute with the stable cloneable cancellation-token API while retaining
+/// the legacy per-call batch-size parameter.
 pub fn execute_with_cancellation_token(
     database: &Database,
     query: &Query,
@@ -237,18 +285,23 @@ pub fn execute_with_cancellation_token(
     batch_rows: usize,
     cancellation: Option<CancellationToken>,
 ) -> Result<AqlResultIter, AqlExecutionError> {
-    execute(
-        database,
-        query,
-        bindings,
-        batch_rows,
-        cancellation.map(|token| token.shared_flag()),
-    )
+    if batch_rows == 0 {
+        return Err(query_error(
+            AqlErrorCode::InvalidQuery,
+            "AQL batch_rows must be greater than zero",
+            crate::Span::default(),
+        ));
+    }
+    let mut options = AqlExecutionOptionsV1::default();
+    options.execution = ExecutionOptionsV1::new(ExecutionConfig {
+        max_batch_rows: batch_rows,
+        ..ExecutionConfig::default()
+    });
+    options.cancellation = cancellation;
+    execute_with_v1_options(database, query, bindings, options)
 }
 
-/// Execute with the native physical optimizer enabled or disabled. The disabled
-/// path is retained as a correctness reference and fallback for expressions
-/// that are not yet lowerable to native vector operators.
+/// Backward-compatible entry point for callers using raw shared atomic flags.
 pub fn execute_with_options(
     database: &Database,
     query: &Query,
@@ -257,8 +310,6 @@ pub fn execute_with_options(
     cancellation: Option<Arc<AtomicBool>>,
     optimizer_enabled: bool,
 ) -> Result<AqlResultIter, AqlExecutionError> {
-    crate::validate_ast(query).map_err(from_parse_error)?;
-    bindings.validate_for(query).map_err(from_parse_error)?;
     if batch_rows == 0 {
         return Err(query_error(
             AqlErrorCode::InvalidQuery,
@@ -266,14 +317,37 @@ pub fn execute_with_options(
             crate::Span::default(),
         ));
     }
+    let mut options = AqlExecutionOptionsV1::default();
+    options.execution = ExecutionOptionsV1::new(ExecutionConfig {
+        max_batch_rows: batch_rows,
+        ..ExecutionConfig::default()
+    });
+    options.optimizer_enabled = optimizer_enabled;
+    options.cancellation = cancellation.map(CancellationToken::from_shared_flag);
+    execute_with_v1_options(database, query, bindings, options)
+}
+
+/// Execute a query with one versioned options object for resource limits,
+/// optimizer policy and cancellation.
+pub fn execute_with_v1_options(
+    database: &Database,
+    query: &Query,
+    bindings: &ParameterBindings,
+    options: AqlExecutionOptionsV1,
+) -> Result<AqlResultIter, AqlExecutionError> {
+    options.validate()?;
+    crate::validate_ast(query).map_err(from_parse_error)?;
+    bindings.validate_for(query).map_err(from_parse_error)?;
+
     let Statement::Select(select) = &query.statement;
     let source = resolve_table_name(database, &select.source)?;
     let schema = database.schema(&source).map_err(from_storage_error)?.clone();
+    let execution_config = options.execution.limits;
 
     let projection = compile_projection(select, &schema, &source, bindings)?;
     let predicate = compile_predicate(select, &schema, &source, bindings)?;
 
-    let native = if optimizer_enabled {
+    let native = if options.optimizer_enabled {
         try_build_native_pipeline(
             database,
             &source,
@@ -282,14 +356,28 @@ pub fn execute_with_options(
             predicate.as_ref(),
             bindings,
             select.limit,
-            batch_rows,
-            cancellation.clone(),
+            options.execution,
+            options.cancellation.clone().unwrap_or_default(),
         )?
     } else {
         None
     };
+
     let input = if native.is_none() {
-        Some(database.scan_batches(&source, batch_rows).map_err(from_storage_error)?)
+        let columns = schema.len();
+        let cell_limited_rows = execution_config.max_batch_cells / columns;
+        if cell_limited_rows == 0 {
+            return Err(query_error(
+                AqlErrorCode::ResourceLimit,
+                format!(
+                    "one input row needs {columns} cells; configured maximum is {}",
+                    execution_config.max_batch_cells,
+                ),
+                crate::Span::default(),
+            ));
+        }
+        let scan_batch_rows = execution_config.max_batch_rows.min(cell_limited_rows);
+        Some(database.scan_batches(&source, scan_batch_rows).map_err(from_storage_error)?)
     } else {
         None
     };
@@ -301,7 +389,8 @@ pub fn execute_with_options(
         predicate,
         bindings: bindings.clone(),
         remaining_limit: select.limit,
-        cancellation,
+        cancellation: options.cancellation,
+        execution_config,
         metrics: AqlExecutionMetrics::default(),
         finished: false,
     })
