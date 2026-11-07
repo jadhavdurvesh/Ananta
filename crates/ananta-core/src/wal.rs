@@ -278,7 +278,7 @@ impl WalWriter {
             ));
         }
 
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = payload;
             return Err(WalError::Io(io::Error::new(
@@ -287,7 +287,7 @@ impl WalWriter {
             )));
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.file.sync_all()?;
             let parent = self.path.parent()
@@ -339,9 +339,9 @@ impl WalWriter {
                 crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointTempSynced,
             );
 
-            // POSIX rename atomically replaces the WAL directory entry. Until
-            // this point the old complete log remains the authoritative path.
-            fs::rename(&temporary, &self.path)?;
+            // Platform replacement atomically switches the WAL directory entry.
+            // Until this point the old complete log remains authoritative.
+            ananta_platform::atomic_replace(&temporary, &self.path)?;
             crate::wal_recovery::maybe_crash_after(
                 crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointRenamedBeforeDirectorySync,
             );
@@ -415,6 +415,13 @@ impl WalWriter {
 #[cfg(unix)]
 fn sync_wal_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
+}
+
+// Windows replacement uses MOVEFILE_WRITE_THROUGH, which flushes the move
+// before returning. Rust does not expose a portable directory-handle flush.
+#[cfg(windows)]
+fn sync_wal_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Read and verify a WAL. Complete frames are checksum/sequence/transaction
@@ -670,6 +677,35 @@ mod tests {
         assert_eq!(report.records[3].kind, WalRecordKind::Commit);
         assert_eq!(report.records[4].kind, WalRecordKind::Checkpoint);
         assert_eq!(report.last_sequence, 5);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn wal_checkpoint_replacement_is_atomic_and_preserves_sequence() {
+        let path = path("checkpoint-replace");
+        let mut writer = WalWriter::open(&path, WalSyncPolicy::OnCommit).unwrap();
+        writer.begin_transaction(41, b"before-checkpoint").unwrap();
+        writer.commit_transaction(41).unwrap();
+        let before = read_wal(&path).unwrap();
+        let base_sequence = before.last_sequence;
+
+        writer.replace_with_checkpoint(base_sequence, b"checkpoint-manifest").unwrap();
+        assert_eq!(writer.next_sequence(), base_sequence + 2);
+        let checkpoint = read_wal(&path).unwrap();
+        assert_eq!(checkpoint.records.len(), 1);
+        assert_eq!(checkpoint.records[0].kind, WalRecordKind::Checkpoint);
+        assert_eq!(checkpoint.records[0].sequence, base_sequence + 1);
+        assert_eq!(checkpoint.records[0].payload, b"checkpoint-manifest");
+
+        let next_transaction = base_sequence + 2;
+        writer.begin_transaction(next_transaction, b"after-checkpoint").unwrap();
+        writer.commit_transaction(next_transaction).unwrap();
+        drop(writer);
+        let after = read_wal(&path).unwrap();
+        assert!(after.is_clean());
+        assert_eq!(after.records.len(), 3);
+        assert_eq!(after.records[1].sequence, next_transaction);
+        assert_eq!(after.records[2].sequence, next_transaction + 1);
         fs::remove_file(path).unwrap();
     }
 

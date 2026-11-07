@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 ananta-types = { path = "../ananta-types" }
+ananta-platform = { path = "../ananta-platform" }
 ananta-format = { path = "../ananta-format" }
 
 [lints]
