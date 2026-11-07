@@ -4,7 +4,7 @@ use crate::{
 };
 use ananta_core::{Database, DbError, ScanBatchIter};
 use ananta_execution::{
-    ComparisonOperator as NativeComparison, ExecutionContext, ExecutionError, ExecutionOperator,
+    CancellationToken, ComparisonOperator as NativeComparison, ExecutionContext, ExecutionError, ExecutionOperator,
     FilterOperator, FilterPredicate, LimitOperator, Operand, ProjectionField, ProjectionOperator,
     ScanOperator, TableStatistics, ColumnStatistics,
 };
