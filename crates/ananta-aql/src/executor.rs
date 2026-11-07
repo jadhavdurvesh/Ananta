@@ -2364,6 +2364,7 @@ mod public_error_code_tests {
     #[test]
     fn aql_error_codes_are_stable_machine_readable_identifiers() {
         assert_eq!(AqlErrorCode::InvalidQuery.as_str(), "invalid_query");
+        assert_eq!(AqlErrorCode::InvalidOptions.as_str(), "invalid_options");
         assert_eq!(AqlErrorCode::TableNotFound.as_str(), "table_not_found");
         assert_eq!(AqlErrorCode::Cancelled.as_str(), "cancelled");
         assert_eq!(AqlErrorCode::ResourceLimit.as_str(), "resource_limit");
