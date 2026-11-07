@@ -764,7 +764,7 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 **Goal:** expose the engine to applications without making the browser dashboard a dependency.
 
 ## M7.1 Embedded API hardening
-- [~] Stabilise public Rust API boundaries: add the curated `ananta-api` facade with storage/types/execution/AQL modules, API version and typed error codes; final export/semver review remains.
+- [x] Stabilise public Rust API boundaries: curate root and module exports, mark versioned options extensible, and add a downstream conformance test pinning API/error/options version identifiers.
 - [~] Define configuration compatibility: validated in-process `ExecutionOptionsV1` and `AqlExecutionOptionsV1` are available; durable database and server-wire configuration contracts remain pending.
 - [x] Define structured error codes with stable machine-readable string identifiers for database, execution and AQL errors; keep display text diagnostic-only.
 - [x] Define query/result lifecycle: lazy AqlResultIter yields owned batches, ends at None, and yields terminal errors once; document dropping the iterator boundary.

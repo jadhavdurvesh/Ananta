@@ -131,6 +131,9 @@ pub const EXECUTION_OPTIONS_V1_VERSION: u16 = 1;
 /// Versioned wrapper for bounded execution configuration.
 ///
 /// This is an in-process API object, not a persisted database configuration file.
+/// Versioned execution limits. Construct with Default or new so later
+/// additive options can be introduced without breaking downstream struct literals.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionOptionsV1 {
     pub version: u16,
