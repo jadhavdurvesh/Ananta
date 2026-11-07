@@ -90,6 +90,7 @@ cargo fmt --all
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo run -p ananta-core --example basic
+cargo run -p ananta-aql --example embedded_api
 ```
 
 The example creates/opens `./ananta-data`, creates a telemetry table if needed, writes a batch to ANF segments and reads the rows back. Running it repeatedly appends another batch.
