@@ -769,10 +769,10 @@ impl Database {
     /// high-water sequence plus one; future transactions retain monotonic IDs.
     /// Full replay is retained for every transaction written after the marker.
     pub fn create_checkpoint(&mut self) -> Result<CheckpointReport, DbError> {
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             return Err(DbError::Wal(
-                "atomic WAL checkpoint rotation is currently supported only on Unix".into(),
+                "atomic WAL checkpoint rotation is unsupported on this platform".into(),
             ));
         }
         self.ensure_operational()?;
