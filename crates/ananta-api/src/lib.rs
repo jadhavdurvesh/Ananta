@@ -38,15 +38,15 @@ pub mod aql {
         execute, execute_source, execute_with_cancellation_token, execute_with_options, execute_with_v1_options,
         explain, explain_with_statistics, parse, AqlError, AqlErrorCode,
         AqlExecutionError, AqlExecutionMetrics, AqlExecutionOptionsV1, AqlPhysicalPlan, AqlResultBatch,
-        AqlResultIter, ParameterBindings, Query, AQL_VERSION,
+        AqlResultIter, ParameterBindings, Query, AQL_VERSION, AQL_EXECUTION_OPTIONS_V1_VERSION,
     };
 }
 
 /// The most common integration surface is also re-exported at the crate root.
 pub use aql::{
     execute_with_cancellation_token, execute_with_v1_options, parse, AqlErrorCode, AqlExecutionError,
-    AqlExecutionOptionsV1, AqlResultBatch, AqlResultIter, ParameterBindings, Query,
+    AqlExecutionOptionsV1, AqlResultBatch, AqlResultIter, ParameterBindings, Query, AQL_EXECUTION_OPTIONS_V1_VERSION,
 };
-pub use execution::{CancellationToken, ExecutionOptionsV1};
+pub use execution::{CancellationToken, ExecutionConfig, ExecutionOptionsV1};
 pub use storage::{Database, DbError, DbErrorCode, ObjectId};
 pub use types::{Column, DataType, Schema, Value};
