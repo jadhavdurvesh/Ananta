@@ -483,15 +483,15 @@ mod tests {
         fs::write(root.join("catalog/catalog.anc"), b"catalog").unwrap();
         fs::write(root.join("data/table/one.anf"), b"one").unwrap();
 
-        let (first, _) = create_checkpoint(&root, 10, 1).unwrap();
+        let (first, first_report) = create_checkpoint(&root, 10, 1).unwrap();
         fs::write(root.join("data/table/two.chr"), b"two").unwrap();
-        let (second, _) = create_checkpoint(&root, 20, 1).unwrap();
+        let (second, second_report) = create_checkpoint(&root, 20, 1).unwrap();
         assert!(first.manifest_filename() != second.manifest_filename());
 
-        let removed = prune_superseded_checkpoint_manifests(&root, &second.manifest_path).unwrap();
+        let removed = prune_superseded_checkpoint_manifests(&root, &second_report.manifest_path).unwrap();
         assert_eq!(removed, 1);
-        assert!(!first.manifest_path.exists());
-        assert!(second.manifest_path.is_file());
+        assert!(!first_report.manifest_path.exists());
+        assert!(second_report.manifest_path.is_file());
         assert_eq!(
             fs::read_dir(root.join("wal").join("checkpoints")).unwrap().count(),
             1,
