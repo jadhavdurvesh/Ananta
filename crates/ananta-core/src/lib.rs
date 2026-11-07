@@ -4904,7 +4904,7 @@ mod tests {
         // removes it before atomically migrating the untouched v1 catalog.
         let migrated = Database::open(&path).unwrap();
         assert_eq!(migrated.catalog_revision(), 1);
-        assert_eq!(migrated.schema("telemetry").unwrap(), schema);
+        assert_eq!(migrated.schema("telemetry").unwrap(), &schema);
         drop(migrated);
         let bytes = fs::read(&catalog_path).unwrap();
         assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), CATALOG_VERSION);
