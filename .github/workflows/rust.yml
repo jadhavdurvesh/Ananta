@@ -30,6 +30,10 @@ jobs:
         run: |
           set -euo pipefail
           cargo run -p ananta-aql --example telemetry_query
+      - name: Run stable embedded API example
+        run: |
+          set -euo pipefail
+          cargo run -p ananta-aql --example embedded_api
       - name: Run native analytics example
         run: |
           set -euo pipefail
