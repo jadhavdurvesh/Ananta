@@ -35,17 +35,17 @@ pub mod execution {
 /// AQL parsing, parameter binding, streaming results and query diagnostics.
 pub mod aql {
     pub use ananta_aql::{
-        execute, execute_source, execute_with_cancellation_token, execute_with_options,
+        execute, execute_source, execute_with_cancellation_token, execute_with_options, execute_with_v1_options,
         explain, explain_with_statistics, parse, AqlError, AqlErrorCode,
-        AqlExecutionError, AqlExecutionMetrics, AqlPhysicalPlan, AqlResultBatch,
+        AqlExecutionError, AqlExecutionMetrics, AqlExecutionOptionsV1, AqlPhysicalPlan, AqlResultBatch,
         AqlResultIter, ParameterBindings, Query, AQL_VERSION,
     };
 }
 
 /// The most common integration surface is also re-exported at the crate root.
 pub use aql::{
-    execute_with_cancellation_token, parse, AqlErrorCode, AqlExecutionError,
-    AqlResultBatch, AqlResultIter, ParameterBindings, Query,
+    execute_with_cancellation_token, execute_with_v1_options, parse, AqlErrorCode, AqlExecutionError,
+    AqlExecutionOptionsV1, AqlResultBatch, AqlResultIter, ParameterBindings, Query,
 };
 pub use execution::{CancellationToken, ExecutionOptionsV1};
 pub use storage::{Database, DbError, DbErrorCode, ObjectId};
