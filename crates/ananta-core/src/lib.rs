@@ -3496,11 +3496,21 @@ fn checksum64(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use ananta_format::encode_segment;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Tests run concurrently. Wall-clock nanoseconds alone are not guaranteed
+    // to be unique on every filesystem/clock implementation, so include a
+    // process-local sequence and PID in every test database path.
+    static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_path() -> PathBuf {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("ananta-test-{nonce}"))
+        let sequence = TEMP_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "ananta-test-{}-{nonce}-{sequence}",
+            std::process::id(),
+        ))
     }
 
     fn sample_schema() -> Schema {
