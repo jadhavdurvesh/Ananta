@@ -44,8 +44,8 @@ pub mod aql {
 
 /// The most common integration surface is also re-exported at the crate root.
 pub use aql::{
-    execute_with_cancellation_token, parse, AqlErrorCode, AqlExecutionError,
-    AqlResultBatch, AqlResultIter, ParameterBindings, Query,
+    execute_with_cancellation_token, execute_with_v1_options, parse, AqlErrorCode, AqlExecutionError,
+    AqlExecutionOptionsV1, AqlResultBatch, AqlResultIter, ParameterBindings, Query,
 };
 pub use execution::{CancellationToken, ExecutionOptionsV1};
 pub use storage::{Database, DbError, DbErrorCode, ObjectId};
