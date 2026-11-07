@@ -3,8 +3,9 @@
 //! Run with: cargo run -p ananta-api --example embedded
 
 use ananta_api::{
-    execute_with_cancellation_token, parse, CancellationToken, Column, DataType,
-    Database, ExecutionOptionsV1, ParameterBindings, Schema, Value, API_VERSION,
+    execute_with_v1_options, parse, AqlExecutionOptionsV1, CancellationToken, Column,
+    DataType, Database, ExecutionConfig, ExecutionOptionsV1, ParameterBindings, Schema,
+    Value, API_VERSION,
 };
 use std::error::Error;
 use std::fs;
@@ -60,12 +61,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let cancellation = CancellationToken::new();
     let cancel_handle = cancellation.clone();
-    let results = execute_with_cancellation_token(
+    let mut query_options = AqlExecutionOptionsV1::default();
+    query_options.execution = ExecutionOptionsV1::new(ExecutionConfig {
+        max_batch_rows: 2,
+        max_batch_cells: 6,
+        max_working_set_bytes: 1024 * 1024,
+    });
+    query_options.cancellation = Some(cancellation);
+    let results = execute_with_v1_options(
         &database,
         &query,
         &bindings,
-        2,
-        Some(cancellation),
+        query_options,
     )
     .map_err(|error| {
         std::io::Error::other(format!("AQL {}: {error}", error.code.as_str()))
