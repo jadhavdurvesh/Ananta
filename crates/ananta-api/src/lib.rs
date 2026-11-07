@@ -27,7 +27,7 @@ pub mod types {
 pub mod execution {
     pub use ananta_execution::{
         CancellationToken, ExecutionConfig, ExecutionContext, ExecutionError,
-        ExecutionErrorCode, ExecutionMetrics, ExecutionOptionsV1, VectorBatch,
+        ExecutionErrorCode, ExecutionMetrics, ExecutionOptionsV1, EXECUTION_OPTIONS_V1_VERSION, VectorBatch,
         VectorSchema,
     };
 }
@@ -47,6 +47,8 @@ pub use aql::{
     execute_with_cancellation_token, execute_with_v1_options, parse, AqlErrorCode, AqlExecutionError,
     AqlExecutionOptionsV1, AqlResultBatch, AqlResultIter, ParameterBindings, Query, AQL_EXECUTION_OPTIONS_V1_VERSION,
 };
-pub use execution::{CancellationToken, ExecutionConfig, ExecutionOptionsV1};
+pub use execution::{
+    CancellationToken, ExecutionConfig, ExecutionOptionsV1, EXECUTION_OPTIONS_V1_VERSION,
+};
 pub use storage::{Database, DbError, DbErrorCode, ObjectId};
 pub use types::{Column, DataType, Schema, Value};
