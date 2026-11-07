@@ -2277,6 +2277,74 @@ mod tests {
     }
 
     #[test]
+    fn versioned_query_options_bound_fallback_batches_and_reject_bad_versions() {
+        let (db, root, expected_rows) = fixture();
+        let query = crate::parse("SELECT * FROM telemetry").unwrap();
+        let mut options = AqlExecutionOptionsV1::default();
+        options.optimizer_enabled = false;
+        options.execution = ExecutionOptionsV1::new(ExecutionConfig {
+            max_batch_rows: 1,
+            max_batch_cells: 3,
+            max_working_set_bytes: 1024 * 1024,
+        });
+        let batches = execute_with_v1_options(
+            &db, &query, &ParameterBindings::default(), options.clone(),
+        ).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(batches.iter().all(|batch| batch.row_count <= 1));
+        let actual_rows = batches.iter().map(|batch| batch.row_count).sum::<usize>();
+        assert_eq!(actual_rows, expected_rows.len());
+
+        let mut unsupported = options.clone();
+        unsupported.version = AQL_EXECUTION_OPTIONS_V1_VERSION + 1;
+        let result = execute_with_v1_options(
+            &db, &query, &ParameterBindings::default(), unsupported,
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported query-options version was accepted"),
+        };
+        assert_eq!(error.code, AqlErrorCode::InvalidOptions);
+
+        let mut tiny = options;
+        tiny.execution = ExecutionOptionsV1::new(ExecutionConfig {
+            max_batch_rows: 1,
+            max_batch_cells: 3,
+            max_working_set_bytes: 1,
+        });
+        let mut iterator = execute_with_v1_options(
+            &db, &query, &ParameterBindings::default(), tiny,
+        ).unwrap();
+        assert_eq!(iterator.next().unwrap().unwrap_err().code, AqlErrorCode::ResourceLimit);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn versioned_query_options_bound_native_operator_batches() {
+        let (db, root, expected_rows) = fixture();
+        let query = crate::parse("SELECT device FROM telemetry").unwrap();
+        let mut options = AqlExecutionOptionsV1::default();
+        options.execution = ExecutionOptionsV1::new(ExecutionConfig {
+            max_batch_rows: 1,
+            max_batch_cells: 1,
+            max_working_set_bytes: 1024 * 1024,
+        });
+        let mut iterator = execute_with_v1_options(
+            &db, &query, &ParameterBindings::default(), options,
+        ).unwrap();
+        assert!(iterator.used_native_execution());
+        let mut rows = 0;
+        while let Some(batch) = iterator.next() {
+            let batch = batch.unwrap();
+            assert!(batch.row_count <= 1);
+            rows += batch.row_count;
+        }
+        assert_eq!(rows, expected_rows.len());
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn null_comparisons_are_unknown_and_are_filtered_out() {
         let (db, root, _) = fixture();
         let query = crate::parse("SELECT device FROM telemetry WHERE reading = NULL").unwrap();
