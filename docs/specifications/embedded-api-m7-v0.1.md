@@ -90,18 +90,18 @@ These budgets are execution defaults, not a promise that every API path or legac
 
 ## 5. Runnable embedded example
 
-The first end-to-end public API example is `crates/ananta-aql/examples/embedded_api.rs`. It demonstrates opening ANANTA's native database, creating a typed table, inserting data, parsing and executing an AQL query, consuming owned result batches, checking stable AQL error identifiers, and using a cloneable cancellation token. It also validates the versioned execution-options object. Run it from the repository root with:
+The recommended end-to-end application example is `crates/ananta-api/examples/embedded.rs`. It imports only the curated `ananta-api` facade, then opens ANANTA's native database, creates a typed table, inserts data, parses and executes an AQL query, consumes owned result batches, reads stable error identifiers, validates versioned execution options, and uses a cloneable cancellation token. Run it from the repository root with:
 
 ```bash
-cargo run -p ananta-aql --example embedded_api
+cargo run -p ananta-api --example embedded
 ```
 
-The example is included in the Native Rust CI workflow so API changes cannot silently break it.
+The Native Rust CI workflow builds and executes this example so the recommended facade stays usable.
 
 ## 6. Remaining M7.1 work
 
-- Stabilise the public Rust facade and clarify which lower-level storage/format modules are internal implementation details.
-- Introduce explicit, versioned configuration/options types without breaking the current embedded API.
-- Consolidate query/result lifecycle and cancellation around a stable public token/options surface.
+- Review the curated `ananta-api` re-export list and document which lower-level storage/format modules remain implementation details.
+- Extend versioned configuration beyond the in-process `ExecutionOptionsV1` contract when durable database or server-wire configuration is introduced.
+- Add one unified AQL query-options object that composes `ExecutionOptionsV1`, optimizer selection and `CancellationToken`.
 - Apply resource budgets consistently to every public query path, documenting any legacy materialising exceptions.
 - Publish complete embedded API examples and compatibility tests.
