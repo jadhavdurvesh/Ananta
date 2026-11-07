@@ -44,6 +44,9 @@ use chronicle::{encode_record, extract_payload, inspect_file as inspect_chronicl
 use capsule::{decode_capsule, derive_column_stats, derive_temporal_bounds, encode_capsule};
 use navigation_map::{file_sha256, map_filename, range_may_match, value_matches, NavigationMap, NavigationMapEntry};
 
+/// Version of the public embedded Rust API contract (independent of file formats).
+pub const EMBEDDED_API_VERSION: &str = "0.1";
+
 const CATALOG_MAGIC: &[u8; 4] = b"ANC1";
 const CATALOG_END: &[u8; 4] = b"CEND";
 const CATALOG_V1_VERSION: u16 = 1;
@@ -62,6 +65,62 @@ pub struct ObjectId(pub u64);
 impl fmt::Display for ObjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+
+/// Stable machine-readable classification for database API errors.
+///
+/// The string returned by DbErrorCode::as_str is part of the embedded API
+/// contract. It is independent of the human-readable Display message.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DbErrorCode {
+    Io, Format, Type, InvalidName, TableExists, TableNotFound, ColumnNotFound,
+    ColumnExists, InvalidColumnOrder, CorruptCatalog, SchemaCompatibility,
+    UnsupportedCatalogVersion, ChecksumMismatch, LengthOverflow, DatabaseLocked,
+    SegmentPublicationUncertain, InvalidBatchId, EmptyBatch, BatchIdConflict,
+    ChronicleCorrupt, IngestRowValidation, CapsuleCorrupt, NavigationMapCorrupt,
+    NavigationMapStale, InvalidRange, CompactionExecution, CompactionManifest,
+    CompactionPreflight, Wal, RecoveryRequired, Backup,
+}
+
+impl DbErrorCode {
+    /// Return the stable identifier for this error classification.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Io => "io",
+            Self::Format => "format",
+            Self::Type => "type",
+            Self::InvalidName => "invalid_name",
+            Self::TableExists => "table_exists",
+            Self::TableNotFound => "table_not_found",
+            Self::ColumnNotFound => "column_not_found",
+            Self::ColumnExists => "column_exists",
+            Self::InvalidColumnOrder => "invalid_column_order",
+            Self::CorruptCatalog => "corrupt_catalog",
+            Self::SchemaCompatibility => "schema_compatibility",
+            Self::UnsupportedCatalogVersion => "unsupported_catalog_version",
+            Self::ChecksumMismatch => "checksum_mismatch",
+            Self::LengthOverflow => "length_overflow",
+            Self::DatabaseLocked => "database_locked",
+            Self::SegmentPublicationUncertain => "segment_publication_uncertain",
+            Self::InvalidBatchId => "invalid_batch_id",
+            Self::EmptyBatch => "empty_batch",
+            Self::BatchIdConflict => "batch_id_conflict",
+            Self::ChronicleCorrupt => "chronicle_corrupt",
+            Self::IngestRowValidation => "ingest_row_validation",
+            Self::CapsuleCorrupt => "capsule_corrupt",
+            Self::NavigationMapCorrupt => "navigation_map_corrupt",
+            Self::NavigationMapStale => "navigation_map_stale",
+            Self::InvalidRange => "invalid_range",
+            Self::CompactionExecution => "compaction_execution",
+            Self::CompactionManifest => "compaction_manifest",
+            Self::CompactionPreflight => "compaction_preflight",
+            Self::Wal => "wal",
+            Self::RecoveryRequired => "recovery_required",
+            Self::Backup => "backup",
+        }
     }
 }
 
@@ -98,6 +157,45 @@ pub enum DbError {
     Wal(String),
     RecoveryRequired(String),
     Backup(String),
+}
+
+impl DbError {
+    /// Stable machine-readable classification. Do not parse the Display message.
+    pub const fn code(&self) -> DbErrorCode {
+        match self {
+            Self::Io(_) => DbErrorCode::Io,
+            Self::Format(_) => DbErrorCode::Format,
+            Self::Type(_) => DbErrorCode::Type,
+            Self::InvalidName(_) => DbErrorCode::InvalidName,
+            Self::TableExists(_) => DbErrorCode::TableExists,
+            Self::TableNotFound(_) => DbErrorCode::TableNotFound,
+            Self::ColumnNotFound(_) => DbErrorCode::ColumnNotFound,
+            Self::ColumnExists(_) => DbErrorCode::ColumnExists,
+            Self::InvalidColumnOrder(_) => DbErrorCode::InvalidColumnOrder,
+            Self::CorruptCatalog(_) => DbErrorCode::CorruptCatalog,
+            Self::SchemaCompatibility(_) => DbErrorCode::SchemaCompatibility,
+            Self::UnsupportedCatalogVersion(_) => DbErrorCode::UnsupportedCatalogVersion,
+            Self::ChecksumMismatch => DbErrorCode::ChecksumMismatch,
+            Self::LengthOverflow => DbErrorCode::LengthOverflow,
+            Self::DatabaseLocked(_) => DbErrorCode::DatabaseLocked,
+            Self::SegmentPublicationUncertain { .. } => DbErrorCode::SegmentPublicationUncertain,
+            Self::InvalidBatchId => DbErrorCode::InvalidBatchId,
+            Self::EmptyBatch => DbErrorCode::EmptyBatch,
+            Self::BatchIdConflict(_) => DbErrorCode::BatchIdConflict,
+            Self::ChronicleCorrupt(_) => DbErrorCode::ChronicleCorrupt,
+            Self::IngestRowValidation { .. } => DbErrorCode::IngestRowValidation,
+            Self::CapsuleCorrupt(_) => DbErrorCode::CapsuleCorrupt,
+            Self::NavigationMapCorrupt(_) => DbErrorCode::NavigationMapCorrupt,
+            Self::NavigationMapStale(_) => DbErrorCode::NavigationMapStale,
+            Self::InvalidRange(_) => DbErrorCode::InvalidRange,
+            Self::CompactionExecution(_) => DbErrorCode::CompactionExecution,
+            Self::CompactionManifest(_) => DbErrorCode::CompactionManifest,
+            Self::CompactionPreflight(_) => DbErrorCode::CompactionPreflight,
+            Self::Wal(_) => DbErrorCode::Wal,
+            Self::RecoveryRequired(_) => DbErrorCode::RecoveryRequired,
+            Self::Backup(_) => DbErrorCode::Backup,
+        }
+    }
 }
 
 impl fmt::Display for DbError {
@@ -7517,4 +7615,29 @@ mod tests {
     }
 
 
+}
+
+
+#[cfg(test)]
+mod public_api_error_code_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_api_version_and_database_error_codes_are_stable() {
+        assert_eq!(EMBEDDED_API_VERSION, "0.1");
+        assert_eq!(DbError::InvalidName("bad name".into()).code().as_str(), "invalid_name");
+        assert_eq!(DbError::TableNotFound("missing".into()).code().as_str(), "table_not_found");
+        assert_eq!(DbError::DatabaseLocked(PathBuf::from("db")).code().as_str(), "database_locked");
+        assert_eq!(DbError::RecoveryRequired("reopen".into()).code().as_str(), "recovery_required");
+        assert_eq!(DbError::Backup("manifest".into()).code().as_str(), "backup");
+    }
+
+    #[test]
+    fn database_error_codes_do_not_depend_on_display_messages() {
+        let error = DbError::TableNotFound("customers".into());
+        assert_eq!(error.code(), DbErrorCode::TableNotFound);
+        assert_eq!(error.code().as_str(), "table_not_found");
+        assert!(error.to_string().contains("customers"));
+        assert!(!error.to_string().contains(error.code().as_str()));
+    }
 }

@@ -10,7 +10,7 @@ pub use time_series::{
     LatestPerSeriesOperator, TimeBucketOperator, TimestampBound, TimestampRangeOperator,
 };
 
-use ananta_core::{BatchColumn, Database, DbError, RecordBatch, ScanBatchIter};
+use ananta_core::{BatchColumn, Database, DbError, DbErrorCode, RecordBatch, ScanBatchIter};
 use ananta_types::{Column, DataType, Schema, Value};
 use std::cmp::Ordering;
 use std::fmt;
@@ -365,6 +365,33 @@ fn checked_add(left: usize, right: usize) -> Result<usize, ExecutionError> {
         .ok_or(ExecutionError::ArithmeticOverflow)
 }
 
+
+/// Stable machine-readable classification for execution-layer errors.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecutionErrorCode {
+    Storage, AggregateOverflow, StatisticsFormat, InvalidSchema, InvalidBatch,
+    InvalidPlan, TypeMismatch, ResourceLimit, ArithmeticOverflow, Cancelled,
+}
+
+impl ExecutionErrorCode {
+    /// Return the stable identifier for this error classification.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Storage => "storage",
+            Self::AggregateOverflow => "aggregate_overflow",
+            Self::StatisticsFormat => "statistics_format",
+            Self::InvalidSchema => "invalid_schema",
+            Self::InvalidBatch => "invalid_batch",
+            Self::InvalidPlan => "invalid_plan",
+            Self::TypeMismatch => "type_mismatch",
+            Self::ResourceLimit => "resource_limit",
+            Self::ArithmeticOverflow => "arithmetic_overflow",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ExecutionError {
     Storage(DbError),
@@ -381,6 +408,32 @@ pub enum ExecutionError {
     },
     ArithmeticOverflow,
     Cancelled,
+}
+
+impl ExecutionError {
+    /// Stable machine-readable classification for this execution error.
+    pub const fn code(&self) -> ExecutionErrorCode {
+        match self {
+            Self::Storage(_) => ExecutionErrorCode::Storage,
+            Self::AggregateOverflow(_) => ExecutionErrorCode::AggregateOverflow,
+            Self::StatisticsFormat(_) => ExecutionErrorCode::StatisticsFormat,
+            Self::InvalidSchema(_) => ExecutionErrorCode::InvalidSchema,
+            Self::InvalidBatch(_) => ExecutionErrorCode::InvalidBatch,
+            Self::InvalidPlan(_) => ExecutionErrorCode::InvalidPlan,
+            Self::TypeMismatch(_) => ExecutionErrorCode::TypeMismatch,
+            Self::ResourceLimit { .. } => ExecutionErrorCode::ResourceLimit,
+            Self::ArithmeticOverflow => ExecutionErrorCode::ArithmeticOverflow,
+            Self::Cancelled => ExecutionErrorCode::Cancelled,
+        }
+    }
+
+    /// Return the underlying database classification when this wraps storage.
+    pub const fn storage_code(&self) -> Option<DbErrorCode> {
+        match self {
+            Self::Storage(error) => Some(error.code()),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for ExecutionError {
@@ -1273,5 +1326,24 @@ mod tests {
         let result = filter.next_batch(&mut context).unwrap().unwrap();
         assert_eq!(result.row_count, 1);
         assert_eq!(result.columns[0].values, vec![Value::Int64(1)]);
+    }
+}
+
+
+#[cfg(test)]
+mod public_error_code_tests {
+    use super::*;
+
+    #[test]
+    fn execution_error_codes_are_stable_and_storage_classification_is_preserved() {
+        assert_eq!(ExecutionError::Cancelled.code().as_str(), "cancelled");
+        assert_eq!(
+            ExecutionError::ResourceLimit { resource: "rows", actual: 2, limit: 1 }.code().as_str(),
+            "resource_limit",
+        );
+        let storage = ExecutionError::Storage(DbError::TableNotFound("missing".into()));
+        assert_eq!(storage.code().as_str(), "storage");
+        assert_eq!(storage.storage_code(), Some(DbErrorCode::TableNotFound));
+        assert_eq!(storage.storage_code().unwrap().as_str(), "table_not_found");
     }
 }

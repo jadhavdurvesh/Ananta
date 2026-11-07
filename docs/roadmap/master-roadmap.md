@@ -766,7 +766,7 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 ## M7.1 Embedded API hardening
 - [ ] Stabilise public Rust API boundaries.
 - [ ] Define configuration compatibility.
-- [ ] Define structured error codes.
+- [x] Define structured error codes with stable machine-readable string identifiers for database, execution and AQL errors; keep display text diagnostic-only.
 - [ ] Define query/result lifecycle.
 - [ ] Add cancellation API.
 - [ ] Add resource limits.
