@@ -975,6 +975,40 @@ impl Iterator for AqlResultIter {
                     return None;
                 }
             };
+            if input.row_count > self.execution_config.max_batch_rows {
+                self.finished = true;
+                return Some(Err(from_execution_error(ExecutionError::ResourceLimit {
+                    resource: "batch rows",
+                    actual: input.row_count,
+                    limit: self.execution_config.max_batch_rows,
+                })));
+            }
+            let input_cells = input.columns.iter()
+                .map(|column| column.values.len())
+                .fold(0_usize, usize::saturating_add);
+            if input_cells > self.execution_config.max_batch_cells {
+                self.finished = true;
+                return Some(Err(from_execution_error(ExecutionError::ResourceLimit {
+                    resource: "batch cells",
+                    actual: input_cells,
+                    limit: self.execution_config.max_batch_cells,
+                })));
+            }
+            let input_bytes = match estimate_batch_bytes(&input) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(from_execution_error(error)));
+                }
+            };
+            if input_bytes > self.execution_config.max_working_set_bytes {
+                self.finished = true;
+                return Some(Err(from_execution_error(ExecutionError::ResourceLimit {
+                    resource: "working-set bytes",
+                    actual: input_bytes,
+                    limit: self.execution_config.max_working_set_bytes,
+                })));
+            }
             let capacity = self.remaining_limit
                 .map_or(input.row_count, |limit| input.row_count.min(usize::try_from(limit).unwrap_or(usize::MAX)));
             let mut output_columns = vec![Vec::with_capacity(capacity); self.projection.len()];
@@ -1035,6 +1069,36 @@ impl Iterator for AqlResultIter {
                 columns: output_columns,
                 row_count,
             };
+            if result.row_count > self.execution_config.max_batch_rows {
+                self.finished = true;
+                return Some(Err(from_execution_error(ExecutionError::ResourceLimit {
+                    resource: "result rows",
+                    actual: result.row_count,
+                    limit: self.execution_config.max_batch_rows,
+                })));
+            }
+            let result_cells = result.columns.iter()
+                .map(Vec::len)
+                .fold(0_usize, usize::saturating_add);
+            if result_cells > self.execution_config.max_batch_cells {
+                self.finished = true;
+                return Some(Err(from_execution_error(ExecutionError::ResourceLimit {
+                    resource: "result cells",
+                    actual: result_cells,
+                    limit: self.execution_config.max_batch_cells,
+                })));
+            }
+            let result_bytes = usize::try_from(estimate_result_batch_bytes(&result))
+                .unwrap_or(usize::MAX);
+            let working_set_bytes = input_bytes.saturating_add(result_bytes);
+            if working_set_bytes > self.execution_config.max_working_set_bytes {
+                self.finished = true;
+                return Some(Err(from_execution_error(ExecutionError::ResourceLimit {
+                    resource: "working-set bytes",
+                    actual: working_set_bytes,
+                    limit: self.execution_config.max_working_set_bytes,
+                })));
+            }
             self.record_metrics(&result);
             return Some(Ok(result));
         }
@@ -1043,7 +1107,7 @@ impl Iterator for AqlResultIter {
 
 impl AqlResultIter {
     pub fn is_cancelled(&self) -> bool {
-        self.cancellation.as_ref().is_some_and(|flag| flag.load(AtomicOrdering::Acquire))
+        self.cancellation.as_ref().is_some_and(CancellationToken::is_cancelled)
     }
 
     pub fn used_native_execution(&self) -> bool {
@@ -1453,8 +1517,8 @@ fn try_build_native_pipeline(
     predicate: Option<&CompiledExpr>,
     bindings: &ParameterBindings,
     limit: Option<u64>,
-    batch_rows: usize,
-    cancellation: Option<Arc<AtomicBool>>,
+    execution_options: ExecutionOptionsV1,
+    cancellation: CancellationToken,
 ) -> Result<Option<NativeAqlExecution>, AqlExecutionError> {
     let native_predicate = match predicate {
         Some(expression) => match compiled_filter_predicate(expression, bindings) {
@@ -1489,7 +1553,7 @@ fn try_build_native_pipeline(
         database,
         table,
         &scan_columns,
-        batch_rows,
+        execution_options.limits.max_batch_rows,
         pushed_scan_limit,
     )
     .map_err(from_execution_error)?;
@@ -1529,8 +1593,7 @@ fn try_build_native_pipeline(
         operator = Box::new(LimitOperator::new(operator, limit));
     }
 
-    let cancellation = cancellation.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-    let context = ExecutionContext::with_cancellation(Default::default(), cancellation)
+    let context = ExecutionContext::with_options(execution_options, cancellation)
         .map_err(from_execution_error)?;
     let _ = schema; // schema was used to compile and validate every logical column reference.
     Ok(Some(NativeAqlExecution { operator, context }))
