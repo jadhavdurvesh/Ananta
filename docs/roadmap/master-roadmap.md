@@ -770,7 +770,7 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 - [x] Define query/result lifecycle: lazy AqlResultIter yields owned batches, ends at None, and yields terminal errors once; document dropping the iterator boundary.
 - [x] Add cancellation API: cloneable CancellationToken shared across threads, ExecutionContext integration and token-aware AQL entry point; retain legacy Arc adapter.
 - [~] Add resource limits: version ExecutionOptionsV1 over row/cell/working-set budgets; uniform propagation across all query paths remains.
-- [ ] Publish API examples.
+- [x] Publish a runnable embedded API example using the native Database, AQL result iterator, stable error codes, versioned execution options and CancellationToken; execute it in CI.
 
 ## M7.2 Server/session layer
 - [ ] Decide process architecture.

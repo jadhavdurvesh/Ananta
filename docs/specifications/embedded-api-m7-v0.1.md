@@ -88,7 +88,17 @@ Defaults are 65,536 rows, 1,000,000 cells and 64 MiB of working-set bytes. `Exec
 
 These budgets are execution defaults, not a promise that every API path or legacy materialising method is bounded by them. M7.1 still needs one unified query-options object and consistent limit propagation through every public query path.
 
-## 5. Remaining M7.1 work
+## 5. Runnable embedded example
+
+The first end-to-end public API example is `crates/ananta-aql/examples/embedded_api.rs`. It demonstrates opening ANANTA's native database, creating a typed table, inserting data, parsing and executing an AQL query, consuming owned result batches, checking stable AQL error identifiers, and using a cloneable cancellation token. It also validates the versioned execution-options object. Run it from the repository root with:
+
+```bash
+cargo run -p ananta-aql --example embedded_api
+```
+
+The example is included in the Native Rust CI workflow so API changes cannot silently break it.
+
+## 6. Remaining M7.1 work
 
 - Stabilise the public Rust facade and clarify which lower-level storage/format modules are internal implementation details.
 - Introduce explicit, versioned configuration/options types without breaking the current embedded API.
