@@ -105,3 +105,21 @@ jobs:
           echo "=== Capsule size 8,192 rows (128 Chronicle batches) ==="
           "$BENCH" "$ROOT/large" 128 512
           rm -rf "$ROOT"
+
+  windows:
+    name: Compile and test Windows atomic WAL replacement
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+      - name: Compile workspace for Windows
+        run: cargo check --workspace --all-targets
+      - name: Test platform atomic replacement
+        run: cargo test -p ananta-platform
+      - name: Test WAL checkpoint rotation on Windows
+        run: cargo test -p ananta-core wal::tests::wal_checkpoint_replacement_is_atomic_and_preserves_sequence
