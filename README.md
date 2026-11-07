@@ -28,6 +28,7 @@ The initial Rust implementation currently includes:
 - ANWL write-ahead logging with redo recovery for ANF/Chronicle publication, catalog DDL, Active Weave pointers, compaction candidate publication, Capsules and Navigation Maps.
 - A single-writer process lock with read-only owner inspection, bounded-memory consistency checking, storage inventory and ANBK v1 checksummed backup/restore.
 - A standalone AQL v0.1 Rust crate with a source-spanned lexer/parser, SELECT AST, literals, casts, boolean/comparison expressions and typed parameter-binding validation.
+- A curated `ananta-api` Rust crate exposing the recommended embedded storage, types, execution and AQL integration surface.
 - A basic telemetry example and unit/integration tests.
 
 This is an experimental first vertical slice, not a complete or production-ready DBMS. The legacy `scan` APIs still materialise their complete result; the additive batch APIs bound decoded output per batch but do not yet provide predicates or physical column-range I/O. Only one local database handle/process may own a database at a time. A crash can leave a stale `.ananta.lock` file; after verifying no writer remains, an operator must remove it before reopening. Windows checkpoint rotation uses atomic `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`; the targeted Windows CI job validates replacement, locking, large backup/restore and backup crash recovery. Windows does not claim Unix-equivalent parent-directory `fsync` semantics, and physical power-loss/device-cache behavior is not certified. AQL v0.1 parsing, catalog-aware planning and supported native execution paths are implemented, while joins, ordering and additional physical operators remain future work. General multi-operation ACID transactions, MVCC, distributed operation and production hardening remain incomplete.
@@ -90,7 +91,7 @@ cargo fmt --all
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo run -p ananta-core --example basic
-cargo run -p ananta-aql --example embedded_api
+cargo run -p ananta-api --example embedded
 ```
 
 The example creates/opens `./ananta-data`, creates a telemetry table if needed, writes a batch to ANF segments and reads the rows back. Running it repeatedly appends another batch.
