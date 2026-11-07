@@ -929,10 +929,16 @@ mod tests {
     fn all_three_weave_layouts_preserve_rows_and_verify_exact_provenance() {
         use crate::compaction_manifest::{CapsuleSourceReference, ChronicleReceiptReference};
         use crate::{BatchId, Column, DataType, Schema};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
 
+        static ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir().join(format!("ananta-weave-test-{nonce}"));
+        let sequence = ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ananta-weave-test-{}-{nonce}-{sequence}",
+            std::process::id(),
+        ));
         let mut db = Database::open(&root).unwrap();
         let schema = Schema::new(vec![
             Column::new("ts", DataType::TimestampMicros, false),
