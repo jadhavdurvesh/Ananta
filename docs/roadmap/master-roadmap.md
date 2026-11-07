@@ -764,12 +764,12 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 **Goal:** expose the engine to applications without making the browser dashboard a dependency.
 
 ## M7.1 Embedded API hardening
-- [ ] Stabilise public Rust API boundaries.
-- [ ] Define configuration compatibility.
+- [~] Stabilise public Rust API boundaries: publish API version, typed error codes and first versioned execution-options surface; facade visibility review remains.
+- [~] Define configuration compatibility: add validated in-process ExecutionOptionsV1; durable database and server-wire configuration contracts remain pending.
 - [x] Define structured error codes with stable machine-readable string identifiers for database, execution and AQL errors; keep display text diagnostic-only.
-- [ ] Define query/result lifecycle.
-- [ ] Add cancellation API.
-- [ ] Add resource limits.
+- [x] Define query/result lifecycle: lazy AqlResultIter yields owned batches, ends at None, and yields terminal errors once; document dropping the iterator boundary.
+- [x] Add cancellation API: cloneable CancellationToken shared across threads, ExecutionContext integration and token-aware AQL entry point; retain legacy Arc adapter.
+- [~] Add resource limits: version ExecutionOptionsV1 over row/cell/working-set budgets; uniform propagation across all query paths remains.
 - [ ] Publish API examples.
 
 ## M7.2 Server/session layer
