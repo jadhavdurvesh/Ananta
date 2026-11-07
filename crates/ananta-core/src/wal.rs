@@ -156,11 +156,20 @@ impl WalWriter {
             fs::create_dir_all(parent)?;
         }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
+        let mut open_options = OpenOptions::new();
+        open_options.create(true).read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+            const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+            // Windows cannot replace a file while any open handle denies
+            // delete-sharing. Keep the writer handle compatible with atomic
+            // MoveFileExW replacement throughout the WAL's lifetime.
+            open_options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        }
+        let mut file = open_options.open(&path)?;
 
         let length = file.metadata()?.len();
         if length == 0 {
@@ -350,10 +359,19 @@ impl WalWriter {
                 crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointDirectorySync,
             );
 
-            let replacement = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .open(&self.path)?;
+            let mut replacement_options = OpenOptions::new();
+            replacement_options.read(true).append(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const FILE_SHARE_READ: u32 = 0x0000_0001;
+                const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+                const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+                replacement_options.share_mode(
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                );
+            }
+            let replacement = replacement_options.open(&self.path)?;
             self.file = replacement;
             self.next_sequence = base_sequence.checked_add(2).ok_or(WalError::SequenceOverflow)?;
             self.active_transactions.clear();
