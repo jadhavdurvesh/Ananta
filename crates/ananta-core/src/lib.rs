@@ -7616,3 +7616,28 @@ mod tests {
 
 
 }
+
+
+#[cfg(test)]
+mod public_api_error_code_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_api_version_and_database_error_codes_are_stable() {
+        assert_eq!(EMBEDDED_API_VERSION, "0.1");
+        assert_eq!(DbError::InvalidName("bad name".into()).code().as_str(), "invalid_name");
+        assert_eq!(DbError::TableNotFound("missing".into()).code().as_str(), "table_not_found");
+        assert_eq!(DbError::DatabaseLocked(PathBuf::from("db")).code().as_str(), "database_locked");
+        assert_eq!(DbError::RecoveryRequired("reopen".into()).code().as_str(), "recovery_required");
+        assert_eq!(DbError::Backup("manifest".into()).code().as_str(), "backup");
+    }
+
+    #[test]
+    fn database_error_codes_do_not_depend_on_display_messages() {
+        let error = DbError::TableNotFound("customers".into());
+        assert_eq!(error.code(), DbErrorCode::TableNotFound);
+        assert_eq!(error.code().as_str(), "table_not_found");
+        assert!(error.to_string().contains("customers"));
+        assert_ne!(error.code().as_str(), error.to_string());
+    }
+}
