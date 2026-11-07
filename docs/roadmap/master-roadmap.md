@@ -5,7 +5,7 @@
 **Owner:** DMJ  
 **Current release target:** 0.1.0 — Native Storage Prototype  
 **Roadmap status:** Active; review this file before starting work outside the current milestone
-**Current focus:** M6.2 WAL-backed recovery and crash-boundary validation; M5 is complete
+**Current focus:** M7.1 embedded API hardening; M6 is closed after Linux workspace validation and targeted Windows durability, locking, WAL rotation and backup/recovery checks
 
 ---
 
@@ -712,11 +712,11 @@ This milestone is a hard prerequisite for production use. Do not imply transacti
 - [x] Add subprocess crash/reopen coverage for Capsule and Navigation Map at WAL MUTATION, durable COMMIT and final-name link; verify data, artifacts, consistency and a second reopen.
 - [x] Add ANCP v1 immutable checkpoint manifests with SHA-256 inventory of stable database artifacts and a WAL checkpoint reference.
 - [x] Validate checkpoint references and recorded artifacts on startup; validate mutable catalog/active-pointer fingerprints unless a committed post-checkpoint intent owns the update.
-- [x] Atomically rotate ANWL on Unix to a checkpoint anchor at previous high-water sequence + 1 after manifest publication; preserve monotonic IDs and redo for all later WAL transactions.
+- [x] Atomically rotate ANWL on Unix and Windows to a checkpoint anchor at previous high-water sequence + 1 after manifest publication; preserve monotonic IDs and redo for all later WAL transactions. Unix uses same-volume rename and directory sync. Windows syncs/closes the current WAL handle, uses `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`, then reopens the replacement; no delete-then-rename fallback is used.
 - [x] Add subprocess crash/reopen coverage at checkpoint-manifest temp sync/publication and WAL temp sync/rename/directory-sync boundaries.
 - [x] Extend Capsule/Navigation Map subprocess crash coverage to all 12 staging, WAL, final-publication and cleanup checkpoints for both artifact types.
 - [x] Retain only the checkpoint manifest referenced by the durable active WAL; prune superseded manifests only after validating the new anchor.
-- [ ] Implement Windows atomic WAL replacement; do not use delete-then-rename.
+- [x] Implement and validate Windows atomic WAL replacement; do not use delete-then-rename.
 
 **Guarantee boundary:** ANF insert, Chronicle ingest, table creation, nullable-column addition, column rename, column reorder, active Weave promotion/rollback/fallback pointers, immutable compaction candidate-directory/OWM publication, Capsule publication and Navigation Map publication use WAL-backed redo. Capsule intent uses the AMUT v1 revision field for its independent generation; the embedded Capsule header retains and validates the logical schema revision. Navigation Map redo verifies all referenced immutable Capsule files before accepting the map. General multi-operation application transactions remain outside this boundary; do not claim general ACID semantics.
 
@@ -734,7 +734,7 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 - [x] Define cancellation boundary: scan iterators can be cancelled by dropping them; the current nonblocking lock acquisition and absence of public multi-call transactions mean transaction wait-timeout APIs are not applicable yet.
 - [x] Document per-operation durability and the explicit absence of general multi-operation ACID transactions.
 - [x] Add repeated cross-process writer-lock denial probes while another process owns the database.
-- [ ] Add platform-specific lock validation and multi-process stress on supported operating systems.
+- [x] Add platform-specific lock validation and multi-process stress on supported operating systems (Unix full-suite subprocess probes; Windows targeted cross-process writer-lock validation).
 
 ## M6.4 Operational integrity
 - [x] Add bounded-memory database consistency checker for WAL, logical scans, Chronicle, Capsules and Navigation Maps.
@@ -742,20 +742,20 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 - [x] Add read-only orphan/temp/staging path reporting.
 - [x] Add versioned ANBK v1 full-directory backup format with manifest SHA-256 and per-file fingerprints.
 - [x] Add backup verification and fresh-directory restore validation through normal database open/recovery plus consistency scan.
-- [x] Test backup/restore into a new directory and backup-manifest corruption rejection (tests added; execution validation outstanding).
+- [x] Execute backup/restore into a new directory and backup-manifest corruption rejection tests on the Linux workspace suite and the Windows targeted backup/restore job.
 - [x] Document corruption repair boundaries and fail-closed recovery guidance.
 - [x] Add backup subprocess interruption tests after copied-file sync, manifest sync and final directory rename; verify incomplete backup absence or complete backup restore.
-- [x] Add a representative multi-artifact backup/restore workload with 2,048 rows, 32 Chronicle records, eight Capsules and one Navigation Map.
-- [ ] Add large-database and cross-platform backup/directory-durability tests.
+- [x] Add and execute a multi-artifact backup/restore workload with 8,192 rows, 64 Chronicle records, 16 Capsules and one Navigation Map.
+- [x] Add and execute large-database and cross-platform backup/directory-publication tests, including Windows subprocess crashes after copied-file sync, manifest sync and final directory publication.
 
 ## M6 exit gate
-- [ ] Fault-injection tests pass.
-- [ ] Recovery is deterministic and repeatable.
-- [ ] Transaction semantics are documented and tested.
-- [ ] Locking rules are enforced.
-- [ ] Backup/restore integrity tests pass.
+- [x] Fault-injection tests pass (complete Linux workspace suite plus targeted Windows WAL and backup subprocess recovery tests).
+- [x] Recovery is deterministic and repeatable (reopen/idempotence, active-Weave fallback, WAL/checkpoint and backup crash boundaries).
+- [x] Transaction semantics are documented and tested (per-operation atomic redo units; no general multi-operation ACID or MVCC claim).
+- [x] Locking rules are enforced (exclusive writer ownership, lock inspection, repeated Linux subprocess denial and Windows cross-process denial).
+- [x] Backup/restore integrity tests pass (manifest corruption, fresh restore, 8,192-row multi-artifact workload and Linux/Windows publication crash tests).
 
-**Deliverable:** Reliable single-node engine milestone. No cluster claims. M6 implementation slices are present, but the exit gate remains open until the Rust test suite and remaining crash/platform validation are run; ANWL checkpoint installation, Unix rotation and superseded-manifest pruning are implemented; Windows atomic replacement remains deferred.
+**Deliverable:** M6 is closed for the single-node, single-writer engine contract. Linux workspace formatting, all-target tests, Clippy, native examples and benchmark suite pass; targeted Windows validation passes for compilation, atomic WAL replacement, writer locking, large backup/restore and backup-publication crash recovery. No cluster or general multi-operation ACID claims. Physical power-loss/device-cache behavior is not certified; Windows write-through publication is not claimed to provide the same parent-directory flush semantics as Unix directory `fsync`.
 
 ---
 
@@ -972,10 +972,9 @@ A task is done only when all applicable items are true:
 
 # 15. Immediate next actions
 
-1. Run the complete Rust workspace test, formatting and lint suites on a Rust 1.75+ toolchain; resolve every regression before closing M6.
-2. Run the expanded Capsule/Navigation Map, checkpoint and backup subprocess crash suites on a Rust 1.75+ environment.
-3. Implement Windows atomic replacement before enabling checkpoint rotation there; keep the active checkpoint manifest and never use delete-then-rename.
-4. Run large-database backup/restore and Unix/Windows lock and directory-durability validation.
-5. Close the M6 exit gate only when recovery, transaction-scope, locking and backup/restore tests have actually passed. Then begin M7 native server and developer interfaces.
+1. Stabilise the embedded Rust API boundary, configuration compatibility, structured error codes and result lifecycle under M7.1.
+2. Keep the native engine independent of Studio and any browser dashboard.
+3. Add compatibility tests before exposing new public API contracts.
+4. Preserve the documented boundary: one writer, per-operation WAL redo, and no general multi-operation ACID or cluster guarantees.
 
-**Current focus: M6 validation and closeout. M7 is next only after the M6 exit gate is satisfied.**
+**Current focus: M7.1 embedded API hardening. M6 is closed; do not broaden the storage guarantee beyond the validated single-node contract.**
