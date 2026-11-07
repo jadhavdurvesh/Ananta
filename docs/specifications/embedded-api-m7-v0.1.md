@@ -58,7 +58,7 @@ Identifiers: `storage`, `aggregate_overflow`, `statistics_format`, `invalid_sche
 - `AqlExecutionError.code` is an `AqlErrorCode`.
 - `AqlErrorCode::as_str() -> &'static str` returns the stable identifier.
 
-Identifiers: `invalid_query`, `table_not_found`, `column_not_found`, `type_mismatch`, `invalid_parameter`, `invalid_cast`, `arithmetic`, `cancelled`, `storage`, `resource_limit`, `execution`.
+Identifiers: `invalid_query`, `invalid_options`, `table_not_found`, `column_not_found`, `type_mismatch`, `invalid_parameter`, `invalid_cast`, `arithmetic`, `cancelled`, `storage`, `resource_limit`, `execution`.
 
 The AQL error retains its source span. The code is the programmatic classification; the message and source span are diagnostic context.
 
@@ -86,9 +86,15 @@ Defaults are 65,536 rows, 1,000,000 cells and 64 MiB of working-set bytes. `Exec
 
 `CancellationToken` is cloneable and thread-safe. All clones share one signal; calling `cancel` on any clone is observed by `ExecutionContext` and AQL execution. New AQL integrations can use `execute_with_cancellation_token`. The legacy `Option<Arc<AtomicBool>>` entry points remain supported as compatibility adapters.
 
-These budgets are execution defaults, not a promise that every API path or legacy materialising method is bounded by them. M7.1 still needs one unified query-options object and consistent limit propagation through every public query path.
+AQL exposes a cloneable `CancellationToken` and a versioned `AqlExecutionOptionsV1` object through `execute_with_v1_options`. The options object composes the AQL-options version, `ExecutionOptionsV1` row/cell/working-set limits, optimizer enablement and an optional cancellation token. Existing `execute`, `execute_with_options` and token-only helpers remain compatibility adapters.
 
-## 5. Runnable embedded example
+## 5. Unified AQL query options
+
+`AqlExecutionOptionsV1` is the single versioned options surface for AQL query execution. It contains the AQL-options version, validated `ExecutionOptionsV1` limits, optimizer enablement and an optional cloneable cancellation token. Use `execute_with_v1_options(database, query, bindings, options)` for new integrations.
+
+The native path applies row/cell/working-set limits at operator boundaries. The fallback path caps scan batches by row and cell budgets, validates input and result batches, and checks the combined estimated input/output working set. The legacy materialising storage `Database::scan` API remains outside this bounded AQL result contract.
+
+## 6. Runnable embedded example
 
 The recommended end-to-end application example is `crates/ananta-api/examples/embedded.rs`. It imports only the curated `ananta-api` facade, then opens ANANTA's native database, creates a typed table, inserts data, parses and executes an AQL query, consumes owned result batches, reads stable error identifiers, validates versioned execution options, and uses a cloneable cancellation token. Run it from the repository root with:
 
@@ -98,10 +104,10 @@ cargo run -p ananta-api --example embedded
 
 The Native Rust CI workflow builds and executes this example so the recommended facade stays usable.
 
-## 6. Remaining M7.1 work
+## 7. Remaining M7.1 work
 
 - Review the curated `ananta-api` re-export list and document which lower-level storage/format modules remain implementation details.
 - Extend versioned configuration beyond the in-process `ExecutionOptionsV1` contract when durable database or server-wire configuration is introduced.
-- Add one unified AQL query-options object that composes `ExecutionOptionsV1`, optimizer selection and `CancellationToken`.
-- Apply resource budgets consistently to every public query path, documenting any legacy materialising exceptions.
+- Extend compatibility tests for the unified AQL options object and its invalid-version/resource-limit errors.
+- Keep the documented exception for legacy materialising storage scans; all AQL iterator paths now enforce the versioned row/cell/working-set limits.
 - Publish complete embedded API examples and compatibility tests.
