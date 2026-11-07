@@ -278,7 +278,7 @@ impl WalWriter {
             ));
         }
 
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = payload;
             return Err(WalError::Io(io::Error::new(
@@ -287,7 +287,7 @@ impl WalWriter {
             )));
         }
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.file.sync_all()?;
             let parent = self.path.parent()
@@ -339,9 +339,9 @@ impl WalWriter {
                 crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointTempSynced,
             );
 
-            // POSIX rename atomically replaces the WAL directory entry. Until
-            // this point the old complete log remains the authoritative path.
-            fs::rename(&temporary, &self.path)?;
+            // Platform replacement atomically switches the WAL directory entry.
+            // Until this point the old complete log remains authoritative.
+            ananta_platform::atomic_replace(&temporary, &self.path)?;
             crate::wal_recovery::maybe_crash_after(
                 crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointRenamedBeforeDirectorySync,
             );
@@ -415,6 +415,13 @@ impl WalWriter {
 #[cfg(unix)]
 fn sync_wal_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
+}
+
+// Windows replacement uses MOVEFILE_WRITE_THROUGH, which flushes the move
+// before returning. Rust does not expose a portable directory-handle flush.
+#[cfg(windows)]
+fn sync_wal_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Read and verify a WAL. Complete frames are checksum/sequence/transaction
