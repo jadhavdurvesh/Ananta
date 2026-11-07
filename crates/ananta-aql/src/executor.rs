@@ -4,7 +4,7 @@ use crate::{
 };
 use ananta_core::{Database, DbError, ScanBatchIter};
 use ananta_execution::{
-    ComparisonOperator as NativeComparison, ExecutionContext, ExecutionError, ExecutionOperator,
+    CancellationToken, ComparisonOperator as NativeComparison, ExecutionContext, ExecutionError, ExecutionOperator,
     FilterOperator, FilterPredicate, LimitOperator, Operand, ProjectionField, ProjectionOperator,
     ScanOperator, TableStatistics, ColumnStatistics,
 };
@@ -223,6 +223,27 @@ pub fn execute(
     cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<AqlResultIter, AqlExecutionError> {
     execute_with_options(database, query, bindings, batch_rows, cancellation, true)
+}
+
+/// Execute with the stable cloneable cancellation-token API.
+///
+/// The legacy Arc<AtomicBool> parameter remains supported by execute(); new
+/// integrations should pass a CancellationToken so the signal can be shared
+/// without exposing atomic implementation details at call sites.
+pub fn execute_with_cancellation_token(
+    database: &Database,
+    query: &Query,
+    bindings: &ParameterBindings,
+    batch_rows: usize,
+    cancellation: Option<CancellationToken>,
+) -> Result<AqlResultIter, AqlExecutionError> {
+    execute(
+        database,
+        query,
+        bindings,
+        batch_rows,
+        cancellation.map(|token| token.shared_flag()),
+    )
 }
 
 /// Execute with the native physical optimizer enabled or disabled. The disabled
@@ -2079,6 +2100,25 @@ mod tests {
         let query = crate::parse("SELECT * FROM telemetry").unwrap();
         let cancelled = Arc::new(AtomicBool::new(true));
         let mut iterator = execute(&db, &query, &ParameterBindings::default(), 10, Some(cancelled)).unwrap();
+        assert_eq!(iterator.next().unwrap().unwrap_err().code, AqlErrorCode::Cancelled);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cloneable_cancellation_token_cancels_aql_result_iteration() {
+        let (db, root, _) = fixture();
+        let query = crate::parse("SELECT device FROM telemetry").unwrap();
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+        worker_token.cancel();
+        let mut iterator = execute_with_cancellation_token(
+            &db,
+            &query,
+            &ParameterBindings::default(),
+            4,
+            Some(token),
+        ).unwrap();
         assert_eq!(iterator.next().unwrap().unwrap_err().code, AqlErrorCode::Cancelled);
         drop(db);
         fs::remove_dir_all(root).unwrap();

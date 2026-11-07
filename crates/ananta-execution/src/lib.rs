@@ -125,6 +125,88 @@ impl Default for ExecutionConfig {
     }
 }
 
+/// Version of the stable in-process execution-options contract.
+pub const EXECUTION_OPTIONS_V1_VERSION: u16 = 1;
+
+/// Versioned wrapper for bounded execution configuration.
+///
+/// This is an in-process API object, not a persisted database configuration file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionOptionsV1 {
+    pub version: u16,
+    pub limits: ExecutionConfig,
+}
+
+impl Default for ExecutionOptionsV1 {
+    fn default() -> Self {
+        Self { version: EXECUTION_OPTIONS_V1_VERSION, limits: ExecutionConfig::default() }
+    }
+}
+
+impl ExecutionOptionsV1 {
+    pub fn new(limits: ExecutionConfig) -> Self {
+        Self { version: EXECUTION_OPTIONS_V1_VERSION, limits }
+    }
+
+    pub fn validate(&self) -> Result<(), ExecutionError> {
+        if self.version != EXECUTION_OPTIONS_V1_VERSION {
+            return Err(ExecutionError::InvalidPlan(format!(
+                "unsupported execution-options version {}",
+                self.version,
+            )));
+        }
+        if self.limits.max_batch_rows == 0
+            || self.limits.max_batch_cells == 0
+            || self.limits.max_working_set_bytes == 0
+        {
+            return Err(ExecutionError::InvalidPlan(
+                "execution resource limits must all be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Cloneable, thread-safe cancellation signal for one query/execution.
+///
+/// Clones share the same cancellation state. Calling cancel on any clone makes
+/// is_cancelled return true for every clone.
+#[derive(Debug, Clone)]
+pub struct CancellationToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self { flag: Arc::new(AtomicBool::new(false)) }
+    }
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.flag.store(true, AtomicOrdering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(AtomicOrdering::Acquire)
+    }
+
+    /// Clone the shared flag for compatibility with legacy Arc<AtomicBool> APIs.
+    /// New integrations should pass the token directly.
+    pub fn shared_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.flag)
+    }
+
+    /// Wrap a flag created by a legacy cancellation API without copying its state.
+    pub fn from_shared_flag(flag: Arc<AtomicBool>) -> Self {
+        Self { flag }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecutionMetrics {
     /// Sum of batches emitted at operator boundaries in this execution context.
@@ -178,6 +260,25 @@ impl ExecutionContext {
     /// Clone this token and set it from another thread to request cancellation.
     pub fn cancellation_token(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.cancelled)
+    }
+
+    /// Construct an execution context from the stable shared cancellation token.
+    pub fn with_token(config: ExecutionConfig, token: CancellationToken) -> Result<Self, ExecutionError> {
+        Self::with_cancellation(config, token.shared_flag())
+    }
+
+    /// Return a token that shares this context's cancellation state.
+    pub fn token(&self) -> CancellationToken {
+        CancellationToken::from_shared_flag(Arc::clone(&self.cancelled))
+    }
+
+    /// Construct an execution context using an explicitly versioned options object.
+    pub fn with_options(
+        options: ExecutionOptionsV1,
+        token: CancellationToken,
+    ) -> Result<Self, ExecutionError> {
+        options.validate()?;
+        Self::with_token(options.limits, token)
     }
 
     pub fn cancel(&self) {
@@ -1345,5 +1446,63 @@ mod public_error_code_tests {
         assert_eq!(storage.code().as_str(), "storage");
         assert_eq!(storage.storage_code(), Some(DbErrorCode::TableNotFound));
         assert_eq!(storage.storage_code().unwrap().as_str(), "table_not_found");
+    }
+}
+
+
+#[cfg(test)]
+mod cancellation_token_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_token_clones_share_one_signal() {
+        let token = CancellationToken::new();
+        let clone = token.clone();
+        assert!(!token.is_cancelled());
+        clone.cancel();
+        assert!(token.is_cancelled());
+        assert!(clone.is_cancelled());
+    }
+
+    #[test]
+    fn execution_context_and_token_share_cancellation_state() {
+        let token = CancellationToken::new();
+        let mut context = ExecutionContext::with_token(ExecutionConfig::default(), token.clone()).unwrap();
+        token.cancel();
+        assert!(context.check_cancelled().is_err());
+        context.cancel();
+        assert!(token.is_cancelled());
+    }
+}
+
+
+#[cfg(test)]
+mod execution_options_tests {
+    use super::*;
+
+    #[test]
+    fn versioned_execution_options_validate_version_and_limits() {
+        assert!(ExecutionOptionsV1::default().validate().is_ok());
+        let unsupported = ExecutionOptionsV1 { version: 2, ..ExecutionOptionsV1::default() };
+        assert!(matches!(
+            unsupported.validate(),
+            Err(ExecutionError::InvalidPlan(_)),
+        ));
+        let invalid_limits = ExecutionOptionsV1::new(ExecutionConfig {
+            max_batch_rows: 0,
+            ..ExecutionConfig::default()
+        });
+        assert!(matches!(
+            invalid_limits.validate(),
+            Err(ExecutionError::InvalidPlan(_)),
+        ));
+    }
+
+    #[test]
+    fn context_accepts_versioned_options_and_shared_token() {
+        let token = CancellationToken::new();
+        let context = ExecutionContext::with_options(ExecutionOptionsV1::default(), token.clone()).unwrap();
+        context.cancel();
+        assert!(token.is_cancelled());
     }
 }

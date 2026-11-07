@@ -76,15 +76,17 @@ The legacy full-result storage scan remains materialising. Applications needing 
 
 ## 4. Cancellation and resource budgets currently implemented
 
-The native execution layer already supports `ExecutionContext` with an `ExecutionConfig`, a shared cancellation flag, metrics and checks at operator boundaries. The configuration currently bounds:
+The native execution layer supports `ExecutionContext` with an `ExecutionConfig`, a shared cancellation signal, metrics and checks at operator boundaries. The configuration bounds:
 
 - `max_batch_rows`
 - `max_batch_cells`
 - `max_working_set_bytes`
 
-Defaults are currently 65,536 rows, 1,000,000 cells and 64 MiB of working-set bytes. These are execution defaults, not a promise that every API path or legacy materialising method is bounded by them.
+Defaults are 65,536 rows, 1,000,000 cells and 64 MiB of working-set bytes. `ExecutionOptionsV1` wraps those limits in an explicitly versioned, validated in-process options object; `ExecutionContext::with_options` rejects unsupported versions and zero limits. It is not a persisted database configuration file or a server wire format.
 
-AQL accepts an optional shared cancellation flag; setting it causes execution to return the `cancelled` classification. A dedicated public cancellation-token type and uniform options object remain part of M7.1 hardening.
+`CancellationToken` is cloneable and thread-safe. All clones share one signal; calling `cancel` on any clone is observed by `ExecutionContext` and AQL execution. New AQL integrations can use `execute_with_cancellation_token`. The legacy `Option<Arc<AtomicBool>>` entry points remain supported as compatibility adapters.
+
+These budgets are execution defaults, not a promise that every API path or legacy materialising method is bounded by them. M7.1 still needs one unified query-options object and consistent limit propagation through every public query path.
 
 ## 5. Remaining M7.1 work
 

@@ -8,13 +8,14 @@ mod timeseries;
 mod planner;
 mod vectorized;
 
+pub use ananta_execution::CancellationToken;
 pub use ananta_types::DataType;
 pub use lexer::{lex, Token, TokenKind};
 pub use parser::{parse, BinaryOperator, ColumnReference, Expr, ExprKind, Identifier, Literal,
     ParameterRef, Projection, Query, SelectItem, SelectStatement, Statement, UnaryOperator};
 
 pub use executor::{
-    execute, execute_source, execute_with_options, explain, explain_with_statistics, AqlErrorCode, AqlExecutionError,
+    execute, execute_source, execute_with_options, execute_with_cancellation_token, explain, explain_with_statistics, AqlErrorCode, AqlExecutionError,
     AqlExecutionMetrics, AqlPhysicalPlan, AqlResultBatch, AqlResultIter,
 };
 pub use plan::{logical_plan, LogicalPlan, LogicalPlanNode};
