@@ -125,6 +125,48 @@ impl Default for ExecutionConfig {
     }
 }
 
+/// Version of the stable in-process execution-options contract.
+pub const EXECUTION_OPTIONS_V1_VERSION: u16 = 1;
+
+/// Versioned wrapper for bounded execution configuration.
+///
+/// This is an in-process API object, not a persisted database configuration file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionOptionsV1 {
+    pub version: u16,
+    pub limits: ExecutionConfig,
+}
+
+impl Default for ExecutionOptionsV1 {
+    fn default() -> Self {
+        Self { version: EXECUTION_OPTIONS_V1_VERSION, limits: ExecutionConfig::default() }
+    }
+}
+
+impl ExecutionOptionsV1 {
+    pub fn new(limits: ExecutionConfig) -> Self {
+        Self { version: EXECUTION_OPTIONS_V1_VERSION, limits }
+    }
+
+    pub fn validate(&self) -> Result<(), ExecutionError> {
+        if self.version != EXECUTION_OPTIONS_V1_VERSION {
+            return Err(ExecutionError::InvalidPlan(format!(
+                "unsupported execution-options version {}",
+                self.version,
+            )));
+        }
+        if self.limits.max_batch_rows == 0
+            || self.limits.max_batch_cells == 0
+            || self.limits.max_working_set_bytes == 0
+        {
+            return Err(ExecutionError::InvalidPlan(
+                "execution resource limits must all be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Cloneable, thread-safe cancellation signal for one query/execution.
 ///
 /// Clones share the same cancellation state. Calling cancel on any clone makes
@@ -228,6 +270,15 @@ impl ExecutionContext {
     /// Return a token that shares this context's cancellation state.
     pub fn token(&self) -> CancellationToken {
         CancellationToken::from_shared_flag(Arc::clone(&self.cancelled))
+    }
+
+    /// Construct an execution context using an explicitly versioned options object.
+    pub fn with_options(
+        options: ExecutionOptionsV1,
+        token: CancellationToken,
+    ) -> Result<Self, ExecutionError> {
+        options.validate()?;
+        Self::with_token(options.limits, token)
     }
 
     pub fn cancel(&self) {
@@ -1419,6 +1470,38 @@ mod cancellation_token_tests {
         let mut context = ExecutionContext::with_token(ExecutionConfig::default(), token.clone()).unwrap();
         token.cancel();
         assert!(context.check_cancelled().is_err());
+        context.cancel();
+        assert!(token.is_cancelled());
+    }
+}
+
+
+#[cfg(test)]
+mod execution_options_tests {
+    use super::*;
+
+    #[test]
+    fn versioned_execution_options_validate_version_and_limits() {
+        assert!(ExecutionOptionsV1::default().validate().is_ok());
+        let unsupported = ExecutionOptionsV1 { version: 2, ..ExecutionOptionsV1::default() };
+        assert!(matches!(
+            unsupported.validate(),
+            Err(ExecutionError::InvalidPlan(_)),
+        ));
+        let invalid_limits = ExecutionOptionsV1::new(ExecutionConfig {
+            max_batch_rows: 0,
+            ..ExecutionConfig::default()
+        });
+        assert!(matches!(
+            invalid_limits.validate(),
+            Err(ExecutionError::InvalidPlan(_)),
+        ));
+    }
+
+    #[test]
+    fn context_accepts_versioned_options_and_shared_token() {
+        let token = CancellationToken::new();
+        let context = ExecutionContext::with_options(ExecutionOptionsV1::default(), token.clone()).unwrap();
         context.cancel();
         assert!(token.is_cancelled());
     }
