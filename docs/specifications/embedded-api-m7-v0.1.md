@@ -8,7 +8,7 @@ This document defines the first stable embedded-API contract surface. The API ve
 ## 1. Compatibility rules
 
 - Public machine-readable identifiers are contractual; human-readable error messages are diagnostic and may become more descriptive.
-- Public classification enums are non-exhaustive. Consumers must include a fallback arm when matching them.
+- Public classification enums and versioned options structs are non-exhaustive. Consumers must include a fallback arm when matching classification enums, and should construct options with Default or new rather than struct literals.
 - Existing identifier strings retain their meaning. New identifiers are additive.
 - Additive Rust API changes may be made within the 0.x line when they preserve existing signatures and semantics. Breaking changes require an explicit API-version decision and migration note.
 - Database file-format compatibility is governed by each format specification, not by the embedded API version.
@@ -102,7 +102,7 @@ The recommended end-to-end application example is `crates/ananta-api/examples/em
 cargo run -p ananta-api --example embedded
 ```
 
-The Native Rust CI workflow builds and executes this example so the recommended facade stays usable.
+The Native Rust CI workflow builds and executes this example so the recommended facade stays usable. A downstream conformance test also imports the crate-root surface and pins the API, execution-options and AQL-options version identifiers.
 
 ## 7. Remaining M7.1 work
 
