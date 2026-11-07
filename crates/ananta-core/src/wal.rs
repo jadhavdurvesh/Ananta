@@ -681,6 +681,35 @@ mod tests {
     }
 
     #[test]
+    fn wal_checkpoint_replacement_is_atomic_and_preserves_sequence() {
+        let path = path("checkpoint-replace");
+        let mut writer = WalWriter::open(&path, WalSyncPolicy::OnCommit).unwrap();
+        writer.begin_transaction(41, b"before-checkpoint").unwrap();
+        writer.commit_transaction(41).unwrap();
+        let before = read_wal(&path).unwrap();
+        let base_sequence = before.last_sequence;
+
+        writer.replace_with_checkpoint(base_sequence, b"checkpoint-manifest").unwrap();
+        assert_eq!(writer.next_sequence(), base_sequence + 2);
+        let checkpoint = read_wal(&path).unwrap();
+        assert_eq!(checkpoint.records.len(), 1);
+        assert_eq!(checkpoint.records[0].kind, WalRecordKind::Checkpoint);
+        assert_eq!(checkpoint.records[0].sequence, base_sequence + 1);
+        assert_eq!(checkpoint.records[0].payload, b"checkpoint-manifest");
+
+        let next_transaction = base_sequence + 2;
+        writer.begin_transaction(next_transaction, b"after-checkpoint").unwrap();
+        writer.commit_transaction(next_transaction).unwrap();
+        drop(writer);
+        let after = read_wal(&path).unwrap();
+        assert!(after.is_clean());
+        assert_eq!(after.records.len(), 3);
+        assert_eq!(after.records[1].sequence, next_transaction);
+        assert_eq!(after.records[2].sequence, next_transaction + 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn wal_reader_reports_and_writer_truncates_an_incomplete_tail() {
         let path = path("truncated");
         let mut writer = WalWriter::open(&path, WalSyncPolicy::Manual).unwrap();
