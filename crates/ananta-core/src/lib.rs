@@ -7638,6 +7638,6 @@ mod public_api_error_code_tests {
         assert_eq!(error.code(), DbErrorCode::TableNotFound);
         assert_eq!(error.code().as_str(), "table_not_found");
         assert!(error.to_string().contains("customers"));
-        assert_ne!(error.code().as_str(), error.to_string());
+        assert!(!error.to_string().contains(error.code().as_str()));
     }
 }
