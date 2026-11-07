@@ -543,7 +543,7 @@ impl Database {
                         })?;
                         let pointer = ActiveWeavePointer::decode(&bytes)
                             .map_err(|_| WalRecoveryError::FileConflict("active pointer snapshot is invalid"))?;
-                        crate::active_generation::install_recovered_pointer(&weave_root, &pointer)
+                        Self::install_recovered_pointer(&weave_root, &pointer)
                             .map_err(|_| WalRecoveryError::FileConflict("active pointer WAL replay failed"))?;
                     }
                     Ok(weave_root)
@@ -605,7 +605,7 @@ impl Database {
         // process stopped while staging the second metadata artifact).
         cleanup_orphan_segment_temps(&root.join("data"))?;
         cleanup_orphan_catalog_staging_temps(&root)?;
-        crate::active_generation::cleanup_orphan_active_pointer_staging(&root, &catalog.tables)?;
+        Self::cleanup_orphan_active_pointer_staging(&root, &catalog.tables)?;
         let mut chronicle_indices = BTreeMap::new();
         for (name, definition) in &catalog.tables {
             let directory = root.join("data").join(name);
