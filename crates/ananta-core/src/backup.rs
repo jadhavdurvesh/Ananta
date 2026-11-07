@@ -49,12 +49,18 @@ pub(crate) fn create_backup(source: &Path, destination: &Path) -> io::Result<Bac
         file.write_all(&manifest)?;
         file.flush()?;
         file.sync_all()?;
+        drop(file);
         crate::wal_recovery::maybe_crash_after(
             crate::wal_recovery::WalRecoveryCrashPoint::AfterBackupManifestSynced,
         );
         sync_tree_directories(&staging)?;
         sync_directory(parent)?;
-        ananta_platform::atomic_move(&staging, &destination)?;
+        ananta_platform::atomic_move(&staging, &destination).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("backup directory publication failed: {error}"),
+            )
+        })?;
         crate::wal_recovery::maybe_crash_after(
             crate::wal_recovery::WalRecoveryCrashPoint::AfterBackupDirectoryRenamedBeforeSync,
         );
