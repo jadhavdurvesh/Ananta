@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ananta-types",
+    "crates/ananta-api",
     "crates/ananta-platform",
     "crates/ananta-format",
     "crates/ananta-core",
