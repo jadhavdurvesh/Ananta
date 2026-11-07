@@ -2284,7 +2284,7 @@ mod tests {
         options.optimizer_enabled = false;
         options.execution = ExecutionOptionsV1::new(ExecutionConfig {
             max_batch_rows: 1,
-            max_batch_cells: 3,
+            max_batch_cells: 4,
             max_working_set_bytes: 1024 * 1024,
         });
         let batches = execute_with_v1_options(
@@ -2308,7 +2308,7 @@ mod tests {
         let mut tiny = options;
         tiny.execution = ExecutionOptionsV1::new(ExecutionConfig {
             max_batch_rows: 1,
-            max_batch_cells: 3,
+            max_batch_cells: 4,
             max_working_set_bytes: 1,
         });
         let mut iterator = execute_with_v1_options(
