@@ -26,7 +26,8 @@ pub fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
 
         #[link(name = "kernel32")]
         extern "system" {
-            fn MoveFileExW(
+            #[link_name = "MoveFileExW"]
+            fn move_file_ex_w(
                 existing_file_name: *const u16,
                 new_file_name: *const u16,
                 flags: u32,
@@ -38,7 +39,7 @@ pub fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
         // SAFETY: both arguments are valid, NUL-terminated UTF-16 buffers that
         // remain alive for the duration of the synchronous Win32 call.
         let result = unsafe {
-            MoveFileExW(
+            move_file_ex_w(
                 source_wide.as_ptr(),
                 destination_wide.as_ptr(),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
@@ -68,7 +69,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn replaces_existing_file_without_a_delete_then_rename_gap() {
+    fn replaces_existing_target_and_consumes_source() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("ananta-platform-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
