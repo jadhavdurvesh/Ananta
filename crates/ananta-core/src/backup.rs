@@ -49,6 +49,10 @@ pub(crate) fn create_backup(source: &Path, destination: &Path) -> io::Result<Bac
         file.write_all(&manifest)?;
         file.flush()?;
         file.sync_all()?;
+        // Windows refuses to rename a directory while a file inside it is
+        // still open without FILE_SHARE_DELETE. Close the synced manifest
+        // before publishing the complete staging directory.
+        drop(file);
         crate::wal_recovery::maybe_crash_after(
             crate::wal_recovery::WalRecoveryCrashPoint::AfterBackupManifestSynced,
         );
