@@ -1328,3 +1328,22 @@ mod tests {
         assert_eq!(result.columns[0].values, vec![Value::Int64(1)]);
     }
 }
+
+
+#[cfg(test)]
+mod public_error_code_tests {
+    use super::*;
+
+    #[test]
+    fn execution_error_codes_are_stable_and_storage_classification_is_preserved() {
+        assert_eq!(ExecutionError::Cancelled.code().as_str(), "cancelled");
+        assert_eq!(
+            ExecutionError::ResourceLimit { resource: "rows", actual: 2, limit: 1 }.code().as_str(),
+            "resource_limit",
+        );
+        let storage = ExecutionError::Storage(DbError::TableNotFound("missing".into()));
+        assert_eq!(storage.code().as_str(), "storage");
+        assert_eq!(storage.storage_code(), Some(DbErrorCode::TableNotFound));
+        assert_eq!(storage.storage_code().unwrap().as_str(), "table_not_found");
+    }
+}
