@@ -224,6 +224,9 @@ pub const AQL_EXECUTION_OPTIONS_V1_VERSION: u16 = 1;
 
 /// Versioned AQL options composing native execution limits, optimizer policy
 /// and a shared cancellation signal.
+/// Versioned AQL query options. Prefer Default and field updates or new;
+/// the non-exhaustive boundary permits additive policy fields in later revisions.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct AqlExecutionOptionsV1 {
     pub version: u16,
