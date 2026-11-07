@@ -225,6 +225,27 @@ pub fn execute(
     execute_with_options(database, query, bindings, batch_rows, cancellation, true)
 }
 
+/// Execute with the stable cloneable cancellation-token API.
+///
+/// The legacy Arc<AtomicBool> parameter remains supported by execute(); new
+/// integrations should pass a CancellationToken so the signal can be shared
+/// without exposing atomic implementation details at call sites.
+pub fn execute_with_cancellation_token(
+    database: &Database,
+    query: &Query,
+    bindings: &ParameterBindings,
+    batch_rows: usize,
+    cancellation: Option<CancellationToken>,
+) -> Result<AqlResultIter, AqlExecutionError> {
+    execute(
+        database,
+        query,
+        bindings,
+        batch_rows,
+        cancellation.map(|token| token.shared_flag()),
+    )
+}
+
 /// Execute with the native physical optimizer enabled or disabled. The disabled
 /// path is retained as a correctness reference and fallback for expressions
 /// that are not yet lowerable to native vector operators.
