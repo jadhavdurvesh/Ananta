@@ -350,7 +350,12 @@ impl WalWriter {
 
             // Platform replacement atomically switches the WAL directory entry.
             // Until this point the old complete log remains authoritative.
-            ananta_platform::atomic_replace(&temporary, &self.path)?;
+            ananta_platform::atomic_replace(&temporary, &self.path).map_err(|error| {
+                WalError::Io(io::Error::new(
+                    error.kind(),
+                    format!("atomic WAL replacement failed: {error}"),
+                ))
+            })?;
             crate::wal_recovery::maybe_crash_after(
                 crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointRenamedBeforeDirectorySync,
             );
@@ -371,7 +376,12 @@ impl WalWriter {
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 );
             }
-            let replacement = replacement_options.open(&self.path)?;
+            let replacement = replacement_options.open(&self.path).map_err(|error| {
+                WalError::Io(io::Error::new(
+                    error.kind(),
+                    format!("reopening WAL after atomic replacement failed: {error}"),
+                ))
+            })?;
             self.file = replacement;
             self.next_sequence = base_sequence.checked_add(2).ok_or(WalError::SequenceOverflow)?;
             self.active_transactions.clear();
