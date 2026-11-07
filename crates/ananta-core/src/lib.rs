@@ -3573,9 +3573,9 @@ mod tests {
         let mut db = Database::open(&root).unwrap();
         db.create_table("telemetry", sample_schema()).unwrap();
 
-        for sequence in 1_u8..=32 {
+        for sequence in 1_u8..=64 {
             let mut batch = Vec::new();
-            for row_index in 0_u16..64 {
+            for row_index in 0_u16..128 {
                 let value = vec![
                     Value::TimestampMicros(i64::from(sequence) * 10_000 + i64::from(row_index)),
                     Value::Utf8(format!("device-{}-{row_index}", sequence % 8)),
@@ -3591,7 +3591,7 @@ mod tests {
             ).unwrap();
         }
 
-        for group in 0_u64..8 {
+        for group in 0_u64..16 {
             let first = group * 4 + 1;
             let last = first + 3;
             db.build_capsule(
@@ -3606,9 +3606,9 @@ mod tests {
         db.build_navigation_map("telemetry", 1).unwrap();
 
         let consistency = db.check_consistency(37).unwrap();
-        assert_eq!(consistency.rows_checked, 2_048);
-        assert_eq!(consistency.chronicle_records_checked, 32);
-        assert_eq!(consistency.capsules_checked, 8);
+        assert_eq!(consistency.rows_checked, 8_192);
+        assert_eq!(consistency.chronicle_records_checked, 64);
+        assert_eq!(consistency.capsules_checked, 16);
         assert_eq!(consistency.navigation_maps_checked, 1);
 
         let checkpoint = db.create_checkpoint().unwrap();
@@ -3623,9 +3623,9 @@ mod tests {
         let restored_db = Database::open(&restored).unwrap();
         assert_eq!(restored_db.scan("telemetry").unwrap(), expected_rows);
         let restored_consistency = restored_db.check_consistency(53).unwrap();
-        assert_eq!(restored_consistency.rows_checked, 2_048);
-        assert_eq!(restored_consistency.chronicle_records_checked, 32);
-        assert_eq!(restored_consistency.capsules_checked, 8);
+        assert_eq!(restored_consistency.rows_checked, 8_192);
+        assert_eq!(restored_consistency.chronicle_records_checked, 64);
+        assert_eq!(restored_consistency.capsules_checked, 16);
         assert_eq!(restored_consistency.navigation_maps_checked, 1);
         drop(restored_db);
 

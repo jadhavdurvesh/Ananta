@@ -124,4 +124,8 @@ jobs:
       - name: Test platform atomic replacement
         run: cargo test -p ananta-platform
       - name: Test WAL checkpoint rotation on Windows
-        run: cargo test -p ananta-core wal::tests::wal_checkpoint_replacement_is_atomic_and_preserves_sequence
+        run: cargo test -p ananta-core --lib wal::tests::wal_checkpoint_replacement_is_atomic_and_preserves_sequence
+      - name: Test Windows cross-process writer locking
+        run: cargo test -p ananta-core --lib second_process_cannot_acquire_database_writer_lock
+      - name: Test Windows large backup and restore
+        run: cargo test -p ananta-core --lib large_chronicle_capsule_map_backup_restores_all_rows_and_indexes
