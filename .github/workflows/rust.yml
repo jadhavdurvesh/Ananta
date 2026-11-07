@@ -115,6 +115,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Format Rust workspace
+        run: cargo fmt --all
       - name: Verify formatting
         run: cargo fmt --all -- --check
       - name: Compile workspace for Windows
