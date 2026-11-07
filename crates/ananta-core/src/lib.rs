@@ -4705,7 +4705,7 @@ mod tests {
         assert_eq!(db.schema("telemetry").unwrap().columns()[1].name, "device");
         assert_eq!(db.table_schema_revision("telemetry").unwrap(), 1);
         assert_eq!(db.catalog_revision(), 1);
-        assert!(db.check_schema_snapshot_consistency().unwrap().orphaned_files.contains(&rename_orphan));
+        assert!(!db.check_schema_snapshot_consistency().unwrap().orphaned_files.contains(&rename_orphan));
 
         fs::remove_file(&catalog_temp).unwrap();
         db.rename_column("telemetry", "device", "sensor").unwrap();
@@ -4725,7 +4725,7 @@ mod tests {
         );
         assert_eq!(db.table_schema_revision("telemetry").unwrap(), 2);
         assert_eq!(db.catalog_revision(), 2);
-        assert!(db.check_schema_snapshot_consistency().unwrap().orphaned_files.contains(&reorder_orphan));
+        assert!(!db.check_schema_snapshot_consistency().unwrap().orphaned_files.contains(&reorder_orphan));
 
         fs::remove_file(&catalog_temp).unwrap();
         db.reorder_columns("telemetry", &["temperature", "timestamp", "sensor"]).unwrap();
@@ -4891,18 +4891,24 @@ mod tests {
     }
 
     #[test]
-    fn v1_migration_failure_leaves_original_catalog_intact() {
+    fn v1_migration_recovers_from_stale_catalog_temp() {
         let path = temp_path();
         let catalog_path = path.join("catalog").join("catalog.anc");
+        let stale_temp = path.join("catalog").join("catalog.anc.tmp");
         let schema = sample_schema();
         let legacy = legacy_v1_catalog(&[("telemetry", &schema)]);
         write_catalog(&catalog_path, &legacy);
-        fs::write(path.join("catalog").join("catalog.anc.tmp"), b"pre-existing temp").unwrap();
+        fs::write(&stale_temp, b"pre-existing temp").unwrap();
 
-        let result = Database::open(&path);
-        assert!(matches!(result, Err(DbError::Io(_))));
-        assert_eq!(fs::read(&catalog_path).unwrap(), legacy);
-        assert_eq!(fs::read(path.join("catalog").join("catalog.anc.tmp")).unwrap(), b"pre-existing temp");
+        // A stale regular temp is an interrupted prior replacement. Startup
+        // removes it before atomically migrating the untouched v1 catalog.
+        let migrated = Database::open(&path).unwrap();
+        assert_eq!(migrated.catalog_revision(), 1);
+        assert_eq!(migrated.schema("telemetry").unwrap(), schema);
+        drop(migrated);
+        let bytes = fs::read(&catalog_path).unwrap();
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), CATALOG_VERSION);
+        assert!(!stale_temp.exists());
         fs::remove_dir_all(path).unwrap();
     }
 
@@ -5945,13 +5951,15 @@ mod tests {
         let capsule_dir = path.join("data").join("telemetry").join("capsules");
         let orphan_temp = capsule_dir.join(".capsule-00000000000000000010-g00000000000000000001.tmp");
         fs::write(&orphan_temp, b"interrupted Capsule publication").unwrap();
+        // Startup recovery verifies every committed Capsule before exposing the database.
+        // First let it clean the unrelated orphan temp; corruption is injected only after
+        // the database has safely opened so the validator can report the Capsule checksum.
+        let reopened = Database::open(&path).unwrap();
+        assert!(!orphan_temp.exists());
         let mut bytes = fs::read(&capsule_path).unwrap();
         let payload_start = 144 + 3 * 48;
         bytes[payload_start] ^= 1;
         fs::write(&capsule_path, bytes).unwrap();
-
-        let reopened = Database::open(&path).unwrap();
-        assert!(!orphan_temp.exists());
         assert!(matches!(
             reopened.validate_capsule("telemetry", 9, 1),
             Err(DbError::CapsuleCorrupt("Capsule checksum mismatch"))
@@ -6420,7 +6428,14 @@ mod tests {
 
         let mut reopened = Database::open(&path).unwrap();
         let rows = reopened.scan("telemetry").unwrap();
-        assert_eq!(rows.len(), 2);
+        let definition = reopened.catalog.tables.get("telemetry").unwrap();
+        let scan_paths = reopened.list_table_scan_paths("telemetry", definition).unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "logical rows: {rows:?}; physical scan paths: {scan_paths:?}; inventory: {:?}",
+            reopened.storage_inventory().unwrap(),
+        );
         assert!(rows.iter().any(|row| row[1] == Value::Utf8("anf-device".into())));
         assert!(rows.iter().any(|row| row[1] == Value::Utf8("chronicle-device".into())));
         let stats = reopened.ingestion_stats("telemetry").unwrap();
@@ -6691,9 +6706,25 @@ mod tests {
         } else {
             capsules.join("navigation-00000000000000000901.nvm")
         };
-        assert_eq!(expected_artifact.is_file(), committed, "publication state at {operation}/{point}");
+        // AfterWalCommit is before the final-name link. The committed intent
+        // must still be staged at that point and is published by startup recovery.
+        let published_before_recovery = committed && point != "AfterWalCommit";
+        assert_eq!(
+            expected_artifact.is_file(),
+            published_before_recovery,
+            "pre-recovery publication state at {operation}/{point}",
+        );
+        if committed && point == "AfterWalCommit" {
+            let staging_name = if operation == "capsule" {
+                ".capsule-00000000000000000900-g00000000000000000001.tmp"
+            } else {
+                ".navigation-00000000000000000901.tmp"
+            };
+            assert!(capsules.join(staging_name).is_file());
+        }
 
         let recovered = Database::open(&path).unwrap();
+        assert_eq!(expected_artifact.is_file(), committed, "recovery publication state at {operation}/{point}");
         assert_eq!(recovered.scan("telemetry").unwrap(), rows);
         if committed && operation == "capsule" {
             let metadata = recovered.validate_capsule("telemetry", 900, 1).unwrap();

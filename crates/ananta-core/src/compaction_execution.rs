@@ -1366,37 +1366,48 @@ impl Database {
                         "committed candidate CIM1/OWM1 identity mismatch",
                     ));
                 }
-                for artifact in &output.artifacts {
-                    read_verified_artifact(
-                        &candidate_dir.join(artifact.data_relative_path()),
-                        artifact.data_file_len,
-                        artifact.data_file_sha256,
-                    )?;
-                    read_verified_artifact(
-                        &candidate_dir.join(artifact.provenance_relative_path()),
-                        artifact.provenance_file_len,
-                        artifact.provenance_file_sha256,
-                    )?;
-                }
-
                 if stage_exists {
+                    // A staged candidate has not yet become visible through a
+                    // canonical final directory. Verify every immutable output
+                    // before publishing that directory.
+                    for artifact in &output.artifacts {
+                        read_verified_artifact(
+                            &candidate_dir.join(artifact.data_relative_path()),
+                            artifact.data_file_len,
+                            artifact.data_file_sha256,
+                        )?;
+                        read_verified_artifact(
+                            &candidate_dir.join(artifact.provenance_relative_path()),
+                            artifact.provenance_file_len,
+                            artifact.provenance_file_sha256,
+                        )?;
+                    }
                     sync_directory(&stage_dir)?;
                     fs::rename(&stage_dir, &final_dir)?;
                 }
                 // Also sync the parent on repeat opens: the prior process may
                 // have stopped after rename and before this directory fsync.
                 sync_directory(&weave_root)?;
-                let verified = self.verify_compaction_candidate(
-                    table,
-                    &input,
-                    output.weave_id,
-                    output.generation,
-                )?;
-                if verified != output {
-                    return Err(DbError::CompactionPreflight(
-                        "recovered candidate differs from committed OWM1 snapshot",
-                    ));
+
+                if stage_exists {
+                    let verified = self.verify_compaction_candidate(
+                        table,
+                        &input,
+                        output.weave_id,
+                        output.generation,
+                    )?;
+                    if verified != output {
+                        return Err(DbError::CompactionPreflight(
+                            "recovered candidate differs from committed OWM1 snapshot",
+                        ));
+                    }
                 }
+                // An already-finalized candidate may be a retained historical
+                // generation. Its integrity is checked when it is selected by
+                // the active pointer (or by an explicit consistency check).
+                // Do not let corruption in an old candidate prevent startup
+                // from validating the active generation and falling back to
+                // its retained previous generation.
             }
         }
         Ok(())
