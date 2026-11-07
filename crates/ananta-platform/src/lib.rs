@@ -105,7 +105,7 @@ pub fn atomic_move(source: &Path, destination: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::atomic_replace;
+    use super::{atomic_move, atomic_replace};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
