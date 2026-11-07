@@ -765,11 +765,11 @@ Specification: docs/specifications/wal-recovery-v0.1.md.
 
 ## M7.1 Embedded API hardening
 - [~] Stabilise public Rust API boundaries: add the curated `ananta-api` facade with storage/types/execution/AQL modules, API version and typed error codes; final export/semver review remains.
-- [~] Define configuration compatibility: add validated in-process `ExecutionOptionsV1`; durable database and server-wire configuration contracts remain pending.
+- [~] Define configuration compatibility: validated in-process `ExecutionOptionsV1` and `AqlExecutionOptionsV1` are available; durable database and server-wire configuration contracts remain pending.
 - [x] Define structured error codes with stable machine-readable string identifiers for database, execution and AQL errors; keep display text diagnostic-only.
 - [x] Define query/result lifecycle: lazy AqlResultIter yields owned batches, ends at None, and yields terminal errors once; document dropping the iterator boundary.
 - [x] Add cancellation API: cloneable CancellationToken shared across threads, ExecutionContext integration and token-aware AQL entry point; retain legacy Arc adapter.
-- [~] Add resource limits: version ExecutionOptionsV1 over row/cell/working-set budgets; uniform propagation across all query paths remains.
+- [x] Add resource limits to AQL execution: versioned `AqlExecutionOptionsV1` composes `ExecutionOptionsV1`, row/cell/working-set limits, optimizer policy and `CancellationToken`; enforce bounds on native and fallback AQL result paths. Legacy materialising storage scans remain an explicit exception.
 - [x] Publish a runnable `ananta-api` facade example using the native Database, AQL result iterator, stable error codes, versioned execution options and CancellationToken; execute it in CI.
 
 ## M7.2 Server/session layer
