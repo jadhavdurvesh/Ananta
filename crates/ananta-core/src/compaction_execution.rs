@@ -223,7 +223,7 @@ impl Database {
             open_files: 2,
             ..CompactionProgress::default()
         }).map_err(|e| DbError::CompactionExecution(e.to_string()))?;
-        let definition = self.catalog.tables.get(table)
+        let definition = self.catalog.tables.get(table).cloned()
             .ok_or_else(|| DbError::TableNotFound(table.to_owned()))?;
         let schema = &definition.schema;
         let column_ids = definition.column_ids.iter().map(|id| id.0).collect::<Vec<_>>();
