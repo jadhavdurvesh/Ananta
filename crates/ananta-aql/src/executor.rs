@@ -2106,6 +2106,25 @@ mod tests {
     }
 
     #[test]
+    fn cloneable_cancellation_token_cancels_aql_result_iteration() {
+        let (db, root, _) = fixture();
+        let query = crate::parse("SELECT device FROM telemetry").unwrap();
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+        worker_token.cancel();
+        let mut iterator = execute_with_cancellation_token(
+            &db,
+            &query,
+            &ParameterBindings::default(),
+            4,
+            Some(token),
+        ).unwrap();
+        assert_eq!(iterator.next().unwrap().unwrap_err().code, AqlErrorCode::Cancelled);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn null_comparisons_are_unknown_and_are_filtered_out() {
         let (db, root, _) = fixture();
         let query = crate::parse("SELECT device FROM telemetry WHERE reading = NULL").unwrap();
