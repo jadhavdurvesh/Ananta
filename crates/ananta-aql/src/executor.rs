@@ -14,7 +14,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Stable machine-readable classifications for AQL parse, planning and execution errors.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AqlErrorCode {
     InvalidQuery,
     TableNotFound,
@@ -27,6 +29,25 @@ pub enum AqlErrorCode {
     Storage,
     ResourceLimit,
     Execution,
+}
+
+impl AqlErrorCode {
+    /// Return the stable identifier for this error classification.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidQuery => "invalid_query",
+            Self::TableNotFound => "table_not_found",
+            Self::ColumnNotFound => "column_not_found",
+            Self::TypeMismatch => "type_mismatch",
+            Self::InvalidParameter => "invalid_parameter",
+            Self::InvalidCast => "invalid_cast",
+            Self::Arithmetic => "arithmetic",
+            Self::Cancelled => "cancelled",
+            Self::Storage => "storage",
+            Self::ResourceLimit => "resource_limit",
+            Self::Execution => "execution",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2072,5 +2093,19 @@ mod tests {
         assert!(output.is_empty());
         drop(db);
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+
+#[cfg(test)]
+mod public_error_code_tests {
+    use super::AqlErrorCode;
+
+    #[test]
+    fn aql_error_codes_are_stable_machine_readable_identifiers() {
+        assert_eq!(AqlErrorCode::InvalidQuery.as_str(), "invalid_query");
+        assert_eq!(AqlErrorCode::TableNotFound.as_str(), "table_not_found");
+        assert_eq!(AqlErrorCode::Cancelled.as_str(), "cancelled");
+        assert_eq!(AqlErrorCode::ResourceLimit.as_str(), "resource_limit");
     }
 }
