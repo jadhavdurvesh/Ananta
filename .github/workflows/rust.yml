@@ -129,3 +129,5 @@ jobs:
         run: cargo test -p ananta-core --lib second_process_cannot_acquire_database_writer_lock
       - name: Test Windows large backup and restore
         run: cargo test -p ananta-core --lib large_chronicle_capsule_map_backup_restores_all_rows_and_indexes
+      - name: Test Windows backup publication crash recovery
+        run: cargo test -p ananta-core --lib backup_publication_survives_process_crashes
