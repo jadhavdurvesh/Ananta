@@ -34,8 +34,16 @@ pub fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
             ) -> i32;
         }
 
-        let source_wide = source.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
-        let destination_wide = destination.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let source_wide = source
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let destination_wide = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
         // SAFETY: both arguments are valid, NUL-terminated UTF-16 buffers that
         // remain alive for the duration of the synchronous Win32 call.
         let result = unsafe {
@@ -70,8 +78,14 @@ mod tests {
 
     #[test]
     fn replaces_existing_target_and_consumes_source() {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir().join(format!("ananta-platform-{}-{nonce}", std::process::id()));
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ananta-platform-{}-{nonce}",
+            std::process::id(),
+        ));
         fs::create_dir_all(&root).unwrap();
         let source = root.join("replacement.tmp");
         let destination = root.join("active.wal");
