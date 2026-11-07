@@ -137,7 +137,7 @@ impl WalReadReport {
 
 pub struct WalWriter {
     path: PathBuf,
-    file: File,
+    file: Option<File>,
     next_sequence: u64,
     active_transactions: BTreeMap<u64, TransactionState>,
     sync_policy: WalSyncPolicy,
@@ -156,20 +156,7 @@ impl WalWriter {
             fs::create_dir_all(parent)?;
         }
 
-        let mut open_options = OpenOptions::new();
-        open_options.create(true).read(true).write(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            const FILE_SHARE_READ: u32 = 0x0000_0001;
-            const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-            const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-            // Windows cannot replace a file while any open handle denies
-            // delete-sharing. Keep the writer handle compatible with atomic
-            // MoveFileExW replacement throughout the WAL's lifetime.
-            open_options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-        }
-        let mut file = open_options.open(&path)?;
+        let mut file = open_wal_file(&path, true, false)?;
 
         let length = file.metadata()?.len();
         if length == 0 {
@@ -179,7 +166,7 @@ impl WalWriter {
             file.sync_all()?;
             return Ok(Self {
                 path,
-                file,
+                file: Some(file),
                 next_sequence: 1,
                 active_transactions: BTreeMap::new(),
                 sync_policy,
@@ -200,7 +187,7 @@ impl WalWriter {
 
         Ok(Self {
             path,
-            file,
+            file: Some(file),
             next_sequence,
             active_transactions: report.active_transactions,
             sync_policy,
@@ -268,17 +255,17 @@ impl WalWriter {
 
     pub fn sync(&mut self) -> Result<(), WalError> {
         self.ensure_healthy()?;
-        self.file.sync_all()?;
+        self.file_mut()?.sync_all()?;
         Ok(())
     }
 
     /// Atomically replace the current WAL with a new log whose first frame
     /// anchors a separately synced, checksummed database checkpoint manifest.
     ///
-    /// This operation is currently enabled on Unix, where rename atomically
-    /// replaces the existing pathname while the old file handle remains open.
-    /// Other targets fail closed until a platform-specific atomic replace is
-    /// implemented; they never emulate replacement with delete-then-rename.
+    /// On Unix this uses atomic rename. On Windows the active handle is closed
+    /// before MoveFileExW replacement and reopened only after the write-through
+    /// move completes. Unsupported targets fail closed rather than using
+    /// delete-then-rename.
     pub(crate) fn replace_with_checkpoint(&mut self, base_sequence: u64, payload: &[u8]) -> Result<(), WalError> {
         self.ensure_healthy()?;
         if !self.active_transactions.is_empty() {
@@ -298,7 +285,7 @@ impl WalWriter {
 
         #[cfg(any(unix, windows))]
         {
-            self.file.sync_all()?;
+            self.file_mut()?.sync_all()?;
             let parent = self.path.parent()
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or(Path::new("."));
@@ -348,14 +335,33 @@ impl WalWriter {
                 crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointTempSynced,
             );
 
-            // Platform replacement atomically switches the WAL directory entry.
-            // Until this point the old complete log remains authoritative.
-            ananta_platform::atomic_replace(&temporary, &self.path).map_err(|error| {
-                WalError::Io(io::Error::new(
+            // Windows requires the destination handle to be closed for
+            // MoveFileExW. Keep the writer unavailable while the pathname is
+            // switched, and restore the old handle if publication fails.
+            self.poisoned = true;
+            let old_file = self.file.take().ok_or(WalError::WriterPoisoned)?;
+            drop(old_file);
+
+            if let Err(error) = ananta_platform::atomic_replace(&temporary, &self.path) {
+                let reopen = open_wal_file(&self.path, false, true);
+                match reopen {
+                    Ok(file) => self.file = Some(file),
+                    Err(reopen_error) => {
+                        return Err(WalError::Io(io::Error::new(
+                            reopen_error.kind(),
+                            format!(
+                                "atomic WAL replacement failed ({error}); reopening the original WAL also failed ({reopen_error})"
+                            ),
+                        )));
+                    }
+                }
+                self.poisoned = false;
+                return Err(WalError::Io(io::Error::new(
                     error.kind(),
                     format!("atomic WAL replacement failed: {error}"),
-                ))
-            })?;
+                )));
+            }
+
             crate::wal_recovery::maybe_crash_after(
                 crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointRenamedBeforeDirectorySync,
             );
@@ -364,25 +370,13 @@ impl WalWriter {
                 crate::wal_recovery::WalRecoveryCrashPoint::AfterCheckpointDirectorySync,
             );
 
-            let mut replacement_options = OpenOptions::new();
-            replacement_options.read(true).append(true);
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::OpenOptionsExt;
-                const FILE_SHARE_READ: u32 = 0x0000_0001;
-                const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-                const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-                replacement_options.share_mode(
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                );
-            }
-            let replacement = replacement_options.open(&self.path).map_err(|error| {
+            let replacement = open_wal_file(&self.path, false, true).map_err(|error| {
                 WalError::Io(io::Error::new(
                     error.kind(),
                     format!("reopening WAL after atomic replacement failed: {error}"),
                 ))
             })?;
-            self.file = replacement;
+            self.file = Some(replacement);
             self.next_sequence = base_sequence.checked_add(2).ok_or(WalError::SequenceOverflow)?;
             self.active_transactions.clear();
             self.poisoned = false;
@@ -411,7 +405,7 @@ impl WalWriter {
         apply_transaction_record(&mut next_transactions, &record)?;
         let encoded = encode_record(&record)?;
 
-        if let Err(error) = self.file.write_all(&encoded) {
+        if let Err(error) = self.file_mut()?.write_all(&encoded) {
             self.poisoned = true;
             return Err(WalError::Io(error));
         }
@@ -423,12 +417,16 @@ impl WalWriter {
             || (self.sync_policy == WalSyncPolicy::OnCommit
                 && matches!(kind, WalRecordKind::Commit | WalRecordKind::Checkpoint));
         if should_sync {
-            if let Err(error) = self.file.sync_data() {
+            if let Err(error) = self.file_mut()?.sync_data() {
                 self.poisoned = true;
                 return Err(WalError::Io(error));
             }
         }
         Ok(record)
+    }
+
+    fn file_mut(&mut self) -> Result<&mut File, WalError> {
+        self.file.as_mut().ok_or(WalError::WriterPoisoned)
     }
 
     fn ensure_healthy(&self) -> Result<(), WalError> {
@@ -438,6 +436,28 @@ impl WalWriter {
             Ok(())
         }
     }
+}
+
+fn open_wal_file(path: &Path, create: bool, append: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    if create {
+        options.create(true);
+    }
+    if append {
+        options.append(true);
+    } else {
+        options.write(true);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    options.open(path)
 }
 
 #[cfg(unix)]
